@@ -1,0 +1,24 @@
+{
+  "expo": {
+    "name": "Metabolic Score",
+    "slug": "metabolic-score",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "dark",
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.amitbaruna.metabolicscore"
+    },
+    "android": {
+      "package": "com.amitbaruna.metabolicscore"
+    },
+    "plugins": [
+      "expo-asset"
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "d2a7deb6-603c-4933-afbb-036644ba4ecd"
+      }
+    }
+  }
+}
