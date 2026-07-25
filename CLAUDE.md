@@ -19,6 +19,9 @@ Follow it without being reminded.
    unprompted.
 7. **This project uses Claude only — no other AI coding tool.** Do not reference GLM or any
    other implementation partner.
+8. **Never run `git commit` (or `git push`) on Amit's behalf.** He reviews and commits all
+   changes himself. Editing files and staging changes for his review is fine; committing is
+   not, until he explicitly says otherwise in this file or in a session.
 
 ## Clinical language discipline (non-negotiable)
 
@@ -131,6 +134,5 @@ chat) — what got fixed, what's still open. Keep entries short; this is a fast
 - Confirm `app_cravings` table actually has all fields the app sends (context, confidence,
   mapped_layer, mechanism, tier) — batched `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` was
   provided; confirm it was run.
-- No git-commit-on-behalf-of-Amit yet — he reviews and commits manually until he says
-  otherwise (see Process rule discussion — not yet added as a numbered rule above, treat as
-  standing instruction until formalized).
+- No git-commit-on-behalf-of-Amit — formalized as Process rule #8. He reviews and commits
+  manually until he explicitly changes that.
