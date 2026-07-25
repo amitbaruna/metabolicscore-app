@@ -85,3 +85,52 @@ Follow it without being reminded.
   this repo, in `App.tsx`, or in any client-side file. They belong only in the Cloudflare
   Worker's environment secrets.
 - `.env` and any `.env.*` files are gitignored — keep it that way.
+
+## Session Log
+
+Update this at the end of every session (either with Claude Code or with Claude in
+chat) — what got fixed, what's still open. Keep entries short; this is a fast
+"where did we leave off" scan, not a full changelog. Newest entry on top.
+
+### 2026-07-25 — Auth root cause fixed, schema drift closed, git/Claude Code set up
+
+**Fixed and confirmed this session:**
+- Google Sign-In root cause: Google provider was Disabled in Supabase Auth → Providers.
+  Enabled, iOS Client ID added to Authorized Client IDs. Sign-in now works end to end.
+- Splash-screen race condition that was silently bouncing users out of onboarding back to
+  Home ~1.5s after sign-in (a `useEffect` re-arming on every `user`/`loading` change and
+  unconditionally forcing `setScreen("home")`, regardless of current screen). Fixed by
+  guarding with `setScreen(prev => prev === 'splash' ? ... : prev)`.
+- Cross-account local cache leak: AsyncStorage cache keys (goals, fat deposition, symptoms,
+  score history, etc.) were device-wide, not scoped per user — switching Google accounts
+  showed stale data from the previous account. Fixed by clearing per-user cache keys
+  whenever the signed-in identity changes.
+- Profile screen's medical condition + fat deposition editors were using disconnected local
+  state that never read or saved to the real value — fixed to read/write through
+  `AppDataContext`.
+- Symptom entry: severity was optional and "Add" silently no-op'd if incomplete. Now
+  required (same as "since"), with a visible flash/highlight cue on missing fields instead
+  of a silent no-op.
+- Schema drift (recurring bug class): `app_scores` was missing `time_spent_seconds` /
+  `engagement_grade`; `app_cravings` was missing `confidence` and `context`. All fixed via
+  `ALTER TABLE`. This is the 3rd time this exact bug class has hit — see next session's
+  task below.
+- Added diagnostic logging (`[Onboarding]`, `[saveProfile]`, `[saveCraving]`,
+  `[Supabase ...]`) at prior silent-failure points to make future debugging faster.
+
+**Still open / next session:**
+- **Schema-drift check script** (handed to Claude Code directly) — compare every field the
+  app sends in save payloads against `information_schema.columns` so missing-column bugs
+  are caught before a live device test, not during one.
+- **Baseline architecture decision (unresolved):** age/height/weight are currently written
+  into a `baseline` JSONB blob on `app_profiles`, not the flat `age`/`height_cm`/`weight_kg`
+  columns that already exist on that table. Needs Amit's call on which is source of truth
+  before this is touched further.
+- **Height/weight in onboarding + push notifications for symptoms/cravings** — Amit raised
+  both, not yet fully scoped. Needs a proper spec conversation.
+- Confirm `app_cravings` table actually has all fields the app sends (context, confidence,
+  mapped_layer, mechanism, tier) — batched `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` was
+  provided; confirm it was run.
+- No git-commit-on-behalf-of-Amit yet — he reviews and commits manually until he says
+  otherwise (see Process rule discussion — not yet added as a numbered rule above, treat as
+  standing instruction until formalized).
