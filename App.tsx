@@ -417,9 +417,20 @@ function LoginScreen({ onNavigate }: { onNavigate: (s: ScreenId) => void }) {
         </TouchableOpacity>
       </View>
 
-      {/* Google sign-in temporarily removed — was a non-functional stub (fake user, no real
-          OAuth). Real Google Sign-In is planned for right before the APK build. See handleGoogle
-          above, still present but unreferenced here — safe to wire back up once real OAuth exists. */}
+      {/* Google sign-in — real OAuth now exists (expo-auth-session, wired to handleGoogle
+          above), so the button that was deliberately removed while it was still a fake stub
+          goes back in here. */}
+      <View style={{ paddingHorizontal: 24, marginTop: 16 }}>
+        <View style={{ flexDirection: 'row', alignItems: 'center', gap: 10, marginBottom: 16 }}>
+          <View style={{ flex: 1, height: 1, backgroundColor: colors.border }} />
+          <Text style={{ fontSize: 11, color: colors.textTertiary }}>or</Text>
+          <View style={{ flex: 1, height: 1, backgroundColor: colors.border }} />
+        </View>
+        <TouchableOpacity onPress={handleGoogle} disabled={loading} style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 10, backgroundColor: colors.card, borderWidth: 1, borderColor: colors.border, paddingVertical: 13, borderRadius: 12, opacity: loading ? 0.6 : 1 }}>
+          <Ionicons name="logo-google" size={16} color={colors.text} />
+          <Text style={{ fontSize: 14, fontWeight: '600', color: colors.text }}>Continue with Google</Text>
+        </TouchableOpacity>
+      </View>
 
       <View style={{ paddingHorizontal: 24, marginTop: 16 }}>
         <View style={{ backgroundColor: colors.cardAlt, borderRadius: 12, padding: 12, flexDirection: 'row', alignItems: 'flex-start', gap: 8 }}>
@@ -655,12 +666,15 @@ function OnboardingScreen({ onNavigate }: { onNavigate: (s: ScreenId) => void })
   };
 
   const handleComplete = async () => {
+    console.log('[Onboarding] handleComplete starting, saving profile:', { full_name: name || 'Friend', gender, conditions, onboarded: true });
     try {
       await saveProfileCtx({ full_name: name || 'Friend', gender, conditions, onboarded: true });
+      console.log('[Onboarding] saveProfileCtx call completed without throwing');
       if (age) await ctxSetBaseline({ ...ctxBaseline, age });
       if (conditions.length) await ctxSetConditions(conditions);
       if (referralCodeInput.trim()) await referral.recordSignup(referralCodeInput.trim());
-    } catch (e) { /* ignore */ }
+      console.log('[Onboarding] handleComplete finished all steps successfully');
+    } catch (e) { console.warn('[Onboarding] handleComplete FAILED:', e); }
     onNavigate('home');
   };
 
@@ -789,7 +803,13 @@ function OnboardingScreen({ onNavigate }: { onNavigate: (s: ScreenId) => void })
       </View>
 
       <View style={{ paddingHorizontal: 24, marginTop: 40 }}>
-        <TouchableOpacity onPress={() => step < 3 ? setStep(step + 1) : handleComplete()} style={{ backgroundColor: colors.red, paddingVertical: 14, borderRadius: 12, alignItems: 'center' }}>
+        <TouchableOpacity onPress={() => {
+          if (step === 0 && !name.trim()) { Alert.alert('Almost there', 'Please enter your name to continue.'); return; }
+          if (step === 1 && !age.trim()) { Alert.alert('Almost there', 'Please enter your age to continue.'); return; }
+          if (step === 2 && !gender) { Alert.alert('Almost there', 'Please select an option to continue.'); return; }
+          if (step === 3 && conditions.length === 0) { Alert.alert('Almost there', 'Please make a selection — choose "No known condition" if none apply.'); return; }
+          step < 3 ? setStep(step + 1) : handleComplete();
+        }} style={{ backgroundColor: colors.red, paddingVertical: 14, borderRadius: 12, alignItems: 'center' }}>
           <Text style={{ color: '#fff', fontSize: 14, fontWeight: '700', letterSpacing: 0.5 }}>{step === 3 ? 'Complete' : 'Continue'}</Text>
         </TouchableOpacity>
         {step === 3 && (
@@ -1849,7 +1869,7 @@ function HomeScreen({ onNavigate, hasScore, scoreResult, onSelectLayer, onNaviga
                       </View>
                       <View style={{ flex: 1 }}>
                         <Text style={{ fontSize: 16, fontWeight: '700', color: colors.text }}>Take your first Metabolic Score</Text>
-                        <Text style={{ fontSize: 13, color: colors.textSecondary, marginTop: 4, lineHeight: 18 }}>A 5-minute assessment to see what's actually going on.</Text>
+                        <Text style={{ fontSize: 13, color: colors.textSecondary, marginTop: 4, lineHeight: 18 }}>A 3-minute assessment to see what's actually going on.</Text>
                       </View>
                     </View>
                   ) : clinicalDepth ? (
@@ -4562,10 +4582,19 @@ function ProfileScreen({ onNavigate, hasScore, scoreResult, onGoToCravings, onGo
   const { colors, theme, toggleTheme } = useTheme();
   const { signOut, user } = useAuth();
   const { clinicalDepth, toggleClinicalDepth } = useClinicalDepth();
+  const [realName, setRealName] = useState<string>('');
+  useEffect(() => {
+    if (!user?.id) return;
+    profiles.get(user.id).then(rows => {
+      const row = Array.isArray(rows) ? rows[0] : null;
+      if (row?.full_name) setRealName(row.full_name);
+    }).catch(() => {});
+  }, [user?.id]);
   const {
     cravings: loggedCravings, symptoms: ctxSymptoms, setSymptoms: ctxSetSymptoms,
     goals: ctxGoals, setGoals: ctxSetGoals, fatDeposition: ctxFatDeposition, setFatDeposition: ctxSetFatDeposition,
     baseline: ctxBaseline, setBaseline: ctxSetBaseline, scoreHistory, refreshScoreHistory,
+    conditions: ctxConditions, setConditions: ctxSetConditions,
   } = useAppData();
   useEffect(() => { refreshScoreHistory(); }, [refreshScoreHistory]);
   const [myMembership, setMyMembership] = useState<any>({ status: 'trial' });
@@ -4612,7 +4641,7 @@ function ProfileScreen({ onNavigate, hasScore, scoreResult, onGoToCravings, onGo
   const [newSymptomQualifier, setNewSymptomQualifier] = useState<boolean | undefined>(undefined);
   // FIX 6: Fat Deposition editable
   const [editFatDeposition, setEditFatDeposition] = useState(false);
-  const [userFatDeposition, setUserFatDeposition] = useState<string>(ctxFatDeposition || 'belly');
+  const [userFatDeposition, setUserFatDeposition] = useState<string>(ctxFatDeposition || '');
   // FIX 7: Baseline editable
   const [editBaseline, setEditBaseline] = useState(false);
   const [metabolicPatternExpanded, setMetabolicPatternExpanded] = useState(false);
@@ -4676,7 +4705,7 @@ function ProfileScreen({ onNavigate, hasScore, scoreResult, onGoToCravings, onGo
   // FIX 10: Help & Support expand
   const [showHelpSupport, setShowHelpSupport] = useState(false);
   const [editConditions, setEditConditions] = useState(false);
-  const [userConditions, setUserConditions] = useState<string[]>([]);
+  const [userConditions, setUserConditions] = useState<string[]>(ctxConditions.length > 0 ? ctxConditions : []);
 
   const toggleGoal = (g: string) => {
     if (userGoals.includes(g)) {
@@ -4699,11 +4728,11 @@ function ProfileScreen({ onNavigate, hasScore, scoreResult, onGoToCravings, onGo
           <View style={{ paddingHorizontal: 24, paddingTop: 12, paddingBottom: 16 }}>
             <View style={{ flexDirection: 'row', alignItems: 'center' }}>
               <View style={{ width: 64, height: 64, borderRadius: 16, backgroundColor: colors.red, alignItems: 'center', justifyContent: 'center' }}>
-                <Text style={{ fontSize: 20, fontWeight: '700', color: '#fff' }}>A</Text>
+                <Text style={{ fontSize: 20, fontWeight: '700', color: '#fff' }}>{(realName || user?.email || 'A').charAt(0).toUpperCase()}</Text>
               </View>
               <View style={{ flex: 1, marginLeft: 16 }}>
-                <Text style={{ fontSize: 18, fontWeight: '700', color: colors.text }}>Amit</Text>
-                <Text style={{ fontSize: 12, color: colors.textSecondary, marginTop: 2 }}>amit@example.com</Text>
+                <Text style={{ fontSize: 18, fontWeight: '700', color: colors.text }}>{realName || 'Friend'}</Text>
+                <Text style={{ fontSize: 12, color: colors.textSecondary, marginTop: 2 }}>{user?.email || ''}</Text>
                 <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6, marginTop: 8, paddingVertical: 4, paddingHorizontal: 10, borderRadius: 8, backgroundColor: `${colors.red}14`, alignSelf: 'flex-start' }}>
                   <Ionicons name="flash" size={12} color={colors.red} />
                   <Text style={{ fontSize: 12, fontWeight: '700', color: colors.red }}>Latest score: {scoreResult?.totalScore ?? '—'}</Text>
@@ -5025,7 +5054,7 @@ function ProfileScreen({ onNavigate, hasScore, scoreResult, onGoToCravings, onGo
               <View style={{ width: 38, height: 38, borderRadius: 12, backgroundColor: `${colors.red}20`, alignItems: 'center', justifyContent: 'center' }}><Ionicons name="body" size={17} color={colors.red} /></View>
               <View style={{ flex: 1 }}>
                 <Text style={{ fontSize: 13, fontWeight: '600', color: colors.text }}>Fat Deposition</Text>
-                <Text style={{ fontSize: 11, color: colors.textSecondary, marginTop: 2 }}>{(FAT_DEPOSITION_OPTIONS.find(f => f.id === userFatDeposition) || FAT_DEPOSITION_OPTIONS[0]).label}</Text>
+                <Text style={{ fontSize: 11, color: colors.textSecondary, marginTop: 2 }}>{userFatDeposition ? (FAT_DEPOSITION_OPTIONS.find(f => f.id === userFatDeposition)?.label || 'Not set') : 'Not set'}</Text>
               </View>
               <Ionicons name={fatDepExpanded ? 'chevron-up' : 'chevron-down'} size={16} color={colors.textTertiary} />
             </TouchableOpacity>
@@ -5033,7 +5062,7 @@ function ProfileScreen({ onNavigate, hasScore, scoreResult, onGoToCravings, onGo
             <View style={{ marginTop: 8 }}>
             <TouchableOpacity activeOpacity={0.97} onPress={() => setEditFatDeposition(!editFatDeposition)} style={{ borderRadius: 20, padding: 16, backgroundColor: colors.card }}>
               {(() => {
-                const pattern = FAT_DEPOSITION_OPTIONS.find(f => f.id === userFatDeposition) || FAT_DEPOSITION_OPTIONS[0];
+                const pattern = FAT_DEPOSITION_OPTIONS.find(f => f.id === userFatDeposition) || null;
                 if (editFatDeposition) {
                   return (
                     <View style={{ gap: 8 }}>
@@ -5041,7 +5070,7 @@ function ProfileScreen({ onNavigate, hasScore, scoreResult, onGoToCravings, onGo
                       {FAT_DEPOSITION_OPTIONS.map(f => {
                         const sel = userFatDeposition === f.id;
                         return (
-                          <TouchableOpacity key={f.id} onPress={() => { setUserFatDeposition(f.id); setEditFatDeposition(false); }} style={{ paddingVertical: 12, paddingHorizontal: 16, borderRadius: 8, backgroundColor: sel ? `${colors.red}14` : colors.bg, borderWidth: 1.5, borderColor: sel ? colors.red : colors.border, flexDirection: 'row', alignItems: 'center', gap: 8 }}>
+                          <TouchableOpacity key={f.id} onPress={() => { setUserFatDeposition(f.id); ctxSetFatDeposition(f.id); setEditFatDeposition(false); }} style={{ paddingVertical: 12, paddingHorizontal: 16, borderRadius: 8, backgroundColor: sel ? `${colors.red}14` : colors.bg, borderWidth: 1.5, borderColor: sel ? colors.red : colors.border, flexDirection: 'row', alignItems: 'center', gap: 8 }}>
                             {sel && <Ionicons name="checkmark" size={14} color={colors.red} />}
                             <View style={{ flex: 1 }}>
                               <Text style={{ fontSize: 14, fontWeight: '600', color: sel ? colors.red : colors.text }}>{f.label}</Text>
@@ -5054,6 +5083,13 @@ function ProfileScreen({ onNavigate, hasScore, scoreResult, onGoToCravings, onGo
                         <Text style={{ fontSize: 12, fontWeight: '600', color: colors.textTertiary }}>Cancel</Text>
                       </TouchableOpacity>
                     </View>
+                  );
+                }
+                if (!pattern) {
+                  return (
+                    <TouchableOpacity onPress={() => setEditFatDeposition(true)} style={{ paddingVertical: 8 }}>
+                      <Text style={{ fontSize: 13, color: colors.textTertiary, textAlign: 'center' }}>Not set yet. Tap to select your pattern.</Text>
+                    </TouchableOpacity>
                   );
                 }
                 return (
@@ -5106,7 +5142,7 @@ function ProfileScreen({ onNavigate, hasScore, scoreResult, onGoToCravings, onGo
                   {CONDITIONS_MALE.map(c => {
                     const sel = userConditions.includes(c);
                     return (
-                      <TouchableOpacity key={c} onPress={() => { if (c === 'No known condition' || c === 'Prefer not to say') { setUserConditions([c]); } else { setUserConditions(sel ? userConditions.filter(x => x !== c) : [...userConditions.filter(x => x !== 'No known condition' && x !== 'Prefer not to say'), c]); } }} style={{ paddingVertical: 10, paddingHorizontal: 14, borderRadius: 8, backgroundColor: sel ? `${colors.red}14` : colors.bg, borderWidth: 1.5, borderColor: sel ? colors.red : colors.border, flexDirection: 'row', alignItems: 'center', gap: 8 }}>
+                      <TouchableOpacity key={c} onPress={() => { if (c === 'No known condition' || c === 'Prefer not to say') { setUserConditions([c]); ctxSetConditions([c]); } else { const updated = sel ? userConditions.filter(x => x !== c) : [...userConditions.filter(x => x !== 'No known condition' && x !== 'Prefer not to say'), c]; setUserConditions(updated); ctxSetConditions(updated); } }} style={{ paddingVertical: 10, paddingHorizontal: 14, borderRadius: 8, backgroundColor: sel ? `${colors.red}14` : colors.bg, borderWidth: 1.5, borderColor: sel ? colors.red : colors.border, flexDirection: 'row', alignItems: 'center', gap: 8 }}>
                         {sel && <Ionicons name="checkmark" size={14} color={colors.red} />}
                         <Text style={{ flex: 1, fontSize: 12, fontWeight: '600', color: sel ? colors.red : colors.textSecondary }}>{c}</Text>
                       </TouchableOpacity>
@@ -6543,7 +6579,19 @@ function AppNavigator() {
     (async () => {
       const dpdp = await AsyncStorage.getItem('ms_dpdp_accepted');
       const t = setTimeout(() => {
-        if (!loading) { if (user) setScreen("home"); else if (!dpdp) setScreen("compliance"); else setScreen("login"); }
+        if (!loading) {
+          // Only resolve the initial splash decision — never hijack navigation
+          // if the app has already moved on (e.g. into onboarding) since this
+          // timer was armed. Without this guard, this effect re-fires on every
+          // `user`/`loading` change (including right after sign-in) and was
+          // forcibly bouncing users out of onboarding back to Home ~1.5s later.
+          setScreen(prev => {
+            if (prev !== 'splash') return prev;
+            if (user) return 'home';
+            if (!dpdp) return 'compliance';
+            return 'login';
+          });
+        }
       }, 1500);
       return () => clearTimeout(t);
     })();
@@ -6631,6 +6679,19 @@ class ErrorBoundary extends React.Component<{ children: ReactNode }, { hasError:
     }
     return this.props.children as any;
   }
+}
+
+// Catches what ErrorBoundary structurally cannot — errors in async code (promises, event
+// handlers, setTimeout callbacks) never reach a React error boundary, since boundaries only
+// catch errors thrown during render. A silent app reload with zero error shown, zero log
+// written, is the exact signature of this category of bug. This won't stop it from happening,
+// but it guarantees the next occurrence leaves a real trace instead of nothing.
+if (typeof (global as any).ErrorUtils !== 'undefined') {
+  const previousHandler = (global as any).ErrorUtils.getGlobalHandler?.();
+  (global as any).ErrorUtils.setGlobalHandler((error: any, isFatal?: boolean) => {
+    console.error('[GlobalError]', isFatal ? 'FATAL' : 'non-fatal', error?.message || error, error?.stack);
+    if (previousHandler) previousHandler(error, isFatal);
+  });
 }
 
 export default function App() {

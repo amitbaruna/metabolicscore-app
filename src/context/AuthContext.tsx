@@ -1,5 +1,23 @@
 import React, { createContext, useContext, useState, useEffect, type ReactNode } from 'react';
 import { auth, IS_DEMO_MODE } from '../config/supabase';
+import * as Google from 'expo-auth-session/providers/google';
+import * as AuthSession from 'expo-auth-session';
+import * as WebBrowser from 'expo-web-browser';
+
+// Required once, at module load, for expo-auth-session's browser-based flow to properly
+// close and hand control back to the app after Google redirects back.
+WebBrowser.maybeCompleteAuthSession();
+
+// iOS-only for now, matching where this app is actually being tested — the Android Client ID
+// gets added here once Android testing is genuinely underway, not before.
+const GOOGLE_IOS_CLIENT_ID = '492433051879-4mbma3a80t0tcrpi1r2domr716k185vc.apps.googleusercontent.com';
+
+// Google's provider defaults to the Authorization Code flow on real installed apps (confirmed
+// live — the first real-device test returned a `code`, not an `id_token`, exactly as this flow
+// predicts). Forcing the older direct-token flow instead is explicitly unreliable in real
+// builds even though it works in sandboxes, so the correct fix is completing this exchange
+// properly rather than fighting the flow Google actually gave us.
+const GOOGLE_TOKEN_ENDPOINT = 'https://oauth2.googleapis.com/token';
 
 type AuthContextType = {
   user: any;
@@ -16,6 +34,10 @@ const AuthContext = createContext<AuthContextType>({} as AuthContextType);
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<any>(null);
   const [loading, setLoading] = useState(true);
+
+  const [request, , promptAsync] = Google.useAuthRequest({
+    iosClientId: GOOGLE_IOS_CLIENT_ID,
+  });
 
   useEffect(() => {
     (async () => {
@@ -35,10 +57,42 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     return { error };
   };
   const signInWithGoogle = async () => {
-    // Demo Google sign-in: create a guest user
-    const user = { id: 'demo-google', email: 'guest@gmail.com', user_metadata: { full_name: 'Google Guest' } };
-    setUser(user);
-    return { error: null };
+    const result = await promptAsync();
+    if (result.type !== 'success') {
+      // User cancelled or it failed on Google's side — not an app error, just no sign-in
+      return { error: result.type === 'error' ? (result.error || { message: 'Google sign-in failed' }) : null };
+    }
+    const code = result.params?.code;
+    if (!code || !request) {
+      console.warn('[signInWithGoogle] Google returned success but no authorization code was found:', result);
+      return { error: { message: 'Google sign-in did not return a valid code' } };
+    }
+    // Exchange the code for real tokens — request.codeVerifier is the PKCE proof that this
+    // exchange is coming from the same app instance that started the sign-in, required since
+    // this is a public mobile client with no client secret.
+    let idToken: string | undefined;
+    try {
+      const tokenResult = await AuthSession.exchangeCodeAsync(
+        {
+          clientId: GOOGLE_IOS_CLIENT_ID,
+          code,
+          redirectUri: request.redirectUri,
+          extraParams: request.codeVerifier ? { code_verifier: request.codeVerifier } : undefined,
+        },
+        { tokenEndpoint: GOOGLE_TOKEN_ENDPOINT }
+      );
+      idToken = tokenResult.idToken;
+    } catch (e: any) {
+      console.warn('[signInWithGoogle] code exchange failed:', e);
+      return { error: { message: e?.message || 'Could not complete Google sign-in' } };
+    }
+    if (!idToken) {
+      console.warn('[signInWithGoogle] Token exchange succeeded but no id_token was in the response.');
+      return { error: { message: 'Google sign-in did not return a valid token' } };
+    }
+    const { user, error } = await auth.signInWithGoogleToken(idToken);
+    if (user) setUser(user);
+    return { error };
   };
   const signOut = async () => { await auth.signOut(); setUser(null); };
 

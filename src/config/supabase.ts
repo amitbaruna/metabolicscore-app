@@ -38,7 +38,7 @@ async function sbFetch(path: string, options: any = {}, token?: string | null) {
     }
   }
   if (!res.ok) {
-    console.warn(`[Supabase ${res.status}] ${options.method || 'GET'} ${path}`, data);
+    console.warn(`[Supabase ${res.status}] ${options.method || 'GET'} ${path}`, 'response:', data, 'request body was:', options.body);
   }
   return data;
 }
@@ -67,6 +67,23 @@ export const auth = {
       method: 'POST',
       headers: { 'apikey': SUPABASE_ANON_KEY, 'Content-Type': 'application/json' },
       body: JSON.stringify({ email, password }),
+    });
+    const data = await res.json();
+    if (data.user) {
+      await AsyncStorage.setItem('ms_user', JSON.stringify(data.user));
+      await AsyncStorage.setItem('ms_token', data.access_token);
+      await AsyncStorage.setItem('ms_refresh_token', data.refresh_token || '');
+    }
+    return { user: data.user, error: data.error || null };
+  },
+  // Real Google sign-in — exchanges the ID token Google handed back (via expo-auth-session)
+  // for an actual Supabase session, same REST pattern as email sign-in above. Replaces the
+  // previous fake stub that created a hardcoded local account regardless of what happened.
+  async signInWithGoogleToken(idToken: string) {
+    const res = await fetch(`${SUPABASE_URL}/auth/v1/token?grant_type=id_token`, {
+      method: 'POST',
+      headers: { 'apikey': SUPABASE_ANON_KEY, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ provider: 'google', id_token: idToken }),
     });
     const data = await res.json();
     if (data.user) {

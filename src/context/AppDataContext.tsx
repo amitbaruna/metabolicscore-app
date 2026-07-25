@@ -91,6 +91,7 @@ const KEYS = {
   miniQuiz: 'ms_mini_quiz',
   lastQuizAnswers: 'ms_last_quiz_answers',
   conditions: 'ms_conditions',
+  lastUserId: 'ms_last_user_id',
 };
 
 const uuid = () => Math.random().toString(36).slice(2) + Date.now().toString(36);
@@ -122,6 +123,30 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     (async () => {
+      // Guard against cross-account data leakage: local cache keys are device-wide,
+      // not scoped per user. If the signed-in identity has changed since the last
+      // time this device loaded data (different account, or switched from/to signed-out),
+      // wipe the stale per-user cache first so a new account never inherits a
+      // previous account's goals/fat-deposition/conditions/etc.
+      const currentIdentity = user?.id || 'anonymous';
+      const lastIdentity = await AsyncStorage.getItem(KEYS.lastUserId);
+      if (lastIdentity !== currentIdentity) {
+        await Promise.all([
+          AsyncStorage.removeItem(KEYS.cravings),
+          AsyncStorage.removeItem(KEYS.symptoms),
+          AsyncStorage.removeItem(KEYS.goals),
+          AsyncStorage.removeItem(KEYS.fatDeposition),
+          AsyncStorage.removeItem(KEYS.baseline),
+          AsyncStorage.removeItem(KEYS.scoreHistory),
+          AsyncStorage.removeItem(KEYS.hasScore),
+          AsyncStorage.removeItem(KEYS.miniQuiz),
+          AsyncStorage.removeItem(KEYS.lastQuizAnswers),
+          AsyncStorage.removeItem(KEYS.conditions),
+        ]);
+        await AsyncStorage.setItem(KEYS.lastUserId, currentIdentity);
+        console.log('[AppDataContext] Identity changed (', lastIdentity, '->', currentIdentity, ') — cleared stale local cache');
+      }
+
       const [c, s, g, fd, bl, sh, hs, mq, lqa, cond] = await Promise.all([
         readJSON<CravingEntry[]>(KEYS.cravings, []),
         readJSON<SymptomEntry[]>(KEYS.symptoms, []),
@@ -286,8 +311,12 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
   }, [user?.id]);
 
   const saveProfile = useCallback(async (data: any) => {
-    if (!user) return;
-    try { await profileApi.upsert({ id: user.id, email: user.email, ...data }); } catch (e) { console.warn('saveProfile', e); }
+    if (!user) { console.warn('[saveProfile] BAILED — no user in AppDataContext at call time. data was:', data); return; }
+    console.log('[saveProfile] upserting for user.id:', user.id, 'email:', user.email, 'data:', data);
+    try {
+      const result = await profileApi.upsert({ id: user.id, email: user.email, ...data });
+      console.log('[saveProfile] upsert result:', result);
+    } catch (e) { console.warn('[saveProfile] upsert THREW:', e); }
   }, [user]);
 
   const refreshScoreHistory = useCallback(async () => {
