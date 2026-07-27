@@ -25,7 +25,7 @@ type AuthContextType = {
   isDemoMode: boolean;
   signIn: (email: string, password: string) => Promise<{ error: any }>;
   signUp: (email: string, password: string, name: string) => Promise<{ error: any }>;
-  signInWithGoogle: () => Promise<{ error: any }>;
+  signInWithGoogle: () => Promise<{ error: any; cancelled?: boolean }>;
   signOut: () => Promise<void>;
 };
 
@@ -59,8 +59,15 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const signInWithGoogle = async () => {
     const result = await promptAsync();
     if (result.type !== 'success') {
-      // User cancelled or it failed on Google's side — not an app error, just no sign-in
-      return { error: result.type === 'error' ? (result.error || { message: 'Google sign-in failed' }) : null };
+      if (result.type === 'error') {
+        return { error: result.error || { message: 'Google sign-in failed' } };
+      }
+      // 'cancel' / 'dismiss' / 'locked' — the user backed out of the consent screen. This is
+      // neither a completed sign-in nor a real error, so it needs its own signal: returning
+      // { error: null } here previously made the caller's `if (error) ... else routeAfterAuth()`
+      // gate treat "backed out" identically to "signed in successfully" and navigate forward
+      // with no session at all. `cancelled: true` lets the caller just stay put instead.
+      return { error: null, cancelled: true };
     }
     const code = result.params?.code;
     if (!code || !request) {

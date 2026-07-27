@@ -102,7 +102,15 @@ export const auth = {
       await AsyncStorage.setItem('ms_token', data.access_token);
       await AsyncStorage.setItem('ms_refresh_token', data.refresh_token || '');
     }
-    return { user: data.user, error: data.error || null };
+    // Supabase's auth error responses use `msg`/`error_code` (or `error_description` on some
+    // endpoints), not a field literally named `error` — reading `data.error` directly was
+    // always undefined on a real rejection, so a genuinely failed login silently looked like
+    // a no-op success (no user, but no error either), letting LoginScreen fall through to
+    // routeAfterAuth() instead of showing an error. res.ok is the real signal to gate on.
+    const error = !res.ok
+      ? { message: data.msg || data.error_description || data.message || 'Sign in failed', code: data.error_code }
+      : null;
+    return { user: data.user, error };
   },
   // Real Google sign-in — exchanges the ID token Google handed back (via expo-auth-session)
   // for an actual Supabase session, same REST pattern as email sign-in above. Replaces the
@@ -292,69 +300,6 @@ export const booking = {
       console.warn('[booking.cancelBooking] unexpected response:', res);
     }
     return res;
-  },
-  // TEMPORARY — for testing only, until the Razorpay webhook + Cloudflare Worker is live tomorrow.
-  // This lets the app mark a booking as paid/confirmed from the client after returning from the
-  // external Razorpay link. This is NOT trustworthy (anyone could call it without paying) and
-  // MUST be removed once the real webhook confirmation path replaces it.
-  //
-  // Used for FRESH purchases only — the booking being confirmed here IS the kickoff call itself.
-  // Date anchoring: single_consultation gets a 7-day window from the day they joined (not tied to
-  // the call date — the call happens sometime within that window). 90_day_program anchors to the
-  // call date itself, no offset, since this is the program's own first call.
-  async TEST_ONLY_confirmBooking(bookingId: string, planType: 'single_consultation' | '90_day_program') {
-    const token = await auth.getToken();
-    const user = await auth.getSession();
-    const bookingPatchRes = await sbFetch(`/rest/v1/app_bookings?id=eq.${bookingId}`, {
-      method: 'PATCH',
-      headers: { 'Prefer': 'return=representation' } as any,
-      body: JSON.stringify({ status: 'confirmed', confirmed_at: new Date().toISOString() }),
-    }, token);
-    if (!Array.isArray(bookingPatchRes) || !bookingPatchRes[0]) {
-      console.warn('[TEST_ONLY_confirmBooking] booking PATCH failed or returned nothing — booking may still show as old/held:', bookingPatchRes);
-    }
-    const joined = new Date();
-    const callDateStr = bookingPatchRes?.[0]?.booking_date; // e.g. "2026-07-25"
-    let planEnd: string | null = null;
-    if (planType === '90_day_program') {
-      const anchor = callDateStr ? new Date(callDateStr) : joined;
-      planEnd = new Date(anchor.getTime() + 90 * 24 * 60 * 60 * 1000).toISOString();
-    } else {
-      // single_consultation: 7-day window from the join/purchase date, not from the call date
-      planEnd = new Date(joined.getTime() + 7 * 24 * 60 * 60 * 1000).toISOString();
-    }
-    const membershipRes = await sbFetch('/rest/v1/app_membership?on_conflict=user_id', {
-      method: 'POST',
-      headers: { 'Prefer': 'resolution=merge-duplicates,return=representation' } as any,
-      body: JSON.stringify({ user_id: user?.id, status: 'paid', plan_type: planType, joined_date: joined.toISOString(), plan_end_date: planEnd, current_booking_id: bookingId }),
-    }, token);
-    if (!Array.isArray(membershipRes)) {
-      console.warn('[TEST_ONLY_confirmBooking] membership upsert failed:', membershipRes);
-    }
-    return { booking: bookingPatchRes, membership: membershipRes };
-  },
-  // TEMPORARY — same caveats as TEST_ONLY_confirmBooking above.
-  // Used when a user who ALREADY has a confirmed call (from a single consultation) buys the 90-day
-  // program. Their existing call becomes the program's kickoff call — no new booking is created, no
-  // slot picker is shown. Date anchoring: the day AFTER the existing call's date, since that call
-  // already happened as its own (single-consultation) engagement — the 90-day clock starts fresh
-  // the day after, not the day of a call that belonged to a different purchase.
-  async TEST_ONLY_confirmProgramUpgrade(existingBookingId: string, existingBookingDate: string) {
-    const token = await auth.getToken();
-    const user = await auth.getSession();
-    const joined = new Date();
-    const existingDate = new Date(existingBookingDate);
-    const dayAfter = new Date(existingDate.getFullYear(), existingDate.getMonth(), existingDate.getDate() + 1);
-    const planEnd = new Date(dayAfter.getTime() + 90 * 24 * 60 * 60 * 1000).toISOString();
-    const membershipRes = await sbFetch('/rest/v1/app_membership?on_conflict=user_id', {
-      method: 'POST',
-      headers: { 'Prefer': 'resolution=merge-duplicates,return=representation' } as any,
-      body: JSON.stringify({ user_id: user?.id, status: 'paid', plan_type: '90_day_program', joined_date: joined.toISOString(), plan_end_date: planEnd, current_booking_id: existingBookingId }),
-    }, token);
-    if (!Array.isArray(membershipRes)) {
-      console.warn('[TEST_ONLY_confirmProgramUpgrade] membership upsert failed:', membershipRes);
-    }
-    return { membership: membershipRes };
   },
   async getMyBooking() {
     const user = await auth.getSession();

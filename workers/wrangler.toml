@@ -1,0 +1,10 @@
+name = "metabolic-payment-verify"
+main = "metabolic-payment-verify.js"
+compatibility_date = "2026-07-21"
+preview_urls = false
+
+[observability]
+enabled = true
+
+[observability.logs]
+enabled = true

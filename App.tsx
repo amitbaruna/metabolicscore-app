@@ -349,8 +349,9 @@ function LoginScreen({ onNavigate }: { onNavigate: (s: ScreenId) => void }) {
 
   const handleGoogle = async () => {
     setLoading(true); setError('');
-    const { error } = await signInWithGoogle();
+    const { error, cancelled } = await signInWithGoogle();
     setLoading(false);
+    if (cancelled) return; // user backed out of the consent screen — stay on login, no error to show
     if (error) setError(error.message || 'Google sign in failed');
     else await routeAfterAuth();
   };
@@ -5688,6 +5689,7 @@ function ScoreHistoryScreen({ onNavigate }: { onNavigate: (s: ScreenId) => void 
 
 function BookingScreen({ onNavigate }: { onNavigate: (s: ScreenId) => void }) {
   const { colors } = useTheme();
+  const { user } = useAuth();
   const [approachExpanded, setApproachExpanded] = useState(false);
   const [programExpanded, setProgramExpanded] = useState(false);
   const [blueprintExpanded, setBlueprintExpanded] = useState(false);
@@ -5705,16 +5707,16 @@ function BookingScreen({ onNavigate }: { onNavigate: (s: ScreenId) => void }) {
   }, []);
   const now = new Date();
   // Unified: both plan tiers now carry a plan_end_date (single_consultation = 7-day window from
-  // join date, 90_day_program = anchored to the kickoff call — see TEST_ONLY_confirmBooking).
+  // join date, 90_day_program = anchored to payment/kickoff — see the Worker's confirmBookingAndMembership
+  // and confirmMembershipByEmail).
   const planActive = myMembership.status === 'paid' && myMembership.plan_end_date && new Date(myMembership.plan_end_date) > now;
   const hasBookedCall = !!myBooking; // an existing confirmed call, regardless of which plan it belongs to
-  const CONSULTATION_LINK = 'https://rzp.io/rzp/jL3zAam';
-  const PROGRAM_LINK = 'https://rzp.io/rzp/1z1KI9U';
   // Replaces handleTapPlan + handleUpgradePayment. No payment happens inside the app at all —
-  // this just opens a conversation. Payment (via a Razorpay link Amit sends manually) and the
-  // membership flip both happen entirely outside the app; the already-deployed Worker's webhook
-  // is what marks someone 'paid' once that external payment completes, using the email they
-  // share in this same WhatsApp conversation to match them to their account.
+  // this just opens a conversation, pre-filled with exactly what Amit needs to send the right
+  // Razorpay Payment Link: which program, its price, and the email to match the payment against.
+  // Payment (via that link) and the membership flip both happen entirely outside the app; the
+  // already-deployed Worker's webhook is what marks someone 'paid' once that external payment
+  // completes, matching on the same email shared here.
   const contactCoach = (tier: 'single_consultation' | '90_day_program') => {
     if (planActive && myMembership.plan_type === tier) {
       // Already on this exact tier — nothing to arrange, offer to reschedule the existing call
@@ -5722,7 +5724,8 @@ function BookingScreen({ onNavigate }: { onNavigate: (s: ScreenId) => void }) {
       return;
     }
     const planLabel = tier === '90_day_program' ? '90-Day Metabolic Reset' : 'Single Consultation';
-    const message = `Hi Amit, I'd like to know more about the ${planLabel}.`;
+    const priceLabel = tier === '90_day_program' ? '₹24,990' : '₹3,499';
+    const message = `Hi Amit, I'd like to enroll in the ${planLabel} (${priceLabel}). My registered email: ${user?.email || '(not set)'}`;
     Linking.openURL(`https://wa.me/919891828688?text=${encodeURIComponent(message)}`).catch(() => {
       Alert.alert('Could not open WhatsApp', 'Please make sure WhatsApp is installed, or reach out by email instead.');
     });
