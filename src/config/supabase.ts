@@ -20,11 +20,35 @@ async function doFetch(path: string, options: any, token?: string | null) {
   return { res, data };
 }
 
+// Fired when a token refresh has been tried and failed (refresh token itself expired/invalid),
+// so the app can't recover silently. AuthContext registers a handler that signs the user out
+// and lets the existing screen router fall back to login — sbFetch itself has no navigation
+// concept, so this is the hook that connects "refresh failed" to "user sees the login screen."
+let onSessionExpired: (() => void) | null = null;
+export function setOnSessionExpired(fn: (() => void) | null) {
+  onSessionExpired = fn;
+}
+
+// Refresh calls are de-duped: if several sbFetch calls hit a 401 at the same moment (e.g. the
+// Promise.all in AppDataContext loading scores/cravings/profile together on app resume), only
+// one actually calls Supabase's refresh endpoint. Supabase rotates refresh tokens on use, so
+// firing one per concurrent 401 would make all but the first fail — the losers would read the
+// same now-stale refresh_token and get rejected. All concurrent callers share this one promise
+// and retry with whatever token it resolves to instead.
+let refreshInFlight: Promise<string | null> | null = null;
+function refreshTokenOnce(): Promise<string | null> {
+  if (!refreshInFlight) {
+    refreshInFlight = auth.refreshToken().finally(() => { refreshInFlight = null; });
+  }
+  return refreshInFlight;
+}
+
 // Single choke point every API call in this app already goes through. If a request comes back
 // with an expired token, silently refresh it using the stored refresh_token and retry the exact
 // same request once, transparently — the caller never sees the 401 at all. Only if the refresh
 // itself fails (refresh token also expired — a much rarer, longer-lived case) does the original
-// error propagate, which correctly means the user needs to log in again.
+// error propagate AND the session is torn down, so the app doesn't sit in a broken signed-in
+// state where every action keeps silently 401'ing.
 async function sbFetch(path: string, options: any = {}, token?: string | null) {
   let { res, data } = await doFetch(path, options, token);
   const isExpiredToken = res.status === 401 && !!token && (
@@ -32,9 +56,13 @@ async function sbFetch(path: string, options: any = {}, token?: string | null) {
     data?.code === 'PGRST303'
   );
   if (isExpiredToken) {
-    const newToken = await auth.refreshToken();
+    const newToken = await refreshTokenOnce();
     if (newToken) {
+      console.log('[sbFetch] token refreshed after 401, retrying', options.method || 'GET', path);
       ({ res, data } = await doFetch(path, options, newToken));
+    } else {
+      console.warn('[sbFetch] refresh failed, signing out:', options.method || 'GET', path);
+      onSessionExpired?.();
     }
   }
   if (!res.ok) {

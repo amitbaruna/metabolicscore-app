@@ -1,5 +1,5 @@
 import React, { createContext, useContext, useState, useEffect, type ReactNode } from 'react';
-import { auth, IS_DEMO_MODE } from '../config/supabase';
+import { auth, IS_DEMO_MODE, setOnSessionExpired } from '../config/supabase';
 import * as Google from 'expo-auth-session/providers/google';
 import * as AuthSession from 'expo-auth-session';
 import * as WebBrowser from 'expo-web-browser';
@@ -95,6 +95,14 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     return { error };
   };
   const signOut = async () => { await auth.signOut(); setUser(null); };
+
+  // If sbFetch ever fails to refresh an expired session (refresh token itself expired/invalid),
+  // it calls this to tear down the session the same way a manual sign-out would — the existing
+  // screen router in App.tsx falls back to login on its own once `user` goes null.
+  useEffect(() => {
+    setOnSessionExpired(() => { signOut(); });
+    return () => setOnSessionExpired(null);
+  }, []);
 
   return (
     <AuthContext.Provider value={{ user, loading, isDemoMode: IS_DEMO_MODE, signIn, signUp, signInWithGoogle, signOut }}>
