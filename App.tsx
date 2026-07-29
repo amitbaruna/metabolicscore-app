@@ -130,18 +130,20 @@ function useTheme() { return useContext(ThemeContext); }
 type ClinicalDepthCtx = { clinicalDepth: boolean; toggleClinicalDepth: () => void };
 const ClinicalDepthContext = createContext<ClinicalDepthCtx>({} as ClinicalDepthCtx);
 function ClinicalDepthProvider({ children }: { children: ReactNode }) {
+  const { user } = useAuth();
+  const userId = user?.id || 'anonymous';
   const [clinicalDepth, setClinicalDepth] = useState(false);
 
   useEffect(() => {
-    AsyncStorage.getItem('ms_clinical_depth').then(saved => {
-      if (saved === 'true') setClinicalDepth(true);
+    AsyncStorage.getItem(`ms_clinical_depth_${userId}`).then(saved => {
+      setClinicalDepth(saved === 'true');
     }).catch(() => {});
-  }, []);
+  }, [userId]);
 
   const toggleClinicalDepth = () => {
     const next = !clinicalDepth;
     setClinicalDepth(next);
-    AsyncStorage.setItem('ms_clinical_depth', next ? 'true' : 'false').catch(() => {});
+    AsyncStorage.setItem(`ms_clinical_depth_${userId}`, next ? 'true' : 'false').catch(() => {});
   };
 
   return <ClinicalDepthContext.Provider value={{ clinicalDepth, toggleClinicalDepth }}>{children}</ClinicalDepthContext.Provider>;
@@ -1465,7 +1467,14 @@ function HomeScreen({ onNavigate, hasScore, scoreResult, onSelectLayer, onNaviga
   const { clinicalDepth, toggleClinicalDepth } = useClinicalDepth();
   const { cravings: loggedCravings, deleteCraving, symptoms: ctxSymptoms, scoreHistory, refreshCravings, conditions: ctxConditions } = useAppData();
   useEffect(() => { refreshCravings(); }, [refreshCravings]);
-  const [showPostTest, setShowPostTest] = useState(hasScore || !!scoreResult || scoreHistory.length > 0);
+  // Derived fresh every render from real data (hasScore/scoreResult come from AppDataContext,
+  // scoreHistory is the live Supabase-backed list) — not captured once at mount, so it stays
+  // correct even when this data finishes loading after HomeScreen has already mounted.
+  const hasRealScore = hasScore || !!scoreResult || scoreHistory.length > 0;
+  // previewOverride is a deliberate manual toggle (the eye icon / "Preview post-test state"
+  // link below), not derived data — null means "no override, follow the real data."
+  const [previewOverride, setPreviewOverride] = useState<boolean | null>(null);
+  const showPostTest = previewOverride ?? hasRealScore;
   const [streak, setStreak] = useState(0);
   const [myBooking, setMyBooking] = useState<any>(null);
   useEffect(() => { booking.getMyBooking().then(setMyBooking).catch(() => {}); }, []);
@@ -1634,6 +1643,9 @@ function HomeScreen({ onNavigate, hasScore, scoreResult, onSelectLayer, onNaviga
   // history) fall through to the layer-2 default.
   const latestHistory = scoreHistory[0];
   const score = scoreResult?.totalScore ?? latestHistory?.total_score ?? 0;
+  // Same fallback precedence as `score` above — prefer the fresh in-session result,
+  // fall back to the persisted band for the latest historical assessment.
+  const band = scoreResult?.band ?? (latestHistory ? getBand(score) : null);
   const prevScore = scoreHistory[1]?.total_score;
   const scoreDelta = prevScore != null ? score - prevScore : null;
   const fallbackLayerScores = latestHistory
@@ -1701,7 +1713,7 @@ function HomeScreen({ onNavigate, hasScore, scoreResult, onSelectLayer, onNaviga
             </View>
             <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
               {showPostTest && (
-                <TouchableOpacity onPress={() => setShowPostTest(false)} style={{ width: 40, height: 40, borderRadius: 20, backgroundColor: colors.card, borderWidth: 1, borderColor: colors.border, alignItems: 'center', justifyContent: 'center' }}>
+                <TouchableOpacity onPress={() => setPreviewOverride(false)} style={{ width: 40, height: 40, borderRadius: 20, backgroundColor: colors.card, borderWidth: 1, borderColor: colors.border, alignItems: 'center', justifyContent: 'center' }}>
                   <Ionicons name="eye-outline" size={16} color={colors.text} />
                 </TouchableOpacity>
               )}
@@ -1770,7 +1782,7 @@ function HomeScreen({ onNavigate, hasScore, scoreResult, onSelectLayer, onNaviga
               )}
 
               <View style={{ marginTop: 24, alignItems: 'center' }}>
-                <TouchableOpacity onPress={() => setShowPostTest(true)}><Text style={{ fontSize: 10, color: colors.textTertiary, textDecorationLine: 'underline' }}>Preview post-test state →</Text></TouchableOpacity>
+                <TouchableOpacity onPress={() => setPreviewOverride(true)}><Text style={{ fontSize: 10, color: colors.textTertiary, textDecorationLine: 'underline' }}>Preview post-test state →</Text></TouchableOpacity>
               </View>
             </View>
           ) : (
@@ -1844,11 +1856,11 @@ function HomeScreen({ onNavigate, hasScore, scoreResult, onSelectLayer, onNaviga
 
               {/* Merged Score + Fat Loss Resistance pad — single foldable card */}
               <View style={{ paddingHorizontal: 24, marginTop: 24 }}>
-                <TouchableOpacity activeOpacity={0.95} onPress={() => { if (scoreResult) { setScorePadExpanded(!scorePadExpanded); } else { onNavigate('score'); } }} style={{ borderRadius: 20, padding: 24, backgroundColor: colors.card, position: 'relative' }}>
+                <TouchableOpacity activeOpacity={0.95} onPress={() => { if (hasRealScore) { setScorePadExpanded(!scorePadExpanded); } else { onNavigate('score'); } }} style={{ borderRadius: 20, padding: 24, backgroundColor: colors.card, position: 'relative' }}>
                   {!clinicalDepth && (
                     <Animated.View pointerEvents="none" style={{ position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, borderRadius: 20, borderWidth: 2.5, borderColor: colors.red, opacity: scorePadBlinkAnim, zIndex: 10 }} />
                   )}
-                  {scoreResult && (
+                  {hasRealScore && (
                   <TouchableOpacity
                     onPress={(e) => { e.stopPropagation(); toggleClinicalDepth(); }}
                     style={{
@@ -1863,7 +1875,7 @@ function HomeScreen({ onNavigate, hasScore, scoreResult, onSelectLayer, onNaviga
                     <Text style={{ fontSize: 10, fontWeight: '700', color: clinicalDepth ? colors.red : colors.textTertiary }}>{clinicalDepth ? 'Detail' : 'Simple'}</Text>
                   </TouchableOpacity>
                   )}
-                  {!scoreResult ? (
+                  {!hasRealScore ? (
                     <View style={{ flexDirection: 'row', alignItems: 'center', gap: 16 }}>
                       <View style={{ width: 60, height: 60, borderRadius: 30, backgroundColor: `${colors.red}18`, alignItems: 'center', justifyContent: 'center' }}>
                         <Ionicons name="analytics-outline" size={26} color={colors.red} />
@@ -1884,7 +1896,7 @@ function HomeScreen({ onNavigate, hasScore, scoreResult, onSelectLayer, onNaviga
                     </View>
                     <View style={{ alignItems: 'flex-end' }}>
                       <View style={{ paddingHorizontal: 10, paddingVertical: 4, borderRadius: 6, backgroundColor: 'rgba(245,158,11,0.12)' }}>
-                        <Text style={{ fontSize: 10, fontWeight: '700', letterSpacing: 1, color: '#F59E0B', textTransform: 'uppercase' }}>{scoreResult?.band?.status || 'Early Dysfunction'}</Text>
+                        <Text style={{ fontSize: 10, fontWeight: '700', letterSpacing: 1, color: '#F59E0B', textTransform: 'uppercase' }}>{band?.status || 'Early Dysfunction'}</Text>
                       </View>
                       {scoreDelta != null && scoreDelta !== 0 && (
                         <View style={{ flexDirection: 'row', alignItems: 'center', gap: 4, marginTop: 8 }}>
@@ -1896,8 +1908,8 @@ function HomeScreen({ onNavigate, hasScore, scoreResult, onSelectLayer, onNaviga
                   </View>
                   ) : (
                   <View style={{ flexDirection: 'row', alignItems: 'center', gap: 16, paddingVertical: 6, marginTop: 24 }}>
-                    <View style={{ width: 60, height: 60, borderRadius: 30, backgroundColor: `${scoreResult?.band?.color || colors.textSecondary}20`, alignItems: 'center', justifyContent: 'center' }}>
-                      <Ionicons name="shield" size={28} color={scoreResult?.band?.color || colors.textSecondary} />
+                    <View style={{ width: 60, height: 60, borderRadius: 30, backgroundColor: `${band?.color || colors.textSecondary}20`, alignItems: 'center', justifyContent: 'center' }}>
+                      <Ionicons name="shield" size={28} color={band?.color || colors.textSecondary} />
                     </View>
                     <View style={{ flex: 1 }}>
                       <Text style={{ fontSize: 17, fontWeight: '700', color: colors.text, lineHeight: 23 }}>Your body is working hard to protect itself</Text>
@@ -1910,10 +1922,10 @@ function HomeScreen({ onNavigate, hasScore, scoreResult, onSelectLayer, onNaviga
                     </View>
                   </View>
                   )}
-                  {clinicalDepth && scoreResult && (
+                  {clinicalDepth && hasRealScore && (
                   <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6, marginTop: 10 }}>
-                    <View style={{ width: 6, height: 6, borderRadius: 3, backgroundColor: scoreResult?.band?.color || colors.textSecondary }} />
-                    <Text style={{ fontSize: 12, fontWeight: '600', color: scoreResult?.band?.color || colors.textSecondary }}>{scoreResult?.band?.label || 'Metabolic Load: Moderate'}</Text>
+                    <View style={{ width: 6, height: 6, borderRadius: 3, backgroundColor: band?.color || colors.textSecondary }} />
+                    <Text style={{ fontSize: 12, fontWeight: '600', color: band?.color || colors.textSecondary }}>{band?.label || 'Metabolic Load: Moderate'}</Text>
                   </View>
                   )}
 
@@ -1970,13 +1982,46 @@ function HomeScreen({ onNavigate, hasScore, scoreResult, onSelectLayer, onNaviga
                   onWorkOnThis={triggerTodaysOneBlink}
                 />
               )}
+              {/* Lightweight fallback when there's no fresh in-session scoreResult (e.g. signed
+                  in without retaking the quiz) but a persisted assessment exists. cascadeRisk
+                  isn't persisted, so the full interactive CascadeVisualization can't be rebuilt
+                  from scoreHistory — this shows the dominant pattern + layer breakdown instead
+                  of hiding the card entirely. */}
+              {!scoreResult && latestHistory && homeSections['metabolic-story'] !== false && (
+                <View style={{ paddingHorizontal: 24, marginTop: 20 }}>
+                  <View style={{ borderRadius: 20, backgroundColor: colors.card, borderWidth: 1, borderColor: colors.border, padding: 16 }}>
+                    <View style={{ flexDirection: 'row', alignItems: 'center', gap: 10, marginBottom: 14 }}>
+                      <View style={{ width: 34, height: 34, borderRadius: 11, backgroundColor: '#7C5CFF15', alignItems: 'center', justifyContent: 'center' }}>
+                        <MaterialCommunityIcons name="link-variant" size={17} color="#7C5CFF" />
+                      </View>
+                      <View style={{ flex: 1 }}>
+                        <Text style={{ fontSize: 15, fontWeight: '700', color: colors.text, letterSpacing: -0.3 }}>Metabolic Story</Text>
+                        <Text style={{ fontSize: 11, color: colors.textTertiary, marginTop: 1 }}>From your last assessment</Text>
+                      </View>
+                    </View>
+                    {latestHistory.dominant_pattern && (
+                      <Text style={{ fontSize: 13, fontWeight: '600', color: colors.text, marginBottom: 12, lineHeight: 18 }}>{latestHistory.dominant_pattern}</Text>
+                    )}
+                    <View style={{ gap: 8 }}>
+                      {LAYERS.map(layer => {
+                        const ls = fallbackLayerScores?.[layer.id];
+                        return (
+                          <View key={layer.id} style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}>
+                            <Text style={{ fontSize: 12, color: colors.textSecondary }}>{layer.name}</Text>
+                            <Text style={{ fontSize: 12, fontWeight: '700', color: colors.text }}>{typeof ls === 'number' ? `${ls}/20` : '—'}</Text>
+                          </View>
+                        );
+                      })}
+                    </View>
+                  </View>
+                </View>
+              )}
 
               {/* Cravings Quick-Log */}
               {homeSections['cravings'] !== false && (
               <View style={{ paddingHorizontal: 24, marginTop: 20 }}>
                 <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
                   <Text style={{ fontSize: 11, fontWeight: '600', color: colors.textSecondary }}>Cravings Quick-Log</Text>
-                  <TouchableOpacity onPress={() => onGoToCravings ? onGoToCravings('home') : onNavigate('cravings')}><Text style={{ fontSize: 11, fontWeight: '600', color: colors.red }}>Log →</Text></TouchableOpacity>
                 </View>
                 <TouchableOpacity activeOpacity={0.97} onPress={() => onGoToCravings ? onGoToCravings('home') : onNavigate('cravings')} style={{ borderRadius: 20, padding: 16, backgroundColor: colors.card }}>
                   {loggedCravings.length === 0 ? (
@@ -2006,7 +2051,6 @@ function HomeScreen({ onNavigate, hasScore, scoreResult, onSelectLayer, onNaviga
               <View style={{ paddingHorizontal: 24, marginTop: 20 }}>
                 <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
                   <Text style={{ fontSize: 11, fontWeight: '600', color: colors.textSecondary }}>Current Symptoms</Text>
-                  <TouchableOpacity onPress={() => onNavigate('symptom-tracker')}><Text style={{ fontSize: 11, fontWeight: '600', color: colors.red }}>Edit →</Text></TouchableOpacity>
                 </View>
                 <TouchableOpacity activeOpacity={0.97} onPress={() => onNavigate('symptom-tracker')} style={{ borderRadius: 20, padding: 16, backgroundColor: colors.card }}>
                   {ctxSymptoms.length === 0 ? (
@@ -4604,7 +4648,11 @@ function ProfileScreen({ onNavigate, hasScore, scoreResult, onGoToCravings, onGo
     membership.get().then(setMyMembership).catch(() => {});
     booking.getMyBooking().then(setMyBooking).catch(() => {});
   }, []);
-  const weakestLayer = scoreResult?.dominantLayer ? LAYERS[scoreResult.dominantLayer - 1] : LAYERS[1];
+  // No hardcoded default layer. A Layer object (name/color/icon) only exists when there's a
+  // fresh in-session scoreResult — the persisted record only has a dominant_pattern string,
+  // not a layer id, so guessing a Layer here would assert a conclusion the data doesn't support.
+  const weakestLayer = scoreResult?.dominantLayer ? LAYERS[scoreResult.dominantLayer - 1] : null;
+  const latestHistory = scoreHistory[0];
   const weeklyCravingSummary = useMemo(() => {
     const sevenDaysAgo = Date.now() - 7 * 24 * 60 * 60 * 1000;
     const recent = (loggedCravings || []).filter((c: any) => new Date(c.created_at).getTime() >= sevenDaysAgo);
@@ -4736,7 +4784,7 @@ function ProfileScreen({ onNavigate, hasScore, scoreResult, onGoToCravings, onGo
                 <Text style={{ fontSize: 12, color: colors.textSecondary, marginTop: 2 }}>{user?.email || ''}</Text>
                 <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6, marginTop: 8, paddingVertical: 4, paddingHorizontal: 10, borderRadius: 8, backgroundColor: `${colors.red}14`, alignSelf: 'flex-start' }}>
                   <Ionicons name="flash" size={12} color={colors.red} />
-                  <Text style={{ fontSize: 12, fontWeight: '700', color: colors.red }}>Latest score: {scoreResult?.totalScore ?? '—'}</Text>
+                  <Text style={{ fontSize: 12, fontWeight: '700', color: colors.red }}>Latest score: {scoreHistory[0]?.total_score ?? '—'}</Text>
                 </View>
               </View>
             </View>
@@ -4826,7 +4874,7 @@ function ProfileScreen({ onNavigate, hasScore, scoreResult, onGoToCravings, onGo
               <View style={{ width: 38, height: 38, borderRadius: 12, backgroundColor: `${colors.red}20`, alignItems: 'center', justifyContent: 'center' }}><Ionicons name="pulse" size={17} color={colors.red} /></View>
               <View style={{ flex: 1 }}>
                 <Text style={{ fontSize: 13, fontWeight: '600', color: colors.text }}>Metabolic Story</Text>
-                <Text style={{ fontSize: 11, color: colors.textSecondary, marginTop: 2 }}>{weakestLayer.name} dominant</Text>
+                <Text style={{ fontSize: 11, color: colors.textSecondary, marginTop: 2 }}>{weakestLayer ? `${weakestLayer.name} dominant` : (latestHistory?.dominant_pattern || 'Take your first assessment to see your metabolic story')}</Text>
               </View>
               <Ionicons name={metabolicPatternExpanded ? 'chevron-up' : 'chevron-down'} size={16} color={colors.textTertiary} />
             </TouchableOpacity>
@@ -4836,7 +4884,11 @@ function ProfileScreen({ onNavigate, hasScore, scoreResult, onGoToCravings, onGo
               <View style={{ gap: 12 }}>
                 <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}>
                   <Text style={{ fontSize: 13, color: colors.textSecondary }}>Dominant layer</Text>
-                  <Text style={{ fontSize: 13, fontWeight: '600', color: weakestLayer.color }}>{weakestLayer.name}</Text>
+                  {weakestLayer ? (
+                    <Text style={{ fontSize: 13, fontWeight: '600', color: weakestLayer.color }}>{weakestLayer.name}</Text>
+                  ) : (
+                    <Text style={{ fontSize: 13, fontWeight: '600', color: colors.textTertiary }}>Not available</Text>
+                  )}
                 </View>
                 <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}>
                   <Text style={{ fontSize: 13, color: colors.textSecondary }}>Trajectory</Text>
@@ -4854,6 +4906,28 @@ function ProfileScreen({ onNavigate, hasScore, scoreResult, onGoToCravings, onGo
                 <CascadeVisualization scoreResult={scoreResult} colors={colors} onNavigate={onNavigate} onWorkOnThis={onGoToTodaysOne} />
               </View>
             )}
+            {/* Same lightweight fallback as Home: cascadeRisk isn't persisted, so the full
+                interactive CascadeVisualization can't be rebuilt from scoreHistory — this shows
+                the layer1-5 breakdown instead of hiding the section entirely. */}
+            {metabolicPatternExpanded && !scoreResult && latestHistory && (() => {
+              const layerScoreMap: Record<number, number> = { 1: latestHistory.layer1, 2: latestHistory.layer2, 3: latestHistory.layer3, 4: latestHistory.layer4, 5: latestHistory.layer5 };
+              return (
+                <View style={{ marginTop: 12, borderRadius: 20, padding: 20, backgroundColor: colors.card }}>
+                  <Text style={{ fontSize: 10, fontWeight: '700', letterSpacing: 1, color: colors.textSecondary, marginBottom: 12, textTransform: 'uppercase' }}>Layer Breakdown — Last Assessment</Text>
+                  <View style={{ gap: 10 }}>
+                    {LAYERS.map(layer => {
+                      const ls = layerScoreMap[layer.id];
+                      return (
+                        <View key={layer.id} style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}>
+                          <Text style={{ fontSize: 13, color: colors.textSecondary }}>{layer.name}</Text>
+                          <Text style={{ fontSize: 13, fontWeight: '700', color: colors.text }}>{typeof ls === 'number' ? `${ls}/20` : '—'}</Text>
+                        </View>
+                      );
+                    })}
+                  </View>
+                </View>
+              );
+            })()}
           </View>
 
           {/* 2. Craving Patterns */}
@@ -6550,6 +6624,10 @@ function AppNavigator() {
   const { hasScore, saveScore, setLastQuizAnswers } = useAppData();
   const [screen, setScreen] = useState<ScreenId>('splash');
   const [scoreResult, setScoreResult] = useState<ScoreResult | null>(null);
+  // In-memory only (not persisted) — reset on sign-in/sign-out/account switch so a
+  // freshly logged-in account never inherits the previous account's quiz result.
+  // Same identity signal (user?.id) that AppDataContext's own identity-change check is built from.
+  useEffect(() => { setScoreResult(null); }, [user?.id]);
   const [userData, setUserData] = useState<UserData>({ gender: 'Male', age: '26–35', conditions: [], sleepScore: 5, stressScore: 5, gutScore: 5 });
   const [selectedLayer, setSelectedLayer] = useState(1);
   const [selectedArticle, setSelectedArticle] = useState<Insight | null>(null);
@@ -6725,13 +6803,13 @@ export default function App() {
   return (
     <ErrorBoundary>
       <ThemeProvider>
-        <ClinicalDepthProvider>
-          <AuthProvider>
+        <AuthProvider>
+          <ClinicalDepthProvider>
             <AppDataProvider>
               <AppInner />
             </AppDataProvider>
-          </AuthProvider>
-        </ClinicalDepthProvider>
+          </ClinicalDepthProvider>
+        </AuthProvider>
       </ThemeProvider>
     </ErrorBoundary>
   );

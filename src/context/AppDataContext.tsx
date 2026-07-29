@@ -81,7 +81,6 @@ type DataContextType = {
 const DataContext = createContext<DataContextType>({} as DataContextType);
 
 const KEYS = {
-  hasScore: 'ms_has_score',
   cravings: 'ms_cravings',
   symptoms: 'ms_symptoms',
   goals: 'ms_goals',
@@ -109,7 +108,6 @@ async function writeJSON(key: string, value: any) {
 
 export function AppDataProvider({ children }: { children: ReactNode }) {
   const { user } = useAuth();
-  const [hasScore, setHasScore] = useState(false);
   const [loading, setLoading] = useState(true);
   const [cravings, setCravingsState] = useState<CravingEntry[]>([]);
   const [symptoms, setSymptomsState] = useState<SymptomEntry[]>([]);
@@ -118,6 +116,7 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
   const [baseline, setBaselineState] = useState<BaselineEntry>({});
   const [conditions, setConditionsState] = useState<string[]>([]);
   const [scoreHistory, setScoreHistory] = useState<ScoreHistoryEntry[]>([]);
+  const hasScore = scoreHistory.length > 0;
   const [miniQuiz, setMiniQuizState] = useState<MiniQuizMap>({});
   const [lastQuizAnswers, setLastQuizAnswersState] = useState<{ layer: number; q: number; selected: number[]; score: number }[]>([]);
 
@@ -138,7 +137,6 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
           AsyncStorage.removeItem(KEYS.fatDeposition),
           AsyncStorage.removeItem(KEYS.baseline),
           AsyncStorage.removeItem(KEYS.scoreHistory),
-          AsyncStorage.removeItem(KEYS.hasScore),
           AsyncStorage.removeItem(KEYS.miniQuiz),
           AsyncStorage.removeItem(KEYS.lastQuizAnswers),
           AsyncStorage.removeItem(KEYS.conditions),
@@ -147,21 +145,20 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
         console.log('[AppDataContext] Identity changed (', lastIdentity, '->', currentIdentity, ') — cleared stale local cache');
       }
 
-      const [c, s, g, fd, bl, sh, hs, mq, lqa, cond] = await Promise.all([
+      const [c, s, g, fd, bl, sh, mq, lqa, cond] = await Promise.all([
         readJSON<CravingEntry[]>(KEYS.cravings, []),
         readJSON<SymptomEntry[]>(KEYS.symptoms, []),
         readJSON<string[]>(KEYS.goals, []),
         AsyncStorage.getItem(KEYS.fatDeposition).then(v => v || ''),
         readJSON<BaselineEntry>(KEYS.baseline, {}),
         readJSON<ScoreHistoryEntry[]>(KEYS.scoreHistory, []),
-        AsyncStorage.getItem(KEYS.hasScore).then(v => v === 'true'),
         readJSON<MiniQuizMap>(KEYS.miniQuiz, {}),
         readJSON<{ layer: number; q: number; selected: number[]; score: number }[]>(KEYS.lastQuizAnswers, []),
         readJSON<string[]>(KEYS.conditions, []),
       ]);
       setCravingsState(c); setSymptomsState(s); setGoalsState(g);
       setFatDepositionState(fd); setBaselineState(bl); setScoreHistory(sh);
-      setHasScore(hs); setMiniQuizState(mq); setLastQuizAnswersState(lqa);
+      setMiniQuizState(mq); setLastQuizAnswersState(lqa);
       setConditionsState(cond);
 
       if (user?.id) {
@@ -183,13 +180,12 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
             }));
             setScoreHistory(mapped);
             await writeJSON(KEYS.scoreHistory, mapped);
-            setHasScore(true);
-            await AsyncStorage.setItem(KEYS.hasScore, 'true');
           }
+          console.log('[DEBUG symptom] raw remote fetch (profileApi.get) on identity change — full row:', Array.isArray(remoteProfile) ? remoteProfile[0] : remoteProfile, '— .symptoms field specifically:', Array.isArray(remoteProfile) ? remoteProfile[0]?.symptoms : undefined);
           if (Array.isArray(remoteCravings) && remoteCravings.length > 0) {
             const mappedC: CravingEntry[] = remoteCravings.map((row: any) => ({
-              id: row.id, craving_type: row.craving_type, timing: row.timing,
-              context: row.context, mapped_layer: row.mapped_layer, mechanism: row.mechanism,
+              id: row.id, craving_type: row.craving_type, timing: row.craving_time,
+              context: row.craving_context, mapped_layer: row.mapped_layer, mechanism: row.mechanism,
               tier: row.tier, confidence: row.confidence, created_at: row.created_at,
             }));
             setCravingsState(mappedC);
@@ -203,7 +199,10 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
             if (p.baseline && typeof p.baseline === 'object') { setBaselineState(p.baseline); await writeJSON(KEYS.baseline, p.baseline); }
             if (Array.isArray(p.conditions)) { setConditionsState(p.conditions); await writeJSON(KEYS.conditions, p.conditions); }
           }
-        } catch (e) { console.warn('Background sync failed (non-blocking):', e); }
+        } catch (e) {
+          console.log('[DEBUG symptom]', 'identity-change remote fetch Promise.all catch fired:', e);
+          console.warn('Background sync failed (non-blocking):', e);
+        }
       }
       setLoading(false);
     })();
@@ -216,12 +215,26 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
     await writeJSON(KEYS.cravings, updated);
     try {
       if (user?.id) {
-        await cravingApi.save({
-          craving_type: entry.craving_type, timing: entry.timing, context: entry.context || null,
+        const cravingPayload = {
+          craving_type: entry.craving_type, craving_time: entry.timing, craving_context: entry.context || null,
           mapped_layer: entry.mapped_layer, mechanism: entry.mechanism, tier: entry.tier, confidence: entry.confidence || null,
-        });
+        };
+        const result = await cravingApi.save(cravingPayload);
+        // Reconcile the client-generated temp id with the real Supabase id, so later
+        // updateCraving/deleteCraving calls (which use this id) target a row that actually
+        // exists remotely instead of silently matching nothing.
+        const realId = Array.isArray(result) && result.length > 0 ? result[0]?.id : null;
+        if (realId) {
+          const reconciled = updated.map(c => c.id === newEntry.id ? { ...c, id: realId } : c);
+          setCravingsState(reconciled);
+          await writeJSON(KEYS.cravings, reconciled);
+        } else {
+          console.warn('[saveCraving] Supabase save returned no usable row/id — keeping local temp id:', result);
+        }
       }
-    } catch (e) { console.warn('Craving sync failed (kept locally):', e); }
+    } catch (e) {
+      console.warn('Craving sync failed (kept locally):', e);
+    }
   }, [cravings, user?.id]);
 
   const saveNpsRating = useCallback(async (score: number, context?: { total_score?: number; dominant_layer?: number }) => {
@@ -242,16 +255,44 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
     await writeJSON(KEYS.cravings, updated);
     try {
       if (user?.id) {
-        await cravingApi.update(id, updates);
+        // updates uses the app-facing CravingEntry field names (timing/context) — translate
+        // to the real app_cravings columns (craving_time/craving_context) before sending.
+        const { timing, context, ...restUpdates } = updates;
+        const cravingUpdatePayload: any = { ...restUpdates };
+        if (timing !== undefined) cravingUpdatePayload.craving_time = timing;
+        if (context !== undefined) cravingUpdatePayload.craving_context = context;
+        const result = await cravingApi.update(id, cravingUpdatePayload);
+        // A PATCH matching zero rows still returns a successful HTTP response — with
+        // Prefer: return=representation this comes back as an empty array, indistinguishable
+        // from success unless checked explicitly.
+        const updatedCount = Array.isArray(result) ? result.length : 0;
+        if (updatedCount === 0) {
+          console.warn('[updateCraving] Remote update matched no rows — local state was changed but the Supabase row was not, id:', id);
+        }
       }
-    } catch (e) { console.warn('Craving update sync failed (kept locally):', e); }
+    } catch (e) {
+      console.warn('Craving update sync failed (kept locally):', e);
+    }
   }, [cravings, user?.id]);
 
   const deleteCraving = useCallback(async (id: string) => {
+    if (user?.id) {
+      try {
+        const result = await cravingApi.delete(id);
+        const deletedCount = Array.isArray(result) ? result.length : 0;
+        if (deletedCount === 0) {
+          console.warn('[deleteCraving] Remote delete matched no rows — not removing locally, id:', id);
+          return;
+        }
+      } catch (e) {
+        console.warn('[deleteCraving] Remote delete failed — not removing locally, id:', id, e);
+        return;
+      }
+    }
     const updated = cravings.filter(c => c.id !== id);
     setCravingsState(updated);
     await writeJSON(KEYS.cravings, updated);
-  }, [cravings]);
+  }, [cravings, user?.id]);
 
   const refreshCravings = useCallback(async () => {
     // Always load from AsyncStorage first (instant, offline-friendly)
@@ -266,13 +307,15 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
       const remote = await cravingApi.list(user.id);
       if (Array.isArray(remote) && remote.length > 0) {
         const remoteMapped: CravingEntry[] = remote.map((row: any) => ({
-          id: row.id, craving_type: row.craving_type, timing: row.timing,
-          context: row.context, mapped_layer: row.mapped_layer, mechanism: row.mechanism,
+          id: row.id, craving_type: row.craving_type, timing: row.craving_time,
+          context: row.craving_context, mapped_layer: row.mapped_layer, mechanism: row.mechanism,
           tier: row.tier, confidence: row.confidence, created_at: row.created_at,
         }));
-        // Merge: keep local entries that don't have a remote counterpart (by created_at)
-        const remoteTimestamps = new Set(remoteMapped.map(r => r.created_at));
-        const localOnly = (await readJSON<CravingEntry[]>(KEYS.cravings, [])).filter(l => !remoteTimestamps.has(l.created_at));
+        // Merge: keep local entries that don't have a remote counterpart (by id — created_at
+        // compared a client nowISO() against a server-side timestamp, which could differ by
+        // precision/round-trip and let the same craving survive as two entries).
+        const remoteIds = new Set(remoteMapped.map(r => r.id));
+        const localOnly = (await readJSON<CravingEntry[]>(KEYS.cravings, [])).filter(l => !remoteIds.has(l.id));
         const merged = [...remoteMapped, ...localOnly].sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
         setCravingsState(merged);
         await writeJSON(KEYS.cravings, merged);
@@ -283,7 +326,18 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
   const setSymptoms = useCallback(async (list: SymptomEntry[]) => {
     setSymptomsState(list);
     await writeJSON(KEYS.symptoms, list);
-    try { if (user?.id) await profileApi.updateFields(user.id, { symptoms: list }); } catch (e) { console.warn('Symptoms sync failed:', e); }
+    AsyncStorage.getItem(KEYS.symptoms).then(v => console.log('[DEBUG symptom] local AsyncStorage read-back after setSymptoms write — key present:', v != null, 'entries written:', list.length));
+    try {
+      if (user?.id) {
+        const symptomPayload = { symptoms: list };
+        console.log('[DEBUG symptom] payload sent to profileApi.updateFields:', symptomPayload);
+        const result = await profileApi.updateFields(user.id, symptomPayload);
+        console.log('[DEBUG symptom] raw response from profileApi.updateFields:', result);
+      }
+    } catch (e) {
+      console.log('[DEBUG symptom] error branch fired in setSymptoms:', e);
+      console.warn('Symptoms sync failed:', e);
+    }
   }, [user?.id]);
 
   const setGoals = useCallback(async (list: string[]) => {
@@ -344,12 +398,6 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
     if (!currentUser) {
       try { currentUser = await (await import('../config/supabase')).auth.getSession(); } catch { /* ignore */ }
     }
-    if (!currentUser) {
-      console.warn('[saveScore] No user session — score not saved to Supabase (kept locally only)');
-      setHasScore(true);
-      await AsyncStorage.setItem(KEYS.hasScore, 'true');
-      return;
-    }
     // LOCAL BACKUP: Always save to AsyncStorage first
     const localEntry: ScoreHistoryEntry = {
       id: 'local-' + Date.now(),
@@ -362,6 +410,10 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
     const updatedHistory = [localEntry, ...scoreHistory];
     setScoreHistory(updatedHistory);
     await writeJSON(KEYS.scoreHistory, updatedHistory);
+    if (!currentUser) {
+      console.warn('[saveScore] No user session — score not saved to Supabase (kept locally only)');
+      return;
+    }
     try {
       const result = await scoreApi.save(data);
       if (result && (result.code || result.error) && !Array.isArray(result)) {
@@ -371,8 +423,6 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
         refreshScoreHistory();
       }
     } catch (e) { console.warn('[saveScore] save failed:', e); }
-    setHasScore(true);
-    await AsyncStorage.setItem(KEYS.hasScore, 'true');
   }, [user, scoreHistory, refreshScoreHistory]);
 
   const setMiniQuizAnswers = useCallback(async (layerId: number, answers: number[]) => {

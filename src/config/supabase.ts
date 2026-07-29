@@ -431,6 +431,16 @@ export const cravings = {
     const token = await auth.getToken();
     return await sbFetch(`/rest/v1/app_cravings?user_id=eq.${userId}&select=*&order=created_at.desc&limit=${limit}`, {}, token);
   },
+  async delete(id: string) {
+    const token = await auth.getToken();
+    // No body on a DELETE, so doFetch's auto Prefer header (only added when options.body is
+    // set) wouldn't fire — set it explicitly so the response tells us how many rows matched,
+    // the same signal callers need to detect a delete that silently matched nothing.
+    return await sbFetch(`/rest/v1/app_cravings?id=eq.${id}`, {
+      method: 'DELETE',
+      headers: { 'Prefer': 'return=representation' },
+    }, token);
+  },
 };
 
 // Real payment verification — calls the deployed Cloudflare Worker, replacing the old
