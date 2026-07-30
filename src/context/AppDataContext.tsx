@@ -250,11 +250,8 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
   }, [user?.id]);
 
   const updateCraving = useCallback(async (id: string, updates: Partial<Omit<CravingEntry, 'id' | 'created_at'>>) => {
-    const updated = cravings.map(c => c.id === id ? { ...c, ...updates } : c);
-    setCravingsState(updated);
-    await writeJSON(KEYS.cravings, updated);
-    try {
-      if (user?.id) {
+    if (user?.id) {
+      try {
         // updates uses the app-facing CravingEntry field names (timing/context) — translate
         // to the real app_cravings columns (craving_time/craving_context) before sending.
         const { timing, context, ...restUpdates } = updates;
@@ -264,15 +261,21 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
         const result = await cravingApi.update(id, cravingUpdatePayload);
         // A PATCH matching zero rows still returns a successful HTTP response — with
         // Prefer: return=representation this comes back as an empty array, indistinguishable
-        // from success unless checked explicitly.
+        // from success unless checked explicitly. Same handling as deleteCraving: don't
+        // reflect a change locally that didn't actually happen server-side.
         const updatedCount = Array.isArray(result) ? result.length : 0;
         if (updatedCount === 0) {
-          console.warn('[updateCraving] Remote update matched no rows — local state was changed but the Supabase row was not, id:', id);
+          console.warn('[updateCraving] Remote update matched no rows — not applying locally, id:', id);
+          return;
         }
+      } catch (e) {
+        console.warn('[updateCraving] Remote update failed — not applying locally, id:', id, e);
+        return;
       }
-    } catch (e) {
-      console.warn('Craving update sync failed (kept locally):', e);
     }
+    const updated = cravings.map(c => c.id === id ? { ...c, ...updates } : c);
+    setCravingsState(updated);
+    await writeJSON(KEYS.cravings, updated);
   }, [cravings, user?.id]);
 
   const deleteCraving = useCallback(async (id: string) => {

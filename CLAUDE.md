@@ -70,6 +70,43 @@ Follow it without being reminded.
   network failures that can look identical to real bugs. Always confirm a stable tunnel and
   a full app close/reopen before trusting a test result as clean evidence.
 
+## Known Issues — Carry Forward (documented, not yet fixed)
+
+Specific open bugs that have been diagnosed but deliberately not fixed yet. Unlike the
+failure-pattern list above (bug *classes* to watch for), these are concrete, located
+instances — check this list before re-diagnosing something that's already understood.
+
+- **HomeScreen's expanded "Fat Loss Resistance" detail view shows nothing after sign-in
+  without retaking the test this session.** `App.tsx`, `HomeScreen`, the score-summary
+  card's expanded section (~line 1930, the block using `generateLocalN1`/`rcsInfo`) is
+  gated on `scoreResult` only, deliberately — it needs full quiz-answer data that
+  `scoreHistory` doesn't persist. Net effect: after sign-in without retaking the test this
+  session, tapping the score-summary card still expands correctly, but this inner section
+  renders nothing — no error, just empty. Same root pattern as the Home/Profile "Metabolic
+  Story" `scoreResult`-vs-`scoreHistory` gap fixed 2026-07-29 (see session log), but this
+  specific spot was deliberately left unfixed since there's no persisted data to fall back
+  to (not a bug in the fallback logic — a genuine data-availability limit, same as noted in
+  the 2026-07-29 entries).
+- **Pre-launch audit needed: every other `scoreResult` read for the same gap.** Flagged
+  2026-07-30, not yet done. Candidates specifically named: the 5 Layers detail pad, and
+  personalized article/video recommendations tied to dominant layer or pattern — but the
+  actual audit should be a full grep of every `scoreResult` read in `App.tsx`, confirming
+  each either (a) has a `scoreHistory[0]` fallback, or (b) is an intentional, documented
+  exception like the one above. Should happen before App Store submission.
+
+## Future Ideas Registry (flagged, not scoped into active work)
+
+Roadmap ideas raised mid-session and deliberately not acted on now, per rule 6. Living list,
+not a session-log entry — check here before re-proposing something already captured.
+
+- **Inter-test change attribution (v1.1 idea, flagged 2026-07-30).** When a user retakes
+  the assessment, surface what specifically changed between the two tests (which
+  questions/layers shifted), not just the total score delta. `scoreHistory` already stores
+  full per-question answers, so the raw data exists — this needs comparison/diff logic and
+  a narrative layer, not new instrumentation. Pairs naturally with the already-planned
+  Adaptive Clarification Loop and Clinical Logic Registry work (referenced by Amit as
+  existing planned work outside this repo's own documentation — not detailed here).
+
 ## Source-of-truth rules
 
 - This GitHub repo (`amitbaruna/metabolicscore-app`) is now the single source of truth for
@@ -94,6 +131,85 @@ Follow it without being reminded.
 Update this at the end of every session (either with Claude Code or with Claude in
 chat) — what got fixed, what's still open. Keep entries short; this is a fast
 "where did we leave off" scan, not a full changelog. Newest entry on top.
+
+### 2026-07-30 — updateCraving rollback fix device-confirmed; three architecture/product decisions logged; Google 2FA sign-in issue observed (not reproduced); v1.1 idea flagged
+
+**Decisions made (not yet implemented in code):**
+1. **Baseline architecture, resolved — scope corrected 2026-07-30 after auditing actual
+   `baseline` JSONB usage in detail.** Migration scope is `age`/`height`/`weight` from
+   `BaselineEntry` only, becoming flat `age`/`height_cm`/`weight_kg` columns on
+   `app_profiles` — closes the open
+   architecture question noted 2026-07-25. `age` stored as an exact integer, not banded —
+   needed for flexible age-window filtering (e.g. "33–40") at query time. `weight_kg` is
+   current-value-only; a full weight-history table is explicitly deferred to a future
+   session alongside the planned Longitudinal app architecture work. Migration spec written,
+   not yet run. Confirmed low-risk: one writer (`setBaseline`), one
+   reader/editor (`ProfileScreen`'s Baseline row), zero downstream dependencies — no scoring
+   engine, no reports, nothing else reads these fields.
+   - **`fat_deposition` removed from this migration's scope** — it was never in the
+     `baseline` JSONB to begin with. It's already its own flat column
+     (`profileApi.updateFields(user.id, { fat_deposition: id })`, separate `setFatDeposition`
+     function) — nothing to migrate.
+   - **`activity_level` removed from this migration's scope** — it doesn't exist anywhere
+     in the app currently (confirmed via grep, zero matches). Not a migration of existing
+     data; it would be a new feature needing its own design pass (what values, where
+     collected, whether it feeds the scoring engine) before any implementation. Tracked
+     separately as an unscoped future feature decision, not bundled into the baseline
+     column migration.
+   - **Distinct from an unrelated same-named field, worth not conflating:**
+     `BaselineEntry.age` (this migration's subject — free-text, entered in `ProfileScreen`'s
+     Baseline row) is unrelated to `UserData.age` (a separate concept — scoring-engine
+     input, currently hardcoded to the literal `'26–35'` everywhere it appears rather than
+     collected from any real question). Same field name, different concepts, different code
+     paths — future work on either must not conflate them.
+2. **Stress-slider tie-break mechanism, confirmed working as designed.**
+   `pickDominantLayer` uses SLI/GSI severity + cascade participation to break ties, not
+   array order. Decision: do not disclose this mechanism to users — no code changes needed.
+3. **Secondary pattern** (`computePatternEngine`'s `secondary_pattern`, gated at 50%
+   confidence): decision is no changes for now — revisit once real users are active on the
+   app and there's usage data to inform whether surfacing it helps.
+
+**Fixed and device-confirmed:**
+- `updateCraving` now mirrors `deleteCraving`'s failure handling exactly (closes the gap
+  flagged in the 2026-07-29 (cont'd 2) entry below): both a zero-match PATCH response and a
+  thrown exception leave local state and AsyncStorage untouched, returning early with a
+  warning log instead of silently applying an edit the server never confirmed. Only a
+  genuine successful response falls through to update local state.
+
+**Schema-check finding — not yet investigated further:** the `npm run schema:check` run
+this session (2026-07-30) showed `app_scores` already has unused columns for `sli`, `bri`,
+`gsi`, `syli`, `secondary_pattern`, `secondary_pattern_confidence`, `dominant_layer`,
+`cascade_risk`, `cascade_risks`, `adaptive_questions_asked`/`adaptive_questions_answered`,
+`pattern_outcome`, `sleep_rating`, `stress_rating`, `gut_rating`. This likely means the
+`cascade_risk`/`dominant_layer` persistence work (to restore the Metabolic Story animation
+permanently, rather than the lightweight layer-breakdown fallback shipped 2026-07-29) may
+only need app-side write/read wiring, not a new migration — these columns may already exist
+from an earlier unfinished attempt. **Before starting that work:** confirm column
+types/nullability actually match what's needed — column existence alone doesn't confirm
+that.
+
+**Investigated, not fixed — logged for awareness:**
+- Google sign-in on `personaltraining9891` (a 2FA-required account) intermittently hangs on
+  code exchange (`[Error: authorization grant invalid/expired]`) but resolves on retry with
+  no code changes. Suspected: 2FA verification latency causing the auth code to age out
+  before exchange completes. Not reproduced on demand — no fix attempted, needs a
+  repeatable trigger before further investigation. Low priority unless it recurs frequently
+  or blocks real users. Cross-account score isolation was confirmed correct during this same
+  test (`personaltraining9891` showed 43, `amit.baruna` showed 29 — no contamination between
+  accounts).
+
+**Pre-launch audit item (not started)** — also tracked in Known Issues — Carry Forward
+above: Score-summary card's expanded "Fat Loss Resistance" section is deliberately gated on
+`scoreResult` only (needs full quiz-answer data `scoreHistory` doesn't persist) — expands
+but shows nothing after sign-in without a fresh test, no error. Same root pattern as the
+Home/Profile Metabolic Story gap fixed 2026-07-29. Before App Store submission: grep every
+`scoreResult` read across the app (5 Layers detail pad, personalized article/video
+recommendations) and confirm each has a `scoreHistory[0]` fallback or is an intentional
+documented exception like this one.
+
+**v1.1 idea flagged, not scoped into active work** — see Future Ideas Registry above:
+inter-test change attribution (surfacing which specific questions/layers shifted between
+two assessments, not just the total score delta).
 
 ### 2026-07-29 (cont'd 2) — Craving schema fix + id-reconciliation bug family fixed; all temp debug logs removed (code-complete, NOT yet device-tested)
 
