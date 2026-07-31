@@ -907,12 +907,14 @@ function CascadeVisualization({
   colors,
   onNavigate,
   onWorkOnThis,
+  alwaysShowIcon = false,
 }: {
   scoreResult: any;
   defaultCascadeIdx?: number;
   colors: ThemeColors;
   onNavigate?: (s: ScreenId) => void;
   onWorkOnThis?: () => void;
+  alwaysShowIcon?: boolean;
 }) {
   const containerW = SCREEN_WIDTH - 48;
   const { clinicalDepth } = useClinicalDepth();
@@ -1210,7 +1212,7 @@ function CascadeVisualization({
                       shadowRadius: isActive ? 18 : 4,
                       shadowOffset: { width: 0, height: 0 },
                     }}>
-                      {clinicalDepth ? <Text style={{ fontSize: 16, fontWeight: '800', color: layer.color, lineHeight: 20 }}>{score}</Text> : <LayerIcon name={layer.icon} size={16} color={layer.color} />}
+                      {clinicalDepth && !alwaysShowIcon ? <Text style={{ fontSize: 16, fontWeight: '800', color: layer.color, lineHeight: 20 }}>{score}</Text> : <LayerIcon name={layer.icon} size={16} color={layer.color} />}
                     </View>
                     <Text style={{ fontSize: 8, fontWeight: '600', color: isActive ? layer.color : colors.textTertiary, letterSpacing: 0.3, textTransform: 'uppercase' }}>
                       {clinicalDepth ? (layer.shortName.split(' \u2014 ')[1] || layer.key) : LAYER_PLAIN_SHORT[layer.id - 1]}
@@ -1317,7 +1319,7 @@ function CascadeVisualization({
               shadowRadius: isActive ? 20 : 0,
               shadowOffset: { width: 0, height: 0 },
             }}>
-              {clinicalDepth ? <Text style={{ fontSize: 20, fontWeight: '800', color: layer.color, lineHeight: 24 }}>{score}</Text> : <LayerIcon name={layer.icon} size={20} color={layer.color} />}
+              {clinicalDepth && !alwaysShowIcon ? <Text style={{ fontSize: 20, fontWeight: '800', color: layer.color, lineHeight: 24 }}>{score}</Text> : <LayerIcon name={layer.icon} size={20} color={layer.color} />}
               <Text style={{ fontSize: 7, fontWeight: '700', color: layer.color, opacity: isActive ? 1 : 0.55, letterSpacing: 0.5, marginTop: 1, textTransform: 'uppercase' }}>
                 {clinicalDepth ? (layer.shortName.split(' \u2014 ')[1] || layer.key) : LAYER_PLAIN_SHORT[layer.id - 1]}
               </Text>
@@ -1402,7 +1404,7 @@ function CascadeVisualization({
               shadowRadius: isActive ? 22 : 0,
               shadowOffset: { width: 0, height: 0 },
             }}>
-              {clinicalDepth ? <Text style={{ fontSize: 20, fontWeight: '800', color: layer.color, lineHeight: 24 }}>{score}</Text> : <LayerIcon name={layer.icon} size={20} color={layer.color} />}
+              {clinicalDepth && !alwaysShowIcon ? <Text style={{ fontSize: 20, fontWeight: '800', color: layer.color, lineHeight: 24 }}>{score}</Text> : <LayerIcon name={layer.icon} size={20} color={layer.color} />}
               <Text style={{ fontSize: 7, fontWeight: '700', color: layer.color, opacity: isActive ? 1 : 0.55, letterSpacing: 0.5, marginTop: 1, textTransform: 'uppercase' }}>
                 {clinicalDepth ? (layer.shortName.split(' \u2014 ')[1] || layer.key) : LAYER_PLAIN_SHORT[layer.id - 1]}
               </Text>
@@ -2006,6 +2008,7 @@ function HomeScreen({ onNavigate, hasScore, scoreResult, onSelectLayer, onNaviga
                   colors={colors}
                   onNavigate={onNavigate}
                   onWorkOnThis={triggerTodaysOneBlink}
+                  alwaysShowIcon
                 />
               )}
               {/* When there's no fresh in-session scoreResult (e.g. signed in without retaking
@@ -2024,6 +2027,7 @@ function HomeScreen({ onNavigate, hasScore, scoreResult, onSelectLayer, onNaviga
                       colors={colors}
                       onNavigate={onNavigate}
                       onWorkOnThis={triggerTodaysOneBlink}
+                      alwaysShowIcon
                     />
                   );
                 }
@@ -3207,7 +3211,16 @@ function ResultsScreen({ onNavigate, result, userData, autoExpandN3, onSelectLay
 function LayersHubScreen({ onNavigate, onSelectLayer, hasScore, scoreResult }: { onNavigate: (s: ScreenId) => void; onSelectLayer?: (id: number) => void; hasScore?: boolean; scoreResult?: any }) {
   const { colors } = useTheme();
   const { clinicalDepth } = useClinicalDepth();
-  const layerScores: Record<number, number> = scoreResult?.sc ?? {};
+  const { scoreHistory } = useAppData();
+  // Fall back to the latest persisted assessment when scoreResult hasn't been set yet this
+  // session (e.g. signed in without retaking the quiz) — same pattern as HomeScreen's
+  // fallbackLayerScores/dominantLayerId.
+  const latestHistory = scoreHistory[0];
+  const fallbackLayerScores = latestHistory
+    ? { 1: latestHistory.layer1, 2: latestHistory.layer2, 3: latestHistory.layer3, 4: latestHistory.layer4, 5: latestHistory.layer5 }
+    : null;
+  const layerScores: Record<number, number> = scoreResult?.sc ?? fallbackLayerScores ?? {};
+  const dominantLayerId = scoreResult?.dominantLayer ?? latestHistory?.dominant_layer ?? null;
   return (
     <View style={{ flex: 1, backgroundColor: colors.bg }}>
       <SafeAreaView style={{ flex: 1 }} edges={['top']}>
@@ -3220,7 +3233,7 @@ function LayersHubScreen({ onNavigate, onSelectLayer, hasScore, scoreResult }: {
             {LAYERS.map(layer => {
               const ls = layerScores[layer.id];
               const hasChip = typeof ls === 'number';
-              const isDominant = hasScore && layer.id === scoreResult?.dominantLayer;
+              const isDominant = hasScore && layer.id === dominantLayerId;
               const needsAttention = hasChip && ls <= 11;
               const sc = !hasChip ? colors.textTertiary : ls >= 14 ? '#22C55E' : ls >= 9 ? '#F59E0B' : '#EF4444';
               const displayName = clinicalDepth ? layer.name : (LAYER_PLAIN[layer.id - 1].charAt(0).toUpperCase() + LAYER_PLAIN[layer.id - 1].slice(1));
