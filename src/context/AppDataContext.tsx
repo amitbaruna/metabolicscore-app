@@ -53,6 +53,7 @@ export type MiniQuizMap = Record<number, number[]>;
 
 type DataContextType = {
   hasScore: boolean;
+  fullName: string;
   scoreHistory: ScoreHistoryEntry[];
   refreshScoreHistory: () => Promise<void>;
   saveProfile: (data: any) => Promise<void>;
@@ -119,6 +120,7 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
   const [conditions, setConditionsState] = useState<string[]>([]);
   const [scoreHistory, setScoreHistory] = useState<ScoreHistoryEntry[]>([]);
   const hasScore = scoreHistory.length > 0;
+  const [fullName, setFullNameState] = useState<string>('');
   const [miniQuiz, setMiniQuizState] = useState<MiniQuizMap>({});
   const [lastQuizAnswers, setLastQuizAnswersState] = useState<{ layer: number; q: number; selected: number[]; score: number }[]>([]);
 
@@ -162,6 +164,9 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
       setFatDepositionState(fd); setBaselineState(bl); setScoreHistory(sh);
       setMiniQuizState(mq); setLastQuizAnswersState(lqa);
       setConditionsState(cond);
+      // Not cached in AsyncStorage (fetched fresh from the profile row below) — reset here
+      // so a new identity never briefly shows the previous account's name.
+      setFullNameState('');
 
       if (user?.id) {
         try {
@@ -197,6 +202,7 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
           }
           if (Array.isArray(remoteProfile) && remoteProfile.length > 0) {
             const p = remoteProfile[0];
+            if (p.full_name) setFullNameState(p.full_name);
             if (Array.isArray(p.symptoms)) { setSymptomsState(p.symptoms); await writeJSON(KEYS.symptoms, p.symptoms); }
             if (Array.isArray(p.goals)) { setGoalsState(p.goals); await writeJSON(KEYS.goals, p.goals); }
             if (p.fat_deposition) { setFatDepositionState(p.fat_deposition); await AsyncStorage.setItem(KEYS.fatDeposition, p.fat_deposition); }
@@ -377,6 +383,10 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
     try {
       const result = await profileApi.upsert({ id: user.id, email: user.email, ...data });
       console.log('[saveProfile] upsert result:', result);
+      // Identity doesn't change on a fresh onboarding save, so the identity-change effect
+      // above won't refire to pick this up — set it immediately so Home/Profile reflect
+      // a just-onboarded name without needing a re-sign-in.
+      if (data.full_name) setFullNameState(data.full_name);
     } catch (e) { console.warn('[saveProfile] upsert THREW:', e); }
   }, [user]);
 
@@ -450,7 +460,7 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
 
   return (
     <DataContext.Provider value={{
-      hasScore, scoreHistory, refreshScoreHistory, saveProfile, saveScore,
+      hasScore, fullName, scoreHistory, refreshScoreHistory, saveProfile, saveScore,
       cravings, saveCraving, updateCraving, saveNpsRating, deleteCraving, refreshCravings, symptoms, setSymptoms, goals, setGoals,
       fatDeposition, setFatDeposition, baseline, setBaseline, conditions, setConditions,
       miniQuiz, setMiniQuizAnswers, lastQuizAnswers, setLastQuizAnswers, loading,

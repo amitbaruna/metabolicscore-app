@@ -1479,14 +1479,22 @@ function CascadeVisualization({
   );
 }
 
+function getTimeOfDayGreeting(): string {
+  const hour = new Date().getHours();
+  if (hour < 12) return 'Good morning';
+  if (hour < 17) return 'Good afternoon';
+  return 'Good evening';
+}
+
 // ============================================================
 // HOME SCREEN
 // ============================================================
 
 function HomeScreen({ onNavigate, hasScore, scoreResult, onSelectLayer, onNavigateToResultsFromHope, onSelectArticle, onGoToCravings, highlightTodaysOne }: { onNavigate: (s: ScreenId) => void; hasScore: boolean; scoreResult?: any; onSelectLayer?: (id: number) => void; onNavigateToResultsFromHope?: () => void; onSelectArticle?: (a: Insight) => void; onGoToCravings?: (from: ScreenId) => void; highlightTodaysOne?: number }) {
   const { colors, theme, toggleTheme } = useTheme();
+  const { user } = useAuth();
   const { clinicalDepth, toggleClinicalDepth } = useClinicalDepth();
-  const { cravings: loggedCravings, deleteCraving, symptoms: ctxSymptoms, scoreHistory, refreshCravings, conditions: ctxConditions } = useAppData();
+  const { fullName, cravings: loggedCravings, deleteCraving, symptoms: ctxSymptoms, scoreHistory, refreshCravings, conditions: ctxConditions } = useAppData();
   useEffect(() => { refreshCravings(); }, [refreshCravings]);
   // Derived fresh every render from real data (hasScore/scoreResult come from AppDataContext,
   // scoreHistory is the live Supabase-backed list) — not captured once at mount, so it stays
@@ -1730,8 +1738,8 @@ function HomeScreen({ onNavigate, hasScore, scoreResult, onSelectLayer, onNaviga
           {/* Header */}
           <View style={{ paddingHorizontal: 24, paddingTop: 12, paddingBottom: 8, flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}>
             <View>
-              <Text style={{ fontSize: 11, color: colors.textSecondary }}>Good morning,</Text>
-              <Text style={{ fontSize: 20, fontWeight: '700', color: colors.text, marginTop: 2 }}>Amit</Text>
+              <Text style={{ fontSize: 11, color: colors.textSecondary }}>{getTimeOfDayGreeting()},</Text>
+              <Text style={{ fontSize: 20, fontWeight: '700', color: colors.text, marginTop: 2 }}>{fullName || 'Friend'}</Text>
             </View>
             <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
               {showPostTest && (
@@ -1747,7 +1755,7 @@ function HomeScreen({ onNavigate, hasScore, scoreResult, onSelectLayer, onNaviga
                 <View style={{ position: 'absolute', top: 8, right: 9, width: 7, height: 7, borderRadius: 4, backgroundColor: colors.red }} />
               </View>
               <TouchableOpacity onPress={() => onNavigate('profile')} style={{ width: 40, height: 40, borderRadius: 20, backgroundColor: colors.card, borderWidth: 1, borderColor: colors.border, alignItems: 'center', justifyContent: 'center' }}>
-                <Text style={{ fontSize: 13, fontWeight: '700', color: colors.text }}>A</Text>
+                <Text style={{ fontSize: 13, fontWeight: '700', color: colors.text }}>{(fullName || user?.email || 'A').charAt(0).toUpperCase()}</Text>
               </TouchableOpacity>
             </View>
           </View>
@@ -4681,16 +4689,8 @@ function ProfileScreen({ onNavigate, hasScore, scoreResult, onGoToCravings, onGo
   const { colors, theme, toggleTheme } = useTheme();
   const { signOut, user } = useAuth();
   const { clinicalDepth, toggleClinicalDepth } = useClinicalDepth();
-  const [realName, setRealName] = useState<string>('');
-  useEffect(() => {
-    if (!user?.id) return;
-    profiles.get(user.id).then(rows => {
-      const row = Array.isArray(rows) ? rows[0] : null;
-      if (row?.full_name) setRealName(row.full_name);
-    }).catch(() => {});
-  }, [user?.id]);
   const {
-    cravings: loggedCravings, symptoms: ctxSymptoms, setSymptoms: ctxSetSymptoms,
+    fullName, cravings: loggedCravings, symptoms: ctxSymptoms, setSymptoms: ctxSetSymptoms,
     goals: ctxGoals, setGoals: ctxSetGoals, fatDeposition: ctxFatDeposition, setFatDeposition: ctxSetFatDeposition,
     baseline: ctxBaseline, setBaseline: ctxSetBaseline, scoreHistory, refreshScoreHistory,
     conditions: ctxConditions, setConditions: ctxSetConditions,
@@ -4836,10 +4836,10 @@ function ProfileScreen({ onNavigate, hasScore, scoreResult, onGoToCravings, onGo
           <View style={{ paddingHorizontal: 24, paddingTop: 12, paddingBottom: 16 }}>
             <View style={{ flexDirection: 'row', alignItems: 'center' }}>
               <View style={{ width: 64, height: 64, borderRadius: 16, backgroundColor: colors.red, alignItems: 'center', justifyContent: 'center' }}>
-                <Text style={{ fontSize: 20, fontWeight: '700', color: '#fff' }}>{(realName || user?.email || 'A').charAt(0).toUpperCase()}</Text>
+                <Text style={{ fontSize: 20, fontWeight: '700', color: '#fff' }}>{(fullName || user?.email || 'A').charAt(0).toUpperCase()}</Text>
               </View>
               <View style={{ flex: 1, marginLeft: 16 }}>
-                <Text style={{ fontSize: 18, fontWeight: '700', color: colors.text }}>{realName || 'Friend'}</Text>
+                <Text style={{ fontSize: 18, fontWeight: '700', color: colors.text }}>{fullName || 'Friend'}</Text>
                 <Text style={{ fontSize: 12, color: colors.textSecondary, marginTop: 2 }}>{user?.email || ''}</Text>
                 <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6, marginTop: 8, paddingVertical: 4, paddingHorizontal: 10, borderRadius: 8, backgroundColor: `${colors.red}14`, alignSelf: 'flex-start' }}>
                   <Ionicons name="flash" size={12} color={colors.red} />
