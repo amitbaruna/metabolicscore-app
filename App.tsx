@@ -1642,7 +1642,14 @@ function HomeScreen({ onNavigate, hasScore, scoreResult, onSelectLayer, onNaviga
     setTimeout(() => { setActionDoneFlash(false); setActionDone(true); }, 3000);
   };
 
-  const layerScores: Record<number, number> = scoreResult?.sc ?? {};
+  // Fall back to the latest persisted assessment when scoreResult hasn't been set yet
+  // this session (e.g. signed in without retaking the quiz) instead of silently treating
+  // layer data as absent — same fallback precedence used for score/band/dominantLayerId below.
+  const latestHistory = scoreHistory[0];
+  const fallbackLayerScores = latestHistory
+    ? { 1: latestHistory.layer1, 2: latestHistory.layer2, 3: latestHistory.layer3, 4: latestHistory.layer4, 5: latestHistory.layer5 }
+    : null;
+  const layerScores: Record<number, number> = scoreResult?.sc ?? fallbackLayerScores ?? {};
   const hasLayerScores = Object.keys(layerScores).length > 0;
   const sortedLayers = hasLayerScores ? [...LAYERS].sort((a, b) => (layerScores[a.id] ?? 0) - (layerScores[b.id] ?? 0)) : LAYERS;
   const getLayerSignal = (layerId: number): string | null => {
@@ -1656,20 +1663,14 @@ function HomeScreen({ onNavigate, hasScore, scoreResult, onSelectLayer, onNaviga
   };
 
   // FIX 3: Use real score from test result. Fallback to 0 only (never show fake 64).
-  // Fall back to the latest persisted assessment when scoreResult hasn't been
-  // set yet this session (e.g. app was just reopened) instead of defaulting
-  // to a hardcoded layer. Only true first-time users (no scoreResult AND no
-  // history) fall through to the layer-2 default.
-  const latestHistory = scoreHistory[0];
+  // Only true first-time users (no scoreResult AND no history) fall through to the
+  // layer-2 default below.
   const score = scoreResult?.totalScore ?? latestHistory?.total_score ?? 0;
   // Same fallback precedence as `score` above — prefer the fresh in-session result,
   // fall back to the persisted band for the latest historical assessment.
   const band = scoreResult?.band ?? (latestHistory ? getBand(score) : null);
   const prevScore = scoreHistory[1]?.total_score;
   const scoreDelta = prevScore != null ? score - prevScore : null;
-  const fallbackLayerScores = latestHistory
-    ? { 1: latestHistory.layer1, 2: latestHistory.layer2, 3: latestHistory.layer3, 4: latestHistory.layer4, 5: latestHistory.layer5 }
-    : null;
   const fallbackDominantLayerId = fallbackLayerScores
     ? Object.entries(fallbackLayerScores).sort((a, b) => a[1] - b[1])[0][0]
     : null;
