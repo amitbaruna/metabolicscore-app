@@ -859,11 +859,14 @@ function getCascadeSignalQuote(scoreResult: any, layerId: number): string | null
 function reconstructScoreResultFromHistory(entry: ScoreHistoryEntry): Partial<ScoreResult> | null {
   if (entry.cascade_risk == null || entry.dominant_layer == null) return null;
   return {
+    totalScore: entry.total_score,
+    band: getBand(entry.total_score),
     cascadeRisk: entry.cascade_risk,
     dominantLayer: entry.dominant_layer,
     sc: { 1: entry.layer1, 2: entry.layer2, 3: entry.layer3, 4: entry.layer4, 5: entry.layer5 },
     rcsInfo: getRCSInfo(entry.rcs ?? 0),
     history: entry.answers || [],
+    patternEngine: { dominant_pattern: entry.dominant_pattern || '' } as ScoreResult['patternEngine'],
   };
 }
 
@@ -1945,14 +1948,20 @@ function HomeScreen({ onNavigate, hasScore, scoreResult, onSelectLayer, onNaviga
                   </View>
                   )}
 
-                  {scorePadExpanded && scoreResult && homeSections['resistance'] !== false && (() => {
-                    const rcsPct = scoreResult?.rcsInfo?.compPct ?? 0;
+                  {scorePadExpanded && homeSections['resistance'] !== false && (() => {
+                    // scoreResult is in-session-only (null after sign-in without retaking the quiz).
+                    // Reconstruct from the latest persisted row when possible; reconstructScoreResultFromHistory
+                    // itself returns null for rows saved before the 2026-07-30 cascade_risk/dominant_layer
+                    // persistence fix, so pre-fix rows correctly fall through to "show nothing" below.
+                    const effectiveScoreResult = scoreResult ?? (latestHistory ? reconstructScoreResultFromHistory(latestHistory) : null);
+                    if (!effectiveScoreResult) return null;
+                    const rcsPct = effectiveScoreResult?.rcsInfo?.compPct ?? 0;
                     const rcsColor = getResistanceColor(rcsPct);
                     const rcsTier = getResistanceTier(rcsPct);
-                    const pointsAvailable = scoreResult?.history ? scoreResult.history.reduce((sum: number, h: any) => sum + ([0, 3, 3, 5, 4][h.ansIdx] || 0), 0) : (score <= 30 ? 35 : score <= 50 ? 25 : score <= 70 ? 15 : 8);
+                    const pointsAvailable = effectiveScoreResult?.history ? effectiveScoreResult.history.reduce((sum: number, h: any) => sum + ([0, 3, 3, 5, 4][h.ansIdx] || 0), 0) : (score <= 30 ? 35 : score <= 50 ? 25 : score <= 70 ? 15 : 8);
                     const weeksEstimate = score <= 30 ? '10–14' : score <= 50 ? '8–12' : '6–10';
                     const n1UserData = { gender: 'Male', age: '26–35', conditions: ctxConditions || [], sleepScore: 5, stressScore: 5, gutScore: 5 };
-                    const n1Narrative = generateLocalN1(scoreResult, n1UserData);
+                    const n1Narrative = generateLocalN1(effectiveScoreResult as ScoreResult, n1UserData);
                     return (
                       <View style={{ marginTop: 16, paddingTop: 16, borderTopWidth: 1, borderTopColor: colors.border }}>
                         <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8, marginBottom: 8 }}>
@@ -6666,7 +6675,7 @@ function BottomNav({ active, onNavigate, hasScore }: { active: string; onNavigat
 
 function AppNavigator() {
   const { user, loading } = useAuth();
-  const { hasScore, saveScore, setLastQuizAnswers } = useAppData();
+  const { hasScore, saveScore, setLastQuizAnswers, scoreHistory } = useAppData();
   const [screen, setScreen] = useState<ScreenId>('splash');
   const [scoreResult, setScoreResult] = useState<ScoreResult | null>(null);
   // In-memory only (not persisted) — reset on sign-in/sign-out/account switch so a
@@ -6750,7 +6759,15 @@ function AppNavigator() {
     case 'onboarding': return <OnboardingScreen onNavigate={navigate} />;
     case 'home': return <HomeScreen onNavigate={navigate} hasScore={hasScore || !!scoreResult} scoreResult={scoreResult} onSelectLayer={(id) => { setSelectedLayer(id); navigate('layer-detail'); }} onNavigateToResultsFromHope={navigateToResultsFromHope} onSelectArticle={(a) => { setSelectedArticle(a); navigate('article-reader'); }} onGoToCravings={goToCravings} highlightTodaysOne={highlightTodaysOne} />;
     case 'score': return <ScoreToolScreen onNavigate={navigate} onComplete={handleScoreComplete} />;
-    case "results": return scoreResult ? <ResultsScreen onNavigate={navigate} result={scoreResult} userData={userData} autoExpandN3={autoExpandN3} onSelectLayer={(id) => setSelectedLayer(id)} /> : <HomeScreen onNavigate={navigate} hasScore={hasScore} />;
+    case "results": {
+      // scoreResult is in-session-only (null after sign-in without retaking the quiz this
+      // session). Falls back to reconstructing from the latest persisted row, same pattern
+      // as the score-summary card's expanded section — reconstructScoreResultFromHistory
+      // itself returns null for rows saved before the 2026-07-30 cascade_risk/dominant_layer
+      // persistence fix, so pre-fix rows correctly still show nothing (HomeScreen) here.
+      const effectiveScoreResult = scoreResult ?? (scoreHistory[0] ? reconstructScoreResultFromHistory(scoreHistory[0]) : null);
+      return effectiveScoreResult ? <ResultsScreen onNavigate={navigate} result={effectiveScoreResult as ScoreResult} userData={userData} autoExpandN3={autoExpandN3} onSelectLayer={(id) => setSelectedLayer(id)} /> : <HomeScreen onNavigate={navigate} hasScore={hasScore} />;
+    }
     case 'layers': return <LayersHubScreen onNavigate={navigate} onSelectLayer={(id) => { setSelectedLayer(id); navigate('layer-detail'); }} hasScore={hasScore || !!scoreResult} scoreResult={scoreResult} />;
     case 'layer-detail': return <LayerDetailScreen onNavigate={navigate} layerId={selectedLayer} onSelectArticle={(a) => { setSelectedArticle(a); navigate('article-reader'); }} />;
     case 'library': return <LibraryScreen onNavigate={navigate} hasScore={hasScore || !!scoreResult} scoreResult={scoreResult} onSelectArticle={(a) => { setSelectedArticle(a); navigate('article-reader'); }} />;
