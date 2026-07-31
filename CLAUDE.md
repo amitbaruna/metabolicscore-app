@@ -132,6 +132,73 @@ Update this at the end of every session (either with Claude Code or with Claude 
 chat) — what got fixed, what's still open. Keep entries short; this is a fast
 "where did we leave off" scan, not a full changelog. Newest entry on top.
 
+### 2026-07-31 — Cascade persistence restored end-to-end (Home, Results, Layers); greeting fixed; baseline/activity_level architecture decisions finalized
+
+**Fixed and device-confirmed today, all committed:**
+1. **`cascade_risk`/`dominant_layer` now persist on `app_scores`** — write path in
+   `handleScoreComplete`, read path in both `scoreHistory` mapping sites plus `saveScore`'s
+   local entry, type additions to `ScoreHistoryEntry`. Restores the real Metabolic Story
+   animation (via `reconstructScoreResultFromHistory`) after sign-in without a fresh test —
+   previously fell back to only a lightweight summary card.
+2. **Score-summary card's "Fat Loss Resistance" expanded section** now works off
+   reconstructed data too — needed `patternEngine.dominant_pattern` added to the
+   reconstruction helper.
+3. **Results screen ("Read full analysis" link) crash fixed** — was throwing
+   `TypeError: Cannot read property 'status' of undefined` in the reconstructed-from-history
+   path. Fixed by adding `totalScore` and `band` to `reconstructScoreResultFromHistory`'s
+   return value, and wiring the results screen's router case to use a reconstructed object
+   when live `scoreResult` is null.
+4. **Home's 5 Layers swipe pad, Latest Insights, and Case Studies** were silently falling
+   back to static/default order (no personalization) in the reconstructed path — fixed by
+   wiring the shared `layerScores` variable to fall back to the already-existing
+   `fallbackLayerScores` local instead of `{}`. Also wired `getLayerSignal`'s "Your signal"
+   quote to the same fallback.
+5. **Standalone Layers tab (bottom nav)** had the identical gap — same fix pattern applied
+   (`useAppData()` for `scoreHistory`, `dominantLayerId` fallback).
+6. **Home's Metabolic Story cascade circles** were showing numeric scores in Clinical Depth
+   mode, icons in Simple mode — changed to always show icons in both modes, **on Home
+   specifically**. Added an `alwaysShowIcon` prop to `CascadeVisualization`, default off,
+   only passed at Home's two call sites — Profile's circles still show numbers in Clinical
+   Depth mode, unchanged.
+7. **HomeScreen's greeting was hardcoded to "Good morning, Amit"** regardless of actual time
+   or signed-in account. Fixed: `full_name` centralized into `AppDataContext` (previously
+   fetched independently and duplicated by `ProfileScreen` — that duplicate fetch removed),
+   greeting now shows real time-of-day (morning/afternoon/evening) and the actual signed-in
+   user's name; avatar initial fixed to match.
+8. **`updateCraving` now mirrors `deleteCraving`'s failure handling exactly** — both a
+   zero-match PATCH and a thrown exception leave local state untouched rather than silently
+   applying an unconfirmed edit.
+
+**Corrected/finalized architecture decisions** (from 2026-07-30, superseding earlier
+inaccurate framing):
+- `fat_deposition` was already a flat column, never in the `baseline` JSONB — no migration
+  needed for it.
+- `activity_level` does not exist anywhere in the app — it's a new feature to design
+  (values, collection point, whether it feeds scoring), not a migration.
+- Confirmed baseline migration scope: just `age`/`height`/`weight` from `BaselineEntry`, one
+  writer (`setBaseline`), one reader/editor (`ProfileScreen`'s Baseline row), zero downstream
+  dependencies. Low risk, not yet built.
+- `BaselineEntry.age` (Profile, free-text) is unrelated to `UserData.age` (scoring-engine
+  input, currently hardcoded, never collected from a real question) — same field name,
+  different concepts, must not be conflated in future work.
+
+**Still open — carry forward, not yet started:**
+- Profile name-*editing* (today only fixed display, via centralized `full_name` — no UI
+  exists yet to let a user change their name).
+- Profile picture upload — explicitly deferred to v1.1.
+- `personaltraining9891`'s Google sign-in intermittently hangs on code exchange — recurring,
+  not just a one-off (upgraded from yesterday's "low priority, unreproducible" note). Needs
+  live-captured terminal output during an actual hang, not diagnosable from memory — this is
+  the priority evidence still missing.
+- Pre-launch `scoreResult` audit — HomeScreen and Results screen are now fully covered, but
+  ReportScreen and the standalone Library screen were named in the original audit request
+  and never actually checked. Still needs doing before App Store submission.
+- Baseline migration (age/height/weight flat columns) — scoped, not built.
+- `activity_level` feature — needs design decision, not started.
+- Score-summary card's expanded Fat Loss Resistance still has no fallback for
+  pre-2026-07-30 historical rows (`cascade_risk`/`dominant_layer` null) — shows nothing for
+  those, by design, not a bug.
+
 ### 2026-07-30 — updateCraving rollback fix device-confirmed; three architecture/product decisions logged; Google 2FA sign-in issue observed (not reproduced); v1.1 idea flagged
 
 **Decisions made (not yet implemented in code):**
