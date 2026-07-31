@@ -38,7 +38,7 @@ try {
 
 // Infrastructure
 import { AuthProvider, useAuth } from './src/context/AuthContext';
-import { AppDataProvider, useAppData } from './src/context/AppDataContext';
+import { AppDataProvider, useAppData, type ScoreHistoryEntry } from './src/context/AppDataContext';
 import { THEMES, type Theme, type ThemeColors } from './src/config/theme';
 
 // Data
@@ -849,6 +849,22 @@ function getCascadeSignalQuote(scoreResult: any, layerId: number): string | null
   if (!strongest?.selected?.length) return null;
   const q = QUESTIONS.find(qx => qx.layer === layerId && qx.id === strongest.q);
   return q?.o[strongest.selected[0]]?.replace(/[,.]$/, '') || null;
+}
+
+// Rebuilds a CascadeVisualization-compatible object from a persisted scoreHistory entry, for
+// accounts signed in without a fresh in-session scoreResult. Returns null when the entry
+// predates the cascade_risk/dominant_layer persistence fix (2026-07-30) — those rows have
+// neither field, so there's nothing to reconstruct; callers should fall back to the
+// lightweight summary card instead.
+function reconstructScoreResultFromHistory(entry: ScoreHistoryEntry): Partial<ScoreResult> | null {
+  if (entry.cascade_risk == null || entry.dominant_layer == null) return null;
+  return {
+    cascadeRisk: entry.cascade_risk,
+    dominantLayer: entry.dominant_layer,
+    sc: { 1: entry.layer1, 2: entry.layer2, 3: entry.layer3, 4: entry.layer4, 5: entry.layer5 },
+    rcsInfo: getRCSInfo(entry.rcs ?? 0),
+    history: entry.answers || [],
+  };
 }
 
 type ParsedCascade = { raw: string; layers: number[] };
@@ -1982,40 +1998,55 @@ function HomeScreen({ onNavigate, hasScore, scoreResult, onSelectLayer, onNaviga
                   onWorkOnThis={triggerTodaysOneBlink}
                 />
               )}
-              {/* Lightweight fallback when there's no fresh in-session scoreResult (e.g. signed
-                  in without retaking the quiz) but a persisted assessment exists. cascadeRisk
-                  isn't persisted, so the full interactive CascadeVisualization can't be rebuilt
-                  from scoreHistory — this shows the dominant pattern + layer breakdown instead
-                  of hiding the card entirely. */}
-              {!scoreResult && latestHistory && homeSections['metabolic-story'] !== false && (
-                <View style={{ paddingHorizontal: 24, marginTop: 20 }}>
-                  <View style={{ borderRadius: 20, backgroundColor: colors.card, borderWidth: 1, borderColor: colors.border, padding: 16 }}>
-                    <View style={{ flexDirection: 'row', alignItems: 'center', gap: 10, marginBottom: 14 }}>
-                      <View style={{ width: 34, height: 34, borderRadius: 11, backgroundColor: '#7C5CFF15', alignItems: 'center', justifyContent: 'center' }}>
-                        <MaterialCommunityIcons name="link-variant" size={17} color="#7C5CFF" />
+              {/* When there's no fresh in-session scoreResult (e.g. signed in without retaking
+                  the quiz) but a persisted assessment exists: rows saved after the 2026-07-30
+                  cascade_risk/dominant_layer persistence fix can be reconstructed into a real
+                  CascadeVisualization; older rows (neither field persisted) fall back to the
+                  lightweight dominant-pattern + layer-breakdown summary instead of hiding the
+                  card entirely. */}
+              {!scoreResult && latestHistory && homeSections['metabolic-story'] !== false && (() => {
+                const reconstructed = reconstructScoreResultFromHistory(latestHistory);
+                if (reconstructed) {
+                  return (
+                    <CascadeVisualization
+                      scoreResult={reconstructed}
+                      defaultCascadeIdx={defaultCascadeIdx}
+                      colors={colors}
+                      onNavigate={onNavigate}
+                      onWorkOnThis={triggerTodaysOneBlink}
+                    />
+                  );
+                }
+                return (
+                  <View style={{ paddingHorizontal: 24, marginTop: 20 }}>
+                    <View style={{ borderRadius: 20, backgroundColor: colors.card, borderWidth: 1, borderColor: colors.border, padding: 16 }}>
+                      <View style={{ flexDirection: 'row', alignItems: 'center', gap: 10, marginBottom: 14 }}>
+                        <View style={{ width: 34, height: 34, borderRadius: 11, backgroundColor: '#7C5CFF15', alignItems: 'center', justifyContent: 'center' }}>
+                          <MaterialCommunityIcons name="link-variant" size={17} color="#7C5CFF" />
+                        </View>
+                        <View style={{ flex: 1 }}>
+                          <Text style={{ fontSize: 15, fontWeight: '700', color: colors.text, letterSpacing: -0.3 }}>Metabolic Story</Text>
+                          <Text style={{ fontSize: 11, color: colors.textTertiary, marginTop: 1 }}>From your last assessment</Text>
+                        </View>
                       </View>
-                      <View style={{ flex: 1 }}>
-                        <Text style={{ fontSize: 15, fontWeight: '700', color: colors.text, letterSpacing: -0.3 }}>Metabolic Story</Text>
-                        <Text style={{ fontSize: 11, color: colors.textTertiary, marginTop: 1 }}>From your last assessment</Text>
+                      {latestHistory.dominant_pattern && (
+                        <Text style={{ fontSize: 13, fontWeight: '600', color: colors.text, marginBottom: 12, lineHeight: 18 }}>{latestHistory.dominant_pattern}</Text>
+                      )}
+                      <View style={{ gap: 8 }}>
+                        {LAYERS.map(layer => {
+                          const ls = fallbackLayerScores?.[layer.id];
+                          return (
+                            <View key={layer.id} style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}>
+                              <Text style={{ fontSize: 12, color: colors.textSecondary }}>{layer.name}</Text>
+                              <Text style={{ fontSize: 12, fontWeight: '700', color: colors.text }}>{typeof ls === 'number' ? `${ls}/20` : '—'}</Text>
+                            </View>
+                          );
+                        })}
                       </View>
-                    </View>
-                    {latestHistory.dominant_pattern && (
-                      <Text style={{ fontSize: 13, fontWeight: '600', color: colors.text, marginBottom: 12, lineHeight: 18 }}>{latestHistory.dominant_pattern}</Text>
-                    )}
-                    <View style={{ gap: 8 }}>
-                      {LAYERS.map(layer => {
-                        const ls = fallbackLayerScores?.[layer.id];
-                        return (
-                          <View key={layer.id} style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}>
-                            <Text style={{ fontSize: 12, color: colors.textSecondary }}>{layer.name}</Text>
-                            <Text style={{ fontSize: 12, fontWeight: '700', color: colors.text }}>{typeof ls === 'number' ? `${ls}/20` : '—'}</Text>
-                          </View>
-                        );
-                      })}
                     </View>
                   </View>
-                </View>
-              )}
+                );
+              })()}
 
               {/* Cravings Quick-Log */}
               {homeSections['cravings'] !== false && (
@@ -4648,11 +4679,16 @@ function ProfileScreen({ onNavigate, hasScore, scoreResult, onGoToCravings, onGo
     membership.get().then(setMyMembership).catch(() => {});
     booking.getMyBooking().then(setMyBooking).catch(() => {});
   }, []);
-  // No hardcoded default layer. A Layer object (name/color/icon) only exists when there's a
-  // fresh in-session scoreResult — the persisted record only has a dominant_pattern string,
-  // not a layer id, so guessing a Layer here would assert a conclusion the data doesn't support.
-  const weakestLayer = scoreResult?.dominantLayer ? LAYERS[scoreResult.dominantLayer - 1] : null;
   const latestHistory = scoreHistory[0];
+  // No hardcoded default layer. Prefer the fresh in-session scoreResult's dominantLayer; fall
+  // back to the persisted dominant_layer on the latest historical entry (present on rows saved
+  // after the 2026-07-30 cascade_risk/dominant_layer persistence fix) — only null (genuine
+  // "Not available") when neither exists, never a guessed default.
+  const weakestLayer = scoreResult?.dominantLayer
+    ? LAYERS[scoreResult.dominantLayer - 1]
+    : latestHistory?.dominant_layer
+    ? LAYERS[latestHistory.dominant_layer - 1]
+    : null;
   const weeklyCravingSummary = useMemo(() => {
     const sevenDaysAgo = Date.now() - 7 * 24 * 60 * 60 * 1000;
     const recent = (loggedCravings || []).filter((c: any) => new Date(c.created_at).getTime() >= sevenDaysAgo);
@@ -4906,10 +4942,19 @@ function ProfileScreen({ onNavigate, hasScore, scoreResult, onGoToCravings, onGo
                 <CascadeVisualization scoreResult={scoreResult} colors={colors} onNavigate={onNavigate} onWorkOnThis={onGoToTodaysOne} />
               </View>
             )}
-            {/* Same lightweight fallback as Home: cascadeRisk isn't persisted, so the full
-                interactive CascadeVisualization can't be rebuilt from scoreHistory — this shows
-                the layer1-5 breakdown instead of hiding the section entirely. */}
+            {/* Same reconstruction attempt as Home: rows saved after the 2026-07-30
+                cascade_risk/dominant_layer persistence fix can rebuild a real
+                CascadeVisualization; older rows fall back to the layer1-5 breakdown instead
+                of hiding the section entirely. */}
             {metabolicPatternExpanded && !scoreResult && latestHistory && (() => {
+              const reconstructed = reconstructScoreResultFromHistory(latestHistory);
+              if (reconstructed) {
+                return (
+                  <View style={{ marginTop: 12 }}>
+                    <CascadeVisualization scoreResult={reconstructed} colors={colors} onNavigate={onNavigate} onWorkOnThis={onGoToTodaysOne} />
+                  </View>
+                );
+              }
               const layerScoreMap: Record<number, number> = { 1: latestHistory.layer1, 2: latestHistory.layer2, 3: latestHistory.layer3, 4: latestHistory.layer4, 5: latestHistory.layer5 };
               return (
                 <View style={{ marginTop: 12, borderRadius: 20, padding: 20, backgroundColor: colors.card }}>
@@ -6688,6 +6733,8 @@ function AppNavigator() {
       rcs: result.rcs, dominant_pattern: result.patternEngine.dominant_pattern,
       dominant_pattern_confidence: result.patternEngine.dominant_pattern_confidence,
       answers: result.history,
+      cascade_risk: result.cascadeRisk,
+      dominant_layer: result.dominantLayer,
       time_spent_seconds: data.timeSpentSeconds ?? null,
       engagement_grade: data.timeSpentSeconds != null ? getEngagementGrade(data.timeSpentSeconds) : null,
     }).catch(() => {});

@@ -44,7 +44,9 @@ export type ScoreHistoryEntry = {
   layer5: number;
   dominant_pattern?: string;
   rcs?: number;
-  answers?: { layer: number; q: number; selected: number[]; score: number }[];
+  answers?: { layer: number; q: number; selected: number[]; score: number; ansIdx: number }[];
+  cascade_risk: string | null;
+  dominant_layer: number | null;
 };
 
 export type MiniQuizMap = Record<number, number[]>;
@@ -177,6 +179,8 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
               layer4: row.layer4, layer5: row.layer5,
               dominant_pattern: row.dominant_pattern, rcs: row.rcs,
               answers: row.answers || null,
+              cascade_risk: row.cascade_risk ?? null,
+              dominant_layer: row.dominant_layer ?? null,
             }));
             setScoreHistory(mapped);
             await writeJSON(KEYS.scoreHistory, mapped);
@@ -389,6 +393,8 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
           layer4: row.layer4, layer5: row.layer5,
           dominant_pattern: row.dominant_pattern, rcs: row.rcs,
           answers: row.answers || null,
+          cascade_risk: row.cascade_risk ?? null,
+          dominant_layer: row.dominant_layer ?? null,
         }));
         setScoreHistory(mapped);
         await writeJSON(KEYS.scoreHistory, mapped);
@@ -409,6 +415,8 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
       layer1: data.layer1, layer2: data.layer2, layer3: data.layer3,
       layer4: data.layer4, layer5: data.layer5,
       dominant_pattern: data.dominant_pattern, rcs: data.rcs,
+      cascade_risk: data.cascade_risk ?? null,
+      dominant_layer: data.dominant_layer ?? null,
     };
     const updatedHistory = [localEntry, ...scoreHistory];
     setScoreHistory(updatedHistory);
