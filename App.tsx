@@ -2915,12 +2915,10 @@ function ResultsScreen({ onNavigate, result, userData, autoExpandN3, onSelectLay
         )}
       </View>
 
-      {/* The one unmissable moment — not collapsible, not optional. Everything else in this
-          screen is behind a tap; this is the one sentence that has to land regardless. */}
       <View style={{ paddingHorizontal: 24, marginTop: 20 }}>
-        <View style={{ borderRadius: 16, padding: 18, backgroundColor: `${dominantLayer.color}14`, borderLeftWidth: 3, borderLeftColor: dominantLayer.color }}>
+        <View style={{ borderRadius: 16, padding: 18, backgroundColor: `${result.rcsInfo.color}14`, borderLeftWidth: 3, borderLeftColor: result.rcsInfo.color }}>
           <Text style={{ fontSize: 14, lineHeight: 21, color: colors.text, fontWeight: '500' }}>
-            <Text style={{ fontWeight: '700', color: dominantLayer.color }}>{clinicalDepth ? dominantLayer.name : (LAYER_PLAIN[result.dominantLayer - 1].charAt(0).toUpperCase() + LAYER_PLAIN[result.dominantLayer - 1].slice(1))}</Text> may be why fat loss has felt stuck — not a discipline problem. Right now, {result.rcsInfo.compPct}% of your body's effort may be going toward protection instead of adaptation.
+            While your Metabolic Score shows how your body is functioning overall — <Text style={{ fontWeight: '700', color: result.rcsInfo.color }}>Fat Loss Readiness goes one layer deeper</Text>. It shows whether your body is currently in a position to release stored fat or not.
           </Text>
         </View>
       </View>
@@ -6309,23 +6307,35 @@ function SlotPickerModal({ planType, razorpayLink, price, onClose, onNavigate, m
 
 function ReportScreen({ onNavigate, scoreResult, userData }: { onNavigate: (s: ScreenId) => void; scoreResult?: any; userData?: any }) {
   const { colors } = useTheme();
-  const { cravings: loggedCravings, symptoms: ctxSymptoms, scoreHistory, baseline } = useAppData();
+  const { fullName, cravings: loggedCravings, symptoms: ctxSymptoms, scoreHistory, baseline } = useAppData();
 
   // Use real scoreResult if available, else fall back to latest scoreHistory
   const latestHistory = scoreHistory[0];
   const totalScore = scoreResult?.totalScore ?? latestHistory?.total_score ?? 0;
   const layerScores = scoreResult?.sc ?? (latestHistory ? { 1: latestHistory.layer1, 2: latestHistory.layer2, 3: latestHistory.layer3, 4: latestHistory.layer4, 5: latestHistory.layer5 } : {});
-  const dominantLayer = scoreResult?.dominantLayer ?? 2;
+  const dominantLayer = scoreResult?.dominantLayer ?? latestHistory?.dominant_layer ?? 2;
   const pattern = scoreResult?.patternEngine?.dominant_pattern ?? latestHistory?.dominant_pattern ?? 'Pattern';
   const rcsVal = scoreResult?.rcs ?? latestHistory?.rcs ?? 0;
   const rcsInfo = scoreResult?.rcsInfo ?? getRCSInfo(rcsVal);
   const band = getBand(totalScore);
 
-  // Real N1/N2/N3 via local engine
+  // Real N1/N2/N3 via local engine — falls back to a reconstructed object (built from the
+  // latest persisted assessment, same helper Home/Results already use) when there's no live
+  // in-session scoreResult, instead of dropping straight to generic placeholder copy.
   const realUserData = { gender: userData?.gender || 'Male', age: userData?.age || '32', conditions: userData?.conditions || [], sleepScore: userData?.sleepScore || 5, stressScore: userData?.stressScore || 5, gutScore: userData?.gutScore || 5 };
-  const n1Text = scoreResult ? generateLocalN1(scoreResult, realUserData) : rcsInfo.desc;
-  const n2Text = scoreResult ? generateLocalN2(scoreResult, realUserData, scoreResult.history || [], []) : 'Take the test to see your hidden mechanism analysis.';
-  const n3Data = scoreResult ? generateLocalN3(scoreResult, realUserData) : { title: 'Take the Test', body: 'Complete your Metabolic Score to see personalized recommendations.' };
+  const reconstructed = !scoreResult && latestHistory ? reconstructScoreResultFromHistory(latestHistory) : null;
+  // reconstructScoreResultFromHistory doesn't return `hl` (needed by N2) since it's not
+  // persisted — bri/gsi/syli are derivable purely from history+sc (already reconstructed
+  // above), only sliClass needs a stressScore input, so reuse the same hardcoded default (5)
+  // the live path already falls back to via realUserData rather than building real
+  // stress-score persistence (separate scope).
+  const reconstructedHl = reconstructed
+    ? computeHiddenLayer(reconstructed.history || [], reconstructed.sc || {}, realUserData.sleepScore, realUserData.stressScore, realUserData.gutScore)
+    : null;
+  const narrativeResult: ScoreResult | null = scoreResult || (reconstructed ? { ...reconstructed, hl: reconstructedHl } as ScoreResult : null);
+  const n1Text = narrativeResult ? generateLocalN1(narrativeResult, realUserData) : rcsInfo.desc;
+  const n2Text = narrativeResult ? generateLocalN2(narrativeResult, realUserData, narrativeResult.history || [], []) : 'Take the test to see your hidden mechanism analysis.';
+  const n3Data = narrativeResult ? generateLocalN3(narrativeResult, realUserData) : { title: 'Take the Test', body: 'Complete your Metabolic Score to see personalized recommendations.' };
 
   // Matched case studies (same logic as Results screen)
   const dominantLayers = [1, 2, 3, 4, 5].filter(i => layerScores[i] <= 11);
@@ -6343,7 +6353,7 @@ function ReportScreen({ onNavigate, scoreResult, userData }: { onNavigate: (s: S
 
   // Report data
   const reportData = {
-    name: 'User',
+    name: fullName || 'Friend',
     date: new Date().toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' }),
     age: baseline?.age || userData?.age || '—',
     gender: userData?.gender || '—',
@@ -6417,6 +6427,7 @@ function ReportScreen({ onNavigate, scoreResult, userData }: { onNavigate: (s: S
             <Text style={{ fontSize: 14, fontWeight: '700', color: reportData.rcsInfo.color }}>{reportData.rcsInfo.label}</Text>
           </View>
         </View>
+        <Text style={{ fontSize: 12, color: colors.textSecondary, marginTop: 12, lineHeight: 18 }}>While your Metabolic Score shows how your body is functioning overall — Fat Loss Readiness goes one layer deeper. It shows whether your body is currently in a position to release stored fat or not.</Text>
         <Text style={{ fontSize: 12, color: colors.textSecondary, marginTop: 12, lineHeight: 18 }}>{reportData.band.label}</Text>
       </ReportSection>
 
