@@ -858,14 +858,22 @@ function getCascadeSignalQuote(scoreResult: any, layerId: number): string | null
 // lightweight summary card instead.
 function reconstructScoreResultFromHistory(entry: ScoreHistoryEntry): Partial<ScoreResult> | null {
   if (entry.cascade_risk == null || entry.dominant_layer == null) return null;
+  const sc = { 1: entry.layer1, 2: entry.layer2, 3: entry.layer3, 4: entry.layer4, 5: entry.layer5 };
+  const history = entry.answers || [];
   return {
     totalScore: entry.total_score,
     band: getBand(entry.total_score),
     cascadeRisk: entry.cascade_risk,
     dominantLayer: entry.dominant_layer,
-    sc: { 1: entry.layer1, 2: entry.layer2, 3: entry.layer3, 4: entry.layer4, 5: entry.layer5 },
+    sc,
     rcsInfo: getRCSInfo(entry.rcs ?? 0),
-    history: entry.answers || [],
+    history,
+    // Sleep/stress/gut scores aren't persisted on ScoreHistoryEntry, so this reuses the same
+    // hardcoded default (5) the rest of the reconstructed-data path already falls back to.
+    // Centralized here so every caller (Home's card, both cascade visualizations, Report
+    // screen) gets a real `hl` automatically instead of each needing its own patch — N2
+    // (generateLocalN2) reads result.hl directly with no null check and throws if it's missing.
+    hl: computeHiddenLayer(history, sc, 5, 5, 5),
     patternEngine: { dominant_pattern: entry.dominant_pattern || '' } as ScoreResult['patternEngine'],
   };
 }
@@ -6324,15 +6332,7 @@ function ReportScreen({ onNavigate, scoreResult, userData }: { onNavigate: (s: S
   // in-session scoreResult, instead of dropping straight to generic placeholder copy.
   const realUserData = { gender: userData?.gender || 'Male', age: userData?.age || '32', conditions: userData?.conditions || [], sleepScore: userData?.sleepScore || 5, stressScore: userData?.stressScore || 5, gutScore: userData?.gutScore || 5 };
   const reconstructed = !scoreResult && latestHistory ? reconstructScoreResultFromHistory(latestHistory) : null;
-  // reconstructScoreResultFromHistory doesn't return `hl` (needed by N2) since it's not
-  // persisted — bri/gsi/syli are derivable purely from history+sc (already reconstructed
-  // above), only sliClass needs a stressScore input, so reuse the same hardcoded default (5)
-  // the live path already falls back to via realUserData rather than building real
-  // stress-score persistence (separate scope).
-  const reconstructedHl = reconstructed
-    ? computeHiddenLayer(reconstructed.history || [], reconstructed.sc || {}, realUserData.sleepScore, realUserData.stressScore, realUserData.gutScore)
-    : null;
-  const narrativeResult: ScoreResult | null = scoreResult || (reconstructed ? { ...reconstructed, hl: reconstructedHl } as ScoreResult : null);
+  const narrativeResult: ScoreResult | null = scoreResult || (reconstructed as ScoreResult | null);
   const n1Text = narrativeResult ? generateLocalN1(narrativeResult, realUserData) : rcsInfo.desc;
   const n2Text = narrativeResult ? generateLocalN2(narrativeResult, realUserData, narrativeResult.history || [], []) : 'Take the test to see your hidden mechanism analysis.';
   const n3Data = narrativeResult ? generateLocalN3(narrativeResult, realUserData) : { title: 'Take the Test', body: 'Complete your Metabolic Score to see personalized recommendations.' };
