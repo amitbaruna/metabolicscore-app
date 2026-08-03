@@ -8,10 +8,18 @@
     "scheme": "metabolicscore",
     "ios": {
       "supportsTablet": true,
-      "bundleIdentifier": "com.amitbaruna.metabolicscore"
+      "bundleIdentifier": "com.amitbaruna.metabolicscore",
+      "infoPlist": {
+        "ITSAppUsesNonExemptEncryption": false
+      }
     },
     "android": {
       "package": "com.amitbaruna.metabolicscore"
+    },
+    "extra": {
+      "eas": {
+        "projectId": "d2a7deb6-603c-4933-afbb-036644ba4ecd"
+      }
     }
   }
 }

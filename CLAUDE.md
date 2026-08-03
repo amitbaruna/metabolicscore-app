@@ -111,6 +111,12 @@ not a session-log entry — check here before re-proposing something already cap
   a narrative layer, not new instrumentation. Pairs naturally with the already-planned
   Adaptive Clarification Loop and Clinical Logic Registry work (referenced by Amit as
   existing planned work outside this repo's own documentation — not detailed here).
+- **PDF Real Cases links aren't clickable (flagged 2026-08-03), accepted as a known
+  limitation for now.** `expo-print`'s HTML `<a>` tags don't survive PDF conversion —
+  confirmed as an inherent limitation of its WKWebView-based print path, not a bug in the
+  report's own HTML/CSS. Real fix would need `pdf-lib` post-processing to add actual PDF
+  link annotations, including mapping each case row to its rendered coordinates —
+  nontrivial, not started. Not worth the implementation risk this close to submission.
 
 ## Source-of-truth rules
 
@@ -136,6 +142,67 @@ not a session-log entry — check here before re-proposing something already cap
 Update this at the end of every session (either with Claude Code or with Claude in
 chat) — what got fixed, what's still open. Keep entries short; this is a fast
 "where did we leave off" scan, not a full changelog. Newest entry on top.
+
+### 2026-08-03 — PDF Report export built end-to-end (expo-print + click tracking); Cascade Map added to the PDF; cascade narrative root-layer bug found and fixed at the source
+
+**Device-confirmed:** the N2 "Hidden Mechanism" infinite-loading fix from 2026-08-01
+(reconstructScoreResultFromHistory now setting `hl`) is showing correctly on device —
+no longer stuck on "Reading your biological pattern...".
+
+**"Download PDF Report" button built (previously a non-functional placeholder, no
+onPress handler at all):**
+- Added `expo-print` (first-party Expo module, no native-linking risk beyond what
+  `expo-dev-client` already requires). Chose it over reusing `react-native-view-shot`
+  (zero new deps, but produces an image not a real PDF, and can't cleanly capture a
+  scrollable page's full height) and over `react-native-html-to-pdf` (bare native
+  module, heavier maintenance lift).
+- Click-tracking: new `app_report_downloads` table (migration written, **run manually
+  by Amit in Supabase**) — `reportDownloads.log()` in `supabase.ts` →
+  `logReportDownload()` in `AppDataContext.tsx`, mirrors the existing `nps` pattern
+  exactly (client-writable insert + self-select RLS, silent `console.warn` on failure,
+  never blocks the actual PDF generation).
+- `buildReportHtml()` (`App.tsx`) — new standalone HTML-template function mirroring
+  ReportScreen's on-screen sections 1-6 (Score Summary, Layer Breakdown, N1/N2/N3, Case
+  Studies) plus disclaimer/footer, since `expo-print` can't render the RN component tree
+  directly. Craving Patterns / Symptom Timeline (sections 7-8) deliberately excluded —
+  they're live context data, not part of the report snapshot. Button now: logs the
+  download, calls `Print.printToFileAsync({ html })`, then `Sharing.shareAsync` with a
+  loading state and error `Alert`.
+- **New "Cascade Map" section added to the PDF** (after Layer Breakdown, renumbering
+  N1/N2/N3/Case Studies below it) — one static SVG diagram + narrative per detected
+  cascade (all of them, not just the top-ranked). Confirmed first via read-only
+  investigation that `CascadeVisualization`'s end-state node layout is fully
+  deterministic from `cascadeRisk`/`dominantLayer`/`sc` (fixed `NODE_LAYOUT` fractions +
+  a pure Bézier `curvePath` formula) — `Animated` only drives cosmetic transitions
+  (bounce, glow, line draw-in), never final position/state — so no animation runtime
+  was needed to build a static equivalent. `buildCascadeItems` (the cascade
+  ranking/narrative logic) was extracted out of `CascadeVisualization`'s `useMemo` into
+  a standalone function so the live on-screen view and the new PDF path share one
+  source of truth instead of duplicating it. `buildCascadeSvg()` reuses the same
+  `NODE_LAYOUT`/`curvePath` math directly.
+
+**Bug found (via the new Cascade Map narratives surfacing it) and fixed —
+pre-existing, not introduced today, affected the live app too:**
+`generateDominoEffect` (`src/data/localNarratives.ts`) was passing the user's overall
+`dominantLayer` into `translateCascadeToUserLang` as if it were the *picked cascade's
+own* root layer — correct for ranking (`rankCascadeStrings`) but wrong for translation
+whenever the dominant layer is a cascade's downstream victim rather than its cause
+(e.g. dominant layer = Metabolic Signaling/L3, but the picked cascade is "L2 → L3" —
+root should read as L2, not L3). Produced broken/inverted phrasing like "Your how your
+body manages energy may be putting pressure on your stress response system." Fixed by
+deriving `rootLayer` from the picked cascade string itself (first `L#` mentioned is
+always the actual cause, per every pattern in `buildCascadeRisk`), leaving the ranking
+call untouched. Since `buildCascadeItems` is now shared between the on-screen Metabolic
+Story and the PDF, this fixes both surfaces at once, at the source.
+
+**Still open — carry forward:**
+- The actual PDF button tap (generate → share sheet) has not yet been confirmed on a
+  real device — only the N2 fix specifically has been device-tested today. Attempted to
+  start `expo start --tunnel` for broader testing but the session moved on to the
+  read-only cascade investigation instead; dev server was not left confirmed running.
+- Everything else still open from 2026-08-01 (Download PDF Report scope is now built,
+  so that item is superseded by this entry; sleepScore/stressScore/gutScore hardcoded
+  5/5/5 defaults remain open, unrelated to today's work).
 
 ### 2026-08-01 — Fat Loss Resistance banner replaced with plain-language description; N2 "Hidden Mechanism" infinite-loading bug fixed at the shared reconstruction helper
 

@@ -1,5 +1,5 @@
 import React, { createContext, useContext, useState, useEffect, useCallback, type ReactNode } from 'react';
-import { profiles as profileApi, scores as scoreApi, cravings as cravingApi, nps as npsApi } from '../config/supabase';
+import { profiles as profileApi, scores as scoreApi, cravings as cravingApi, nps as npsApi, reportDownloads as reportDownloadsApi } from '../config/supabase';
 import { useAuth } from './AuthContext';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 
@@ -36,6 +36,7 @@ export type BaselineEntry = {
 export type ScoreHistoryEntry = {
   id: string;
   date: string;
+  created_at: string;
   total_score: number;
   layer1: number;
   layer2: number;
@@ -62,6 +63,7 @@ type DataContextType = {
   saveCraving: (entry: Omit<CravingEntry, 'id' | 'created_at'>) => Promise<void>;
   updateCraving: (id: string, updates: Partial<Omit<CravingEntry, 'id' | 'created_at'>>) => Promise<void>;
   saveNpsRating: (score: number, context?: { total_score?: number; dominant_layer?: number }) => Promise<void>;
+  logReportDownload: (reportType?: string) => Promise<void>;
   deleteCraving: (id: string) => Promise<void>;
   refreshCravings: () => Promise<void>;
   symptoms: SymptomEntry[];
@@ -179,6 +181,7 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
             const mapped: ScoreHistoryEntry[] = remoteScores.map((row: any) => ({
               id: row.id,
               date: new Date(row.created_at).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }),
+              created_at: row.created_at,
               total_score: row.total_score,
               layer1: row.layer1, layer2: row.layer2, layer3: row.layer3,
               layer4: row.layer4, layer5: row.layer5,
@@ -257,6 +260,14 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
         });
       }
     } catch (e) { console.warn('NPS rating sync failed:', e); }
+  }, [user?.id]);
+
+  const logReportDownload = useCallback(async (reportType: string = 'pdf_report') => {
+    try {
+      if (user?.id) {
+        await reportDownloadsApi.log(reportType);
+      }
+    } catch (e) { console.warn('Report download log failed:', e); }
   }, [user?.id]);
 
   const updateCraving = useCallback(async (id: string, updates: Partial<Omit<CravingEntry, 'id' | 'created_at'>>) => {
@@ -398,6 +409,7 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
         const mapped: ScoreHistoryEntry[] = remote.map((row: any) => ({
           id: row.id,
           date: new Date(row.created_at).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }),
+          created_at: row.created_at,
           total_score: row.total_score,
           layer1: row.layer1, layer2: row.layer2, layer3: row.layer3,
           layer4: row.layer4, layer5: row.layer5,
@@ -421,6 +433,7 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
     const localEntry: ScoreHistoryEntry = {
       id: 'local-' + Date.now(),
       date: new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }),
+      created_at: new Date().toISOString(),
       total_score: data.total_score,
       layer1: data.layer1, layer2: data.layer2, layer3: data.layer3,
       layer4: data.layer4, layer5: data.layer5,
@@ -461,7 +474,7 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
   return (
     <DataContext.Provider value={{
       hasScore, fullName, scoreHistory, refreshScoreHistory, saveProfile, saveScore,
-      cravings, saveCraving, updateCraving, saveNpsRating, deleteCraving, refreshCravings, symptoms, setSymptoms, goals, setGoals,
+      cravings, saveCraving, updateCraving, saveNpsRating, logReportDownload, deleteCraving, refreshCravings, symptoms, setSymptoms, goals, setGoals,
       fatDeposition, setFatDeposition, baseline, setBaseline, conditions, setConditions,
       miniQuiz, setMiniQuizAnswers, lastQuizAnswers, setLastQuizAnswers, loading,
     }}>

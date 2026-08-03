@@ -411,6 +411,17 @@ export const nps = {
   },
 };
 
+export const reportDownloads = {
+  async log(reportType: string = 'pdf_report') {
+    const token = await auth.getToken();
+    const user = await auth.getSession();
+    return await sbFetch('/rest/v1/app_report_downloads', {
+      method: 'POST',
+      body: JSON.stringify({ user_id: user?.id, report_type: reportType }),
+    }, token);
+  },
+};
+
 export const cravings = {
   async save(payload: any) {
     const token = await auth.getToken();

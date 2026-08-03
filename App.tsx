@@ -18,8 +18,10 @@ import { LinearGradient } from 'expo-linear-gradient';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import ViewShot from 'react-native-view-shot';
 import * as Sharing from 'expo-sharing';
+import * as Print from 'expo-print';
 import * as Clipboard from 'expo-clipboard';
 import { Asset } from 'expo-asset';
+import { File as ExpoFile } from 'expo-file-system';
 import Svg, { Path, Defs, LinearGradient as SvgLinearGradient, Stop as SvgStop } from 'react-native-svg';
 import { booking, membership, referral, account, pushNotifications, auth, profiles } from './src/config/supabase';
 // Guarded — expo-notifications behaves inconsistently in Expo Go, especially for remote push
@@ -909,6 +911,75 @@ const NODE_R = 28;
 const LINE_DASH = 1000;
 const AnimatedSvgPath = Animated.createAnimatedComponent(Path);
 
+// Single source of truth for "which cascades exist, in what order, with what narrative" —
+// used by CascadeVisualization's on-screen rendering AND the static PDF cascade-map section,
+// so the two can never disagree about ranking or narrative text the way a duplicated copy
+// could silently drift.
+function buildCascadeItems(scoreResult: any): CascadeVisualItem[] {
+  const dominantLayer = scoreResult?.dominantLayer || 1;
+  // Same ranking generateDominoEffect uses internally — computing it here too, once, means
+  // idx below always refers to the same cascade in both places. Previously this used raw
+  // parse order while generateDominoEffect silently re-ranked internally, which could attach
+  // the wrong narrative to the wrong cascade.
+  const rankedRaw = rankCascadeStrings(scoreResult?.cascadeRisk || '', dominantLayer);
+  if (rankedRaw.length === 0) return [];
+  return rankedRaw.map((raw, idx) => {
+    const layers = parseCascadeLayers(raw);
+    const domino = generateDominoEffect(scoreResult, idx);
+    const rootLayer = layers[0] || 1;
+    // Reuse the action text generateDominoEffect already computed on this same line — do NOT
+    // maintain a second copy (CASCADE_ACTIONS, below) as the source of truth. That list is kept
+    // only as a fallback for the rare case generateDominoEffect returns nothing for this cascade.
+    const fallback = CASCADE_ACTIONS[rootLayer] || CASCADE_ACTIONS[2];
+    let narrative = domino?.userLanguage || '';
+    // Weave in the root layer's real-signal quote (option 3+ only, never a green answer) partway
+    // through the explanation, right after the opening sentence. If this layer has no real-signal
+    // answer, narrative is left exactly as generateDominoEffect produced it — no quote is forced in.
+    const signalQuote = getCascadeSignalQuote(scoreResult, rootLayer);
+    if (signalQuote && narrative) {
+      const firstBreak = narrative.indexOf('. ');
+      const quoteSentence = `You mentioned: "${signalQuote}." `;
+      narrative = firstBreak !== -1
+        ? narrative.slice(0, firstBreak + 2) + quoteSentence + narrative.slice(firstBreak + 2)
+        : quoteSentence + narrative;
+    }
+    return { raw, layers, narrative, action: domino?.action || fallback.action, actionOutcome: domino?.actionOutcome || fallback.outcome, rootLayer };
+  });
+}
+
+// Static SVG mirror of CascadeVisualization's settled end-state geometry (fixed NODE_LAYOUT
+// fractions + the same quadratic-Bézier curvePath formula) — no animation involved, since the
+// PDF has no runtime to animate in. Renders one diagram for a single cascade's layer chain.
+function buildCascadeSvg(layers: number[], svgW: number, svgH: number): string {
+  const pos: Record<number, { x: number; y: number }> = {};
+  for (let i = 1; i <= 5; i++) pos[i] = { x: NODE_LAYOUT[i].fx * svgW, y: NODE_LAYOUT[i].fy * svgH };
+  const r = 22;
+
+  const curve = (fromL: number, toL: number) => {
+    const f = pos[fromL], t = pos[toL];
+    const mx = (f.x + t.x) / 2, my = (f.y + t.y) / 2;
+    const dx = t.x - f.x, dy = t.y - f.y;
+    return `M ${f.x} ${f.y} Q ${mx - dy * 0.15} ${my + dx * 0.15} ${t.x} ${t.y}`;
+  };
+
+  const lines = layers.slice(0, -1).map((l, i) =>
+    `<path d="${curve(l, layers[i + 1])}" stroke="${LAYERS[l - 1].color}" stroke-width="2.5" fill="none" />`
+  ).join('');
+
+  const nodes = [1, 2, 3, 4, 5].map(i => {
+    const active = layers.includes(i);
+    const layer = LAYERS[i - 1];
+    const fill = active ? layer.color : '#E5E5E5';
+    const textColor = active ? '#fff' : '#999';
+    return `
+      <circle cx="${pos[i].x}" cy="${pos[i].y}" r="${r}" fill="${fill}" />
+      <text x="${pos[i].x}" y="${pos[i].y + 4}" text-anchor="middle" font-size="11" font-weight="700" fill="${textColor}">L${i}</text>
+      <text x="${pos[i].x}" y="${pos[i].y + r + 14}" text-anchor="middle" font-size="9" fill="#888">${LAYER_PLAIN_SHORT[i - 1]}</text>`;
+  }).join('');
+
+  return `<svg width="${svgW}" height="${svgH}" viewBox="0 0 ${svgW} ${svgH}">${lines}${nodes}</svg>`;
+}
+
 function CascadeVisualization({
   scoreResult,
   defaultCascadeIdx = 0,
@@ -927,37 +998,7 @@ function CascadeVisualization({
   const containerW = SCREEN_WIDTH - 48;
   const { clinicalDepth } = useClinicalDepth();
 
-  const allCascades: CascadeVisualItem[] = useMemo(() => {
-    const dominantLayer = scoreResult?.dominantLayer || 1;
-    // Same ranking generateDominoEffect uses internally — computing it here too, once, means
-    // idx below always refers to the same cascade in both places. Previously this used raw
-    // parse order while generateDominoEffect silently re-ranked internally, which could attach
-    // the wrong narrative to the wrong cascade.
-    const rankedRaw = rankCascadeStrings(scoreResult?.cascadeRisk || '', dominantLayer);
-    if (rankedRaw.length === 0) return [];
-    return rankedRaw.map((raw, idx) => {
-      const layers = parseCascadeLayers(raw);
-      const domino = generateDominoEffect(scoreResult, idx);
-      const rootLayer = layers[0] || 1;
-      // Reuse the action text generateDominoEffect already computed on this same line — do NOT
-      // maintain a second copy (CASCADE_ACTIONS, below) as the source of truth. That list is kept
-      // only as a fallback for the rare case generateDominoEffect returns nothing for this cascade.
-      const fallback = CASCADE_ACTIONS[rootLayer] || CASCADE_ACTIONS[2];
-      let narrative = domino?.userLanguage || '';
-      // Weave in the root layer's real-signal quote (option 3+ only, never a green answer) partway
-      // through the explanation, right after the opening sentence. If this layer has no real-signal
-      // answer, narrative is left exactly as generateDominoEffect produced it — no quote is forced in.
-      const signalQuote = getCascadeSignalQuote(scoreResult, rootLayer);
-      if (signalQuote && narrative) {
-        const firstBreak = narrative.indexOf('. ');
-        const quoteSentence = `You mentioned: "${signalQuote}." `;
-        narrative = firstBreak !== -1
-          ? narrative.slice(0, firstBreak + 2) + quoteSentence + narrative.slice(firstBreak + 2)
-          : quoteSentence + narrative;
-      }
-      return { raw, layers, narrative, action: domino?.action || fallback.action, actionOutcome: domino?.actionOutcome || fallback.outcome, rootLayer };
-    });
-  }, [scoreResult?.cascadeRisk, scoreResult?.dominantLayer]);
+  const allCascades: CascadeVisualItem[] = useMemo(() => buildCascadeItems(scoreResult), [scoreResult?.cascadeRisk, scoreResult?.dominantLayer]);
 
   const [activeIdx, setActiveIdx] = useState(defaultCascadeIdx);
   const [replayKey, setReplayKey] = useState(0);
@@ -6313,9 +6354,369 @@ function SlotPickerModal({ planType, razorpayLink, price, onClose, onNavigate, m
   );
 }
 
+// Mirrors ReportScreen's on-screen sections 1-6 (Score Summary through Case Studies) plus the
+// disclaimer/footer — built as a standalone HTML string since expo-print can't render the RN
+// component tree directly. Craving Patterns / Symptom Timeline (sections 7-8) are live,
+// real-time context data rather than part of the report snapshot, so they're intentionally
+// left out of the exported file.
+// iOS's WKWebView print path (used by expo-print's printToFileAsync) silently drops the
+// `background`/`background-image` CSS property during PDF rendering, even though it renders
+// fine on-screen (confirmed: github.com/expo/expo#23686). Everything that needs a solid or
+// gradient fill — the progress bars, Active/Dominant badges, case-study thumbnails — is built
+// as inline SVG (rect/circle with `fill`) instead, the same technique already working
+// correctly for the Cascade Map diagrams (buildCascadeSvg). Text `color` is unaffected by this
+// bug, so colored text elsewhere is left as plain CSS.
+function buildBarSvg(score: number, color: string): string {
+  const pct = Math.max(0, Math.min(100, (score / 20) * 100));
+  return `<svg width="100%" height="6" viewBox="0 0 100 6" preserveAspectRatio="none" style="display:block;">
+    <rect x="0" y="0" width="100" height="6" rx="3" fill="#eee" />
+    <rect x="0" y="0" width="${pct}" height="6" rx="3" fill="${color}" />
+  </svg>`;
+}
+
+function buildBadgeSvg(text: string, bg: string, color: string, w: number): string {
+  return `<svg width="${w}" height="12" viewBox="0 0 ${w} 12" style="vertical-align:middle;"><rect width="${w}" height="12" rx="6" fill="${bg}" /><text x="${w / 2}" y="8.5" text-anchor="middle" font-size="7" font-weight="700" fill="${color}">${text}</text></svg>`;
+}
+
+// Same background-drop bug as .header above — .band-badge's fill was a dynamic inline
+// `style="background:...` (reportData.band.color), missed when the other badges were
+// converted to SVG. Can't reuse buildBadgeSvg's fixed-width small pill here: band.status
+// ranges from "Well Regulated" to "Significant Metabolic Impairment", nearly triple the
+// length, at a larger 11px/27px-tall size to match .band-badge's original CSS. Width is
+// estimated from character count (no real text-metrics API available in this
+// string-building context) rather than a fixed w — same estimate-not-measure trade-off
+// already accepted for buildGradientThumbSvg's angle/color parsing above.
+function buildBandBadgeSvg(text: string, bg: string): string {
+  const upper = text.toUpperCase();
+  const w = upper.length * 7 + 24;
+  return `<svg width="${w}" height="27" viewBox="0 0 ${w} 27" style="vertical-align:middle;"><rect width="${w}" height="27" rx="6" fill="${bg}" /><text x="${w / 2}" y="17.5" text-anchor="middle" font-size="11" font-weight="700" fill="#fff">${upper}</text></svg>`;
+}
+
+// Same background-drop bug, same estimate-width approach as buildBandBadgeSvg above — .about-tag's
+// solid #fff fill (ABOUT_STATS.years/clients + the static "Featured in Indian Express" string, all
+// different lengths) was another plain CSS `background`. rx=10 always renders as a full pill on a
+// 20px-tall box regardless of the exact value (browsers clamp radius to half the shorter side),
+// same as the original border-radius:12 already did.
+function buildTagSvg(text: string): string {
+  const w = Math.round(text.length * 6.3) + 20;
+  return `<svg width="${w}" height="20" viewBox="0 0 ${w} 20" style="vertical-align:middle;"><rect width="${w}" height="20" rx="10" fill="#fff" /><text x="${w / 2}" y="13.5" text-anchor="middle" font-size="10" font-weight="700" fill="#4A1B0C">${text}</text></svg>`;
+}
+
+function buildCircleBadgeSvg(text: string, color: string): string {
+  return `<svg width="18" height="18" viewBox="0 0 18 18" style="vertical-align:middle;margin-right:6px;"><circle cx="9" cy="9" r="9" fill="${color}" /><text x="9" y="12.5" text-anchor="middle" font-size="9" font-weight="700" fill="#fff">${text}</text></svg>`;
+}
+
+// Converts a CSS `linear-gradient(<angle>deg, <color>, <color>)` string (as used in
+// CASE_STUDIES) into an SVG <linearGradient> — same angle-to-vector math as any standard
+// CSS-to-SVG gradient conversion (0deg = "to top" in CSS, matching x1/y1/x2/y2 direction here).
+function buildGradientThumbSvg(gradientStr: string, uid: string): string {
+  const angleMatch = gradientStr.match(/(-?\d+(?:\.\d+)?)deg/);
+  const angle = angleMatch ? parseFloat(angleMatch[1]) : 135;
+  const colors = gradientStr.match(/#[0-9A-Fa-f]{3,8}/g) || ['#7C5CFF', '#4DA8FF'];
+  const rad = (angle * Math.PI) / 180;
+  const dx = Math.sin(rad), dy = -Math.cos(rad);
+  const x1 = 0.5 - dx / 2, y1 = 0.5 - dy / 2, x2 = 0.5 + dx / 2, y2 = 0.5 + dy / 2;
+  const stops = colors.map((c, i) => `<stop offset="${colors.length > 1 ? (i / (colors.length - 1)) * 100 : 0}%" stop-color="${c}" />`).join('');
+  return `<svg width="48" height="48" viewBox="0 0 48 48" style="display:block;">
+    <defs><linearGradient id="${uid}" x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}">${stops}</linearGradient></defs>
+    <rect width="48" height="48" rx="8" fill="url(#${uid})" />
+  </svg>`;
+}
+
+// No existing pattern in the app's own on-screen narrative rendering bolds specific words or
+// phrases within a paragraph (checked CascadeVisualization's narrative Text and the N1/N2
+// Text components — all render narrative copy as one uniform-weight string). Absent a source
+// pattern to mirror, this bolds each paragraph's leading sentence as the "key phrase" emphasis
+// point, applied consistently across the Cascade Map narrative and the N2/N3 body copy so the
+// treatment reads as one deliberate style rather than a one-off.
+function boldFirstSentence(text: string): string {
+  const idx = text.indexOf('. ');
+  if (idx === -1) return `<strong>${text}</strong>`;
+  return `<strong>${text.slice(0, idx + 1)}</strong>${text.slice(idx + 1)}`;
+}
+
+// PDF-only — Hero.png (moved to src/assets/about/hero.png) is bundled the same way
+// SpecialisationScreen's profile.pdf already is (Asset.fromModule + downloadAsync), then read
+// as base64 and embedded directly into the HTML's <img src>, since expo-print builds a PDF
+// from a raw HTML string rather than the RN component tree — there's no require()'d Image to
+// reference. This function must only ever be called from the PDF-generation path
+// (downloadPdfReport below), never from a rendered screen component, so this photo never
+// appears anywhere in the live app itself.
+async function getHeroPhotoBase64(): Promise<string> {
+  const asset = Asset.fromModule(require('./src/assets/about/hero.png'));
+  await asset.downloadAsync();
+  const base64 = await new ExpoFile(asset.localUri!).base64();
+  return `data:image/png;base64,${base64}`;
+}
+
+function buildAboutSectionHtml(sectionNum: number, heroPhotoBase64: string): string {
+  return `
+  <section>
+    <h2>${sectionNum}. About Amit Baruna</h2>
+    <div class="about-card">
+      <svg class="about-card-bg"><rect width="100%" height="100%" rx="16" fill="#F5C4B3" /></svg>
+      <div class="about-card-content">
+        <img class="about-photo" src="${heroPhotoBase64}" />
+        <div class="about-body">
+          <p class="about-bio">Metabolic coach and inventor of the Metabolic Score assessment. After years of watching clients follow every rule and still not see results, I built this tool to find the real, hidden layer holding them back — not just another diet plan.</p>
+          <div class="about-tags">
+            ${buildTagSvg(`${ABOUT_STATS.years} years experience`)}
+            ${buildTagSvg(`${ABOUT_STATS.clients} clients`)}
+            ${buildTagSvg('Featured in Indian Express')}
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>`;
+}
+
+function buildReportHtml(reportData: any, retakeDateText: string, matchedCases: any[], cascadeItems: CascadeVisualItem[], loggedCravings: any[], symptomsList: any[], heroPhotoBase64: string): string {
+  const layerRows = reportData.layers.map((l: any) => {
+    const isActive = l.score <= 11;
+    const isDominant = l.id === reportData.dominantLayer;
+    return `
+    <div class="layer-row">
+      <div class="layer-top">
+        <span class="layer-name">${buildCircleBadgeSvg(`L${l.id}`, l.color)}${l.name}${isActive ? ` ${buildBadgeSvg('ACTIVE', '#F5C4B3', '#4A1B0C', 42)}` : ''}${isDominant ? ` ${buildBadgeSvg('DOMINANT', '#D42B2B', '#fff', 56)}` : ''}</span>
+        <span class="layer-score">${l.score}/20</span>
+      </div>
+      <div class="bar-track">${buildBarSvg(l.score, l.color)}</div>
+    </div>`;
+  }).join('');
+
+  const casesToShow = matchedCases.length > 0 ? matchedCases : CASE_STUDIES.slice(0, 3);
+  const caseRows = casesToShow.map((cs: any, i: number) => `
+    <a class="case-row" href="${cs.reel}">
+      <div class="case-thumb">${buildGradientThumbSvg(cs.gradient, `caseGrad${cs.id}_${i}`)}<span class="play-icon">▶</span></div>
+      <div class="case-text"><strong>${cs.result.split('·')[0]}</strong><br/><span class="case-layer">${cs.layer}</span><br/><span class="case-desc">${cs.hook}</span></div>
+    </a>`).join('');
+
+  // One diagram + narrative per detected cascade, all detected (not just the top-ranked one) —
+  // static SVG mirror of CascadeVisualization's settled end-state (see buildCascadeSvg), since
+  // there's no runtime here to animate the on-screen version.
+  const cascadeBlocks = cascadeItems.map(item => `
+    <div class="cascade-block">
+      ${buildCascadeSvg(item.layers, 460, 220)}
+      <p>${boldFirstSentence(item.narrative)}</p>
+    </div>`).join('');
+
+  const cravingRows = loggedCravings.slice(0, 7).map((c: any) => {
+    const ct = CRAVING_TYPES.find(t => t.id === c.craving_type);
+    const timing = CRAVING_TIMING.find(t => t.id === c.timing)?.label || c.timing;
+    const tag = c.mapped_layer ? `L${c.mapped_layer}` : (c.tier === 'habit' ? 'HABIT' : '');
+    return `<div class="craving-row"><span>${ct?.icon || ''}</span><span class="craving-label">${ct?.label || ''} · ${timing}</span>${tag ? `<span class="craving-tag">${tag}</span>` : ''}</div>`;
+  }).join('');
+
+  const symptomRows = symptomsList.map((s: any) => `<div class="symptom-row"><span>${s.name}</span><span class="symptom-since">${s.since}</span></div>`).join('');
+
+  // Running section counter — Score Summary and Layer Breakdown are always 1/2; everything
+  // after that (Cascade Map, Cravings, Symptoms) is conditional, so numbering is computed once
+  // here rather than via compounding inline ternaries.
+  let n = 2;
+  const cascadeNum = cascadeItems.length > 0 ? ++n : null;
+  const n1Num = ++n;
+  const n2Num = ++n;
+  const n3Num = ++n;
+  const casesNum = ++n;
+  const cravingsNum = loggedCravings.length > 0 ? ++n : null;
+  const symptomsNum = symptomsList.length > 0 ? ++n : null;
+  const aboutNum = ++n;
+
+  return `<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<style>
+  body { font-family: -apple-system, Helvetica, Arial, sans-serif; color: #1A1A1A; padding: 24px; font-size: 15px; }
+  /* Same background-drop bug as buildBarSvg above (WKWebView silently drops the CSS
+     "background" property on iOS print) — missed when the other elements were converted to
+     SVG fills. .header-bg is an SVG rect sized to the header's own resolved box
+     (position:absolute, no viewBox — 1 user unit = 1px against the containing block) sitting
+     behind .header-content, which is also "position: relative" so it paints after (on top of)
+     the absolutely-positioned SVG per normal stacking order, without needing an explicit
+     z-index. */
+  .header { position: relative; overflow: hidden; color: #fff; border-radius: 16px; padding: 24px; text-align: center; }
+  .header-bg { position: absolute; top: 0; left: 0; width: 100%; height: 100%; display: block; }
+  .header-content { position: relative; }
+  .brand { font-size: 12px; font-weight: 700; letter-spacing: 2px; color: rgba(255,255,255,0.8); text-transform: uppercase; }
+  .title { font-size: 22px; font-weight: 900; margin-top: 6px; }
+  .date { font-size: 13px; color: rgba(255,255,255,0.85); margin-top: 8px; }
+  .meta-row { display: flex; justify-content: space-between; margin-top: 18px; border-top: 1px solid rgba(255,255,255,0.15); padding-top: 14px; }
+  .meta-row div { flex: 1; }
+  .meta-label { font-size: 10px; font-weight: 700; letter-spacing: 1px; color: rgba(255,255,255,0.8); text-transform: uppercase; }
+  .meta-value { font-size: 13px; font-weight: 700; margin-top: 2px; }
+  section { margin-top: 36px; }
+  h2 { font-size: 18px; font-weight: 700; text-transform: uppercase; letter-spacing: 1px; color: #444; border-bottom: 1px solid #eee; padding-bottom: 8px; }
+  .score-row { display: flex; justify-content: space-between; align-items: center; }
+  .score-label { font-size: 11px; text-transform: uppercase; color: #666; }
+  .score-num { font-size: 46px; font-weight: 900; }
+  .score-max { font-size: 14px; color: #666; font-weight: 400; }
+  .rcs-label { font-size: 11px; color: #666; margin-top: 8px; }
+  .rcs-value { font-size: 15px; font-weight: 700; }
+  .band-desc { font-size: 14px; color: #444; margin-top: 12px; line-height: 1.6; font-weight: 700; }
+  .layer-row { margin-top: 12px; }
+  .layer-top { display: flex; justify-content: space-between; font-size: 13px; font-weight: 600; margin-bottom: 4px; }
+  .cascade-block { margin-top: 16px; text-align: center; }
+  .cascade-block svg { max-width: 100%; }
+  .cascade-block p { text-align: left; margin-top: 8px; }
+  .bar-track { height: 6px; border-radius: 3px; overflow: hidden; }
+  p { font-size: 15px; line-height: 1.7; }
+  .case-row { display: flex; align-items: center; gap: 10px; padding: 8px 0; border-bottom: 1px solid #f0f0f0; text-decoration: none; color: #1A1A1A; }
+  .case-thumb { width: 48px; height: 48px; border-radius: 8px; flex-shrink: 0; position: relative; overflow: hidden; }
+  .play-icon { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); color: #fff; font-size: 14px; }
+  .case-text { font-size: 13px; }
+  .case-desc { font-size: 11px; color: #666; font-style: italic; line-height: 1.5; }
+  .rcs-big { font-size: 42px; font-weight: 900; }
+  .rcs-tier { font-size: 15px; font-weight: 700; margin-top: 4px; text-transform: uppercase; letter-spacing: 0.5px; }
+  .case-layer { font-size: 11px; color: #666; }
+  .craving-row { display: flex; align-items: center; gap: 8px; padding: 6px 0; font-size: 13px; }
+  .craving-label { flex: 1; }
+  .craving-tag { font-size: 10px; font-weight: 700; color: #666; }
+  .symptom-row { display: flex; justify-content: space-between; padding: 4px 0; font-size: 13px; }
+  .symptom-since { color: #666; }
+  /* Coral card matching the ACTIVE layer badge's existing #F5C4B3/#4A1B0C pairing (buildBadgeSvg
+     above) — the only coral already established in this report, reused here rather than
+     introducing a new one-off color. Background is an SVG rect (same background-drop bug and
+     same position:relative/absolute + relative-content-wrapper technique as .header — card
+     height is content-driven (photo + wrapping bio text), unknown ahead of time, same as
+     .header's). */
+  .about-card { position: relative; overflow: hidden; margin-top: 12px; padding: 20px; border-radius: 16px; }
+  .about-card-bg { position: absolute; top: 0; left: 0; width: 100%; height: 100%; display: block; }
+  .about-card-content { position: relative; display: flex; align-items: center; gap: 16px; }
+  .about-photo { width: 88px; height: 88px; border-radius: 44px; flex-shrink: 0; object-fit: cover; border: 3px solid #fff; }
+  .about-body { flex: 1; }
+  .about-bio { font-size: 13px; line-height: 1.6; color: #4A1B0C; margin: 0; }
+  .about-tags { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+  /* Same background-drop bug + relative-wrapper technique as .about-card/.header — DISCLAIMER
+     is a single long paragraph that wraps to a content-driven height, same as those. */
+  .disclaimer { position: relative; overflow: hidden; margin-top: 24px; padding: 12px; border-radius: 12px; }
+  .disclaimer-bg { position: absolute; top: 0; left: 0; width: 100%; height: 100%; display: block; }
+  .disclaimer-content { position: relative; font-size: 12px; line-height: 1.6; color: #333; text-align: center; font-weight: 600; }
+  .footer { margin-top: 16px; text-align: center; font-size: 12px; color: #333; font-weight: 600; }
+  /* Only the footer repeats on every printed page (the header stays page-1-only, unchanged,
+     outside this table). <tfoot> is the one long-standing, widely-supported print mechanism
+     for repeating content per page — unlike @page margin boxes (only shipped in very recent
+     Safari/Chrome versions) or position:fixed (documented as unreliable across engines, still
+     an open bug in Chromium). table/tr/td default styling is stripped so the wrapper is
+     invisible and every section keeps its existing spacing exactly as before. */
+  .page-table { width: 100%; border-collapse: collapse; }
+  .page-table > tbody > tr > td, .page-table > tfoot > tr > td { padding: 0; border: none; }
+  /* "Page X of Y" via CSS Paged Media counters, rendered in the native page margin box (not
+     part of the tfoot flow above). Standard mechanism for this, but per the note directly
+     above, @page margin boxes are a recent addition to Safari/Chrome's print engines — since
+     expo-print's iOS path renders through WKWebView (Safari's engine, the same one that drops
+     background-image, see the top-of-file comment on buildBarSvg), this needs on-device
+     confirmation on both platforms before being trusted. No better cross-platform option
+     exists without a JS pagination pass, which expo-print doesn't support. */
+  @page { margin: 24pt 24pt 40pt 24pt; @bottom-center { content: "Page " counter(page) " of " counter(pages); font-size: 9px; color: #999; } }
+</style>
+</head>
+<body>
+  <div class="header">
+    <svg class="header-bg"><rect width="100%" height="100%" rx="16" fill="#0D1B2A" /></svg>
+    <div class="header-content">
+      <div class="brand">Metabolic Score™</div>
+      <div class="title">Comprehensive Analysis Report</div>
+      <div class="date">${reportData.date}</div>
+      <div class="meta-row">
+        <div><div class="meta-label">Age / Gender</div><div class="meta-value">${reportData.age} / ${reportData.gender}</div></div>
+        <div><div class="meta-label">Weight</div><div class="meta-value">${reportData.weight} kg</div></div>
+        <div><div class="meta-label">Retake on</div><div class="meta-value">${retakeDateText}</div></div>
+      </div>
+    </div>
+  </div>
+
+  <table class="page-table">
+  <tfoot>
+    <tr><td>
+      <div class="footer">
+        Generated by Metabolic Score™ · ${BRAND.fullName} · amitbaruna.com · metabolicscore.in<br/>
+        WhatsApp +91 98918 28688 · ${BRAND.instagramHandle}
+      </div>
+    </td></tr>
+  </tfoot>
+  <tbody>
+  <tr><td>
+
+  <section>
+    <h2>1. Score Summary</h2>
+    <div class="score-row">
+      <div>
+        <div class="score-label">Metabolic Permission Score</div>
+        <div class="score-num" style="color:${reportData.band.color}">${reportData.totalScore}<span class="score-max">/100</span></div>
+      </div>
+      <div style="text-align:right">
+        ${buildBandBadgeSvg(reportData.band.status, reportData.band.color)}
+        <div class="rcs-label">Fat Loss Resistance</div>
+        <div class="rcs-value" style="color:${reportData.rcsInfo.color}">${reportData.rcsInfo.label}</div>
+      </div>
+    </div>
+    <p class="band-desc">${reportData.band.label}</p>
+  </section>
+
+  <section>
+    <h2>2. Layer Breakdown (5 Layers of Metabolic Permission™)</h2>
+    ${layerRows}
+  </section>
+
+  ${cascadeNum ? `
+  <section>
+    <h2>${cascadeNum}. Cascade Map — How Your Layers Connect</h2>
+    ${cascadeBlocks}
+  </section>` : ''}
+
+  <section>
+    <h2>${n1Num}. Fat Loss Resistance</h2>
+    <div class="rcs-big" style="color:${reportData.rcsInfo.color}">${reportData.rcsInfo.compPct}%</div>
+    <div class="rcs-tier" style="color:${reportData.rcsInfo.color}">${reportData.rcsInfo.label}</div>
+  </section>
+
+  <section>
+    <h2>${n2Num}. Why You're Stuck — And What's Actually Happening</h2>
+    <p>${boldFirstSentence(reportData.n2)}</p>
+  </section>
+
+  <section>
+    <h2>${n3Num}. Where To Begin — Your First Step</h2>
+    <p><strong>${reportData.n3.title}</strong></p>
+    <p>${boldFirstSentence(reportData.n3.body)}</p>
+  </section>
+
+  <section>
+    <h2>${casesNum}. Real Cases — Matched to Your Pattern</h2>
+    ${caseRows}
+  </section>
+
+  ${cravingsNum ? `
+  <section>
+    <h2>${cravingsNum}. Craving Patterns</h2>
+    ${cravingRows}
+  </section>` : ''}
+
+  ${symptomsNum ? `
+  <section>
+    <h2>${symptomsNum}. Symptom Timeline</h2>
+    ${symptomRows}
+  </section>` : ''}
+
+  ${buildAboutSectionHtml(aboutNum, heroPhotoBase64)}
+
+  <div class="disclaimer">
+    <svg class="disclaimer-bg"><rect width="100%" height="100%" rx="12" fill="#f2f2f2" /></svg>
+    <div class="disclaimer-content">${DISCLAIMER}</div>
+  </div>
+
+  </td></tr>
+  </tbody>
+  </table>
+</body>
+</html>`;
+}
+
 function ReportScreen({ onNavigate, scoreResult, userData }: { onNavigate: (s: ScreenId) => void; scoreResult?: any; userData?: any }) {
   const { colors } = useTheme();
-  const { fullName, cravings: loggedCravings, symptoms: ctxSymptoms, scoreHistory, baseline } = useAppData();
+  const { fullName, cravings: loggedCravings, symptoms: ctxSymptoms, scoreHistory, baseline, logReportDownload } = useAppData();
+  const [downloadingPdf, setDownloadingPdf] = useState(false);
 
   // Use real scoreResult if available, else fall back to latest scoreHistory
   const latestHistory = scoreHistory[0];
@@ -6342,7 +6743,7 @@ function ReportScreen({ onNavigate, scoreResult, userData }: { onNavigate: (s: S
   const matchedCases = CASE_STUDIES.filter(cs => (CASE_LAYER_MAP[cs.id] || []).some(l => dominantLayers.includes(l))).slice(0, 3);
 
   // Dynamic 14-day countdown
-  const lastTestDate = scoreHistory[0]?.date ? new Date(scoreHistory[0].date) : null;
+  const lastTestDate = scoreHistory[0]?.created_at ? new Date(scoreHistory[0].created_at) : null;
   let retakeDaysText = 'Take your first test';
   if (lastTestDate) {
     const daysSince = Math.floor((Date.now() - lastTestDate.getTime()) / (1000 * 60 * 60 * 24));
@@ -6350,6 +6751,12 @@ function ReportScreen({ onNavigate, scoreResult, userData }: { onNavigate: (s: S
     if (daysRemaining > 0) retakeDaysText = `${daysRemaining} days`;
     else retakeDaysText = 'Ready to retake';
   }
+  // PDF-only: the actual next-retake calendar date (lastTestDate + 14 days), rather than the
+  // day-count/"Ready to retake" text above — that text is still used elsewhere on this screen
+  // and is left untouched.
+  const retakeDateText = lastTestDate
+    ? new Date(lastTestDate.getTime() + 14 * 24 * 60 * 60 * 1000).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })
+    : 'Take your first test';
 
   // Report data
   const reportData = {
@@ -6372,6 +6779,27 @@ function ReportScreen({ onNavigate, scoreResult, userData }: { onNavigate: (s: S
 
   // WhatsApp share text
   const shareText = `My Metabolic Score™ is ${totalScore}/100. Fat loss resistance: ${rcsInfo.compPct}%. Primary pattern: ${pattern}. Get yours at amitbaruna.com`;
+
+  const downloadPdfReport = async () => {
+    if (downloadingPdf) return;
+    setDownloadingPdf(true);
+    logReportDownload('pdf_report').catch(() => {});
+    try {
+      const cascadeItems = buildCascadeItems(narrativeResult);
+      const heroPhotoBase64 = await getHeroPhotoBase64();
+      const html = buildReportHtml(reportData, retakeDateText, matchedCases, cascadeItems, loggedCravings, ctxSymptoms, heroPhotoBase64);
+      const { uri } = await Print.printToFileAsync({ html });
+      if (await Sharing.isAvailableAsync()) {
+        await Sharing.shareAsync(uri, { mimeType: 'application/pdf', dialogTitle: 'Share your Metabolic Score Report' });
+      } else {
+        Alert.alert('Sharing not available on this device');
+      }
+    } catch (e) {
+      Alert.alert('Could not generate PDF', 'Please try again.');
+    } finally {
+      setDownloadingPdf(false);
+    }
+  };
 
   return (
     <ScrollScreen bg={colors.bg} bottomPad={40}>
@@ -6546,9 +6974,9 @@ function ReportScreen({ onNavigate, scoreResult, userData }: { onNavigate: (s: S
       </View>
 
       <View style={{ paddingHorizontal: 24, gap: 12 }}>
-        <TouchableOpacity style={{ backgroundColor: colors.red, paddingVertical: 14, borderRadius: 12, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8 }}>
-          <Ionicons name="document-text" size={16} color="#fff" />
-          <Text style={{ color: '#fff', fontSize: 14, fontWeight: '700', letterSpacing: 0.5 }}>Download PDF Report</Text>
+        <TouchableOpacity onPress={downloadPdfReport} disabled={downloadingPdf} style={{ backgroundColor: colors.red, paddingVertical: 14, borderRadius: 12, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8, opacity: downloadingPdf ? 0.7 : 1 }}>
+          {downloadingPdf ? <ActivityIndicator size="small" color="#fff" /> : <Ionicons name="document-text" size={16} color="#fff" />}
+          <Text style={{ color: '#fff', fontSize: 14, fontWeight: '700', letterSpacing: 0.5 }}>{downloadingPdf ? 'Generating...' : 'Download PDF Report'}</Text>
         </TouchableOpacity>
         <TouchableOpacity onPress={() => Linking.openURL(`https://wa.me/?text=${encodeURIComponent(shareText)}`)} style={{ backgroundColor: '#25D366', paddingVertical: 14, borderRadius: 12, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8 }}>
           <Ionicons name="logo-whatsapp" size={16} color="#fff" />

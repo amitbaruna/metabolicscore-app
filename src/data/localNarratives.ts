@@ -50,9 +50,12 @@ const N1_CLOSERS: string[] = [
 function generateN1(result: ScoreResult, _userData: UserData): LocalN1 {
   const rcsLabel = result.rcsInfo.label;
   const openers = N1_OPENERS[rcsLabel] || N1_OPENERS['Moderate'];
-  const opener = openers[Math.floor(Math.random() * openers.length)];
+  // Deterministic, not random — the same ScoreResult must always produce the same N1 text
+  // everywhere it's shown (Home's card, Results screen, the PDF export), so selection is keyed
+  // off stable fields of the result itself rather than Math.random().
+  const opener = openers[result.totalScore % openers.length];
   const patternLine = N1_PATTERNS[result.patternEngine.dominant_pattern] || N1_PATTERNS['Single System Bottleneck'];
-  const closer = N1_CLOSERS[Math.floor(Math.random() * N1_CLOSERS.length)];
+  const closer = N1_CLOSERS[result.dominantLayer % N1_CLOSERS.length];
   const weakestName = LAYER_NAMES[result.dominantLayer - 1];
   return { brief: `${opener} ${patternLine} Your primary bottleneck is ${weakestName} — focusing here first may unlock the most progress. ${closer}` };
 }
@@ -217,25 +220,35 @@ const DOMINO_ACTIONS: Record<number, { action: string; outcome: string }> = {
   },
 };
 
+// LAYER_PLAIN entries are inconsistent in shape — 4 of 5 already embed a leading "your"
+// ('your body clock', 'your stress response system', 'your gut-brain connection', 'your
+// mindset and self-image'), one doesn't ('how your body manages energy'). A hardcoded "Your "
+// prefix in front of any of the "your X" entries produces "Your your X" — this general helper
+// (capitalize root's own first letter, never prepend a separate word) is the fix: every
+// LAYER_PLAIN entry already carries whatever preposition/possessive it needs, so this is
+// correct for all 5 regardless of which one ends up as root. Applies at every sentence-initial
+// use of root/rootName below; mid-sentence uses stay lowercase as before.
+const capitalize = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
+
 const CASCADE_USER_LANG: [RegExp, (root: string, others: string[]) => string][] = [
   [/L1.*failure.*→.*L2/i,
-    (root, others) => `Your ${root} may be pulling down ${others[0] || 'your stress response system'}. When your body clock misfires, cortisol probably stays elevated — this may suppress serotonin and keep your stress response on high alert.`],
+    (root, others) => `${capitalize(root)} may be pulling down ${others[0] || 'your stress response system'}. When your body clock misfires, cortisol probably stays elevated — this may suppress serotonin and keep your stress response on high alert.`],
   [/L2.*compromised.*→.*L4/i,
-    (root, others) => `Your ${root} may be weakening ${others[0] || 'your gut-brain connection'}. Since 90% of serotonin is produced in the gut, stress strain may directly translate to digestive and mood issues.`],
+    (root, others) => `${capitalize(root)} may be weakening ${others[0] || 'your gut-brain connection'}. Since 90% of serotonin is produced in the gut, stress strain may directly translate to digestive and mood issues.`],
   [/L3.*\+.*L4.*feedback/i,
     () => `There may be a feedback loop between ${LAYER_PLAIN[2]} and ${LAYER_PLAIN[3]}. Insulin resistance may be driving gut inflammation, and the gut inflammation may make insulin resistance worse — each one probably feeds the other.`],
   [/L4.*severely/i,
-    (root) => `${root.charAt(0).toUpperCase() + root.slice(1)} may be under severe strain. A compromised gut-brain connection may directly affect your mood, energy, and cravings through vagus nerve signaling.`],
+    (root) => `${capitalize(root)} may be under severe strain. A compromised gut-brain connection may directly affect your mood, energy, and cravings through vagus nerve signaling.`],
   [/L1.*disruption.*→.*L4/i,
-    (root, others) => `Your ${root} disruption may be reaching ${others[0] || 'your gut-brain connection'}. Your body clock and gut health are closely connected — a misaligned rhythm may worsen digestive strain.`],
+    (root, others) => `${capitalize(root)} disruption may be reaching ${others[0] || 'your gut-brain connection'}. Your body clock and gut health are closely connected — a misaligned rhythm may worsen digestive strain.`],
   [/L1.*disruption.*→.*L5/i,
-    (root, others) => `Your ${root} disruption may be affecting ${others[0] || 'your mindset and self-image'}. When your body loses its rhythmic anchor, behavioral patterns and self-image may start to shift negatively.`],
+    (root, others) => `${capitalize(root)} disruption may be affecting ${others[0] || 'your mindset and self-image'}. When your body loses its rhythmic anchor, behavioral patterns and self-image may start to shift negatively.`],
   [/L2.*overload.*→.*L3/i,
-    (root, others) => `Your ${root} may be putting pressure on ${others[0] || 'how your body manages energy'}. Chronic stress hormones may interfere with how your body produces and uses energy.`],
+    (root, others) => `${capitalize(root)} may be putting pressure on ${others[0] || 'how your body manages energy'}. Chronic stress hormones may interfere with how your body produces and uses energy.`],
   [/L3.*instability.*→.*L5/i,
     (root, others) => `Instability in ${root} may be influencing ${others[0] || 'your mindset and self-image'}. Blood sugar swings may create mood and motivation dips that reinforce negative self-image patterns.`],
   [/L4.*compromised.*→.*L5/i,
-    (root, others) => `Your ${root} may be weakening ${others[0] || 'your mindset and self-image'}. Gut inflammation may affect neurotransmitter production, which may influence how you see yourself and your ability to stay consistent.`],
+    (root, others) => `${capitalize(root)} may be weakening ${others[0] || 'your mindset and self-image'}. Gut inflammation may affect neurotransmitter production, which may influence how you see yourself and your ability to stay consistent.`],
 ];
 
 function translateCascadeToUserLang(cascade: string, rootLayer: number): string {
@@ -255,9 +268,9 @@ function translateCascadeToUserLang(cascade: string, rootLayer: number): string 
 
   // Fallback: generic cascade language
   if (otherNames.length > 0) {
-    return `Your ${rootName} may be cascading into ${otherNames[0]}. When one layer is under strain, it may pull down connected systems — addressing ${rootName} first may help stabilize the others.`;
+    return `${capitalize(rootName)} may be cascading into ${otherNames[0]}. When one layer is under strain, it may pull down connected systems — addressing ${rootName} first may help stabilize the others.`;
   }
-  return `Your ${rootName} is the root of a cascade pattern. When this layer is under strain, it may pull down connected systems — targeted action here may help break the chain.`;
+  return `${capitalize(rootName)} is the root of a cascade pattern. When this layer is under strain, it may pull down connected systems — targeted action here may help break the chain.`;
 }
 
 // Ranks raw cascade strings by relevance to the dominant layer: the dominant layer being the
@@ -292,12 +305,19 @@ export function generateDominoEffect(scoreResult: ScoreResult, idx: number): Dom
     return null;
   }
 
-  const rootLayer = scoreResult.dominantLayer;
-  const ranked = rankCascadeStrings(cascadeStr, rootLayer);
+  const dominantLayer = scoreResult.dominantLayer;
+  const ranked = rankCascadeStrings(cascadeStr, dominantLayer);
   if (ranked.length === 0) return null;
 
   // Pick the cascade at the given rotation index (wraps around)
   const picked = ranked[idx % ranked.length];
+
+  // The picked cascade's own root/cause layer — NOT necessarily the user's overall
+  // dominantLayer (used above only for ranking). Every pattern in buildCascadeRisk is
+  // "L{cause} ... → L{effect} ...", so the first L# mentioned is always the actual root;
+  // falling back to dominantLayer is defensive only, since a picked cascade always has one.
+  const rootMatch = picked.match(/L(\d)/);
+  const rootLayer = rootMatch ? parseInt(rootMatch[1]) : dominantLayer;
 
   // Translate to user-facing language
   const userLanguage = translateCascadeToUserLang(picked, rootLayer);
