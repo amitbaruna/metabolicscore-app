@@ -1,5 +1,5 @@
 import React, { createContext, useContext, useState, useEffect, useCallback, type ReactNode } from 'react';
-import { profiles as profileApi, scores as scoreApi, cravings as cravingApi, nps as npsApi, reportDownloads as reportDownloadsApi } from '../config/supabase';
+import { profiles as profileApi, scores as scoreApi, cravings as cravingApi, nps as npsApi, reportDownloads as reportDownloadsApi, checkins as checkinApi } from '../config/supabase';
 import { useAuth } from './AuthContext';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 
@@ -64,6 +64,13 @@ type DataContextType = {
   updateCraving: (id: string, updates: Partial<Omit<CravingEntry, 'id' | 'created_at'>>) => Promise<void>;
   saveNpsRating: (score: number, context?: { total_score?: number; dominant_layer?: number }) => Promise<void>;
   logReportDownload: (reportType?: string) => Promise<void>;
+  // Returns whether the write actually succeeded — callers use this to gate optimistic
+  // local/AsyncStorage state, rather than assuming success just because nothing threw
+  // (sbFetch never throws on a non-2xx response; a Postgres error comes back as normal
+  // resolved data). Confirmed 2026-08-07: without this signal, a failed calendar check-in
+  // still left Home showing "done" because the AsyncStorage write happened unconditionally.
+  logCheckin: (assignedActionId: string | null, date?: string) => Promise<boolean>;
+  logCheckinUndo: (date: string) => Promise<boolean>;
   deleteCraving: (id: string) => Promise<void>;
   refreshCravings: () => Promise<void>;
   symptoms: SymptomEntry[];
@@ -270,6 +277,58 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
     } catch (e) { console.warn('Report download log failed:', e); }
   }, [user?.id]);
 
+  const logCheckin = useCallback(async (assignedActionId: string | null, date?: string): Promise<boolean> => {
+    console.log('[DEBUG checkin] logCheckin called — user.id:', user?.id, 'assignedActionId:', assignedActionId, 'date:', date);
+    if (!user?.id) { console.log('[DEBUG checkin] logCheckin SKIPPED — no user.id at call time'); return false; }
+    try {
+      const result = await checkinApi.markDone(assignedActionId, date);
+      console.log('[DEBUG checkin] checkinApi.markDone raw result:', result);
+      // sbFetch never throws on a non-2xx response — it returns the PostgREST error body as
+      // normal resolved data (only console.warn's internally). This function previously
+      // awaited the call and discarded the result without checking it, so a real write
+      // failure (RLS rejection, missing grant, constraint violation) was silently dropped
+      // here even though sbFetch's own warning still printed. Same result-checking pattern
+      // saveScore/saveCraving/deleteCraving already use.
+      const isErrorResponse = result && (result.code || result.error || (result.message && !Array.isArray(result)));
+      if (isErrorResponse) {
+        console.warn('[logCheckin] Supabase write failed:', result);
+        return false;
+      }
+      if (!Array.isArray(result) || result.length === 0) {
+        console.warn('[logCheckin] Supabase write returned no row (unexpected for return=representation):', result);
+        return false;
+      }
+      return true;
+    } catch (e) {
+      console.warn('[logCheckin] threw:', e);
+      return false;
+    }
+  }, [user?.id]);
+
+  // Undo — Streak Calendar's "Done, tap to undo" within the 2-day edit window. Same
+  // result-checking discipline as logCheckin above, not a swallowed try/catch.
+  const logCheckinUndo = useCallback(async (date: string): Promise<boolean> => {
+    console.log('[DEBUG checkin] logCheckinUndo called — user.id:', user?.id, 'date:', date);
+    if (!user?.id) { console.log('[DEBUG checkin] logCheckinUndo SKIPPED — no user.id at call time'); return false; }
+    try {
+      const result = await checkinApi.markUndone(date);
+      console.log('[DEBUG checkin] checkinApi.markUndone raw result:', result);
+      const isErrorResponse = result && (result.code || result.error || (result.message && !Array.isArray(result)));
+      if (isErrorResponse) {
+        console.warn('[logCheckinUndo] Supabase write failed:', result);
+        return false;
+      }
+      if (!Array.isArray(result) || result.length === 0) {
+        console.warn('[logCheckinUndo] Supabase write matched no row:', result);
+        return false;
+      }
+      return true;
+    } catch (e) {
+      console.warn('[logCheckinUndo] threw:', e);
+      return false;
+    }
+  }, [user?.id]);
+
   const updateCraving = useCallback(async (id: string, updates: Partial<Omit<CravingEntry, 'id' | 'created_at'>>) => {
     if (user?.id) {
       try {
@@ -474,7 +533,7 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
   return (
     <DataContext.Provider value={{
       hasScore, fullName, scoreHistory, refreshScoreHistory, saveProfile, saveScore,
-      cravings, saveCraving, updateCraving, saveNpsRating, logReportDownload, deleteCraving, refreshCravings, symptoms, setSymptoms, goals, setGoals,
+      cravings, saveCraving, updateCraving, saveNpsRating, logReportDownload, logCheckin, logCheckinUndo, deleteCraving, refreshCravings, symptoms, setSymptoms, goals, setGoals,
       fatDeposition, setFatDeposition, baseline, setBaseline, conditions, setConditions,
       miniQuiz, setMiniQuizAnswers, lastQuizAnswers, setLastQuizAnswers, loading,
     }}>

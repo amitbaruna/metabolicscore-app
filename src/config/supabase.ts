@@ -377,12 +377,100 @@ export const pushNotifications = {
     const authToken = await auth.getToken();
     const res = await sbFetch(`/rest/v1/app_profiles?id=eq.${userId}`, {
       method: 'PATCH',
-      body: JSON.stringify({ push_token: token }),
+      body: JSON.stringify({ expo_push_token: token, push_token_updated_at: new Date().toISOString() }),
     }, authToken);
     if (!Array.isArray(res)) {
-      console.warn('[pushNotifications.saveToken] unexpected response — the push_token column may not exist yet on app_profiles:', res);
+      console.warn('[pushNotifications.saveToken] unexpected response:', res);
     }
     return res;
+  },
+};
+
+// Reads a layer's fixed daily-action row (v1.0: one row per layer, no rotation — see
+// Habit_Notification_Engine_SPEC_DRAFT.md §10.3) for the check-in card's rotating "reveal"
+// copy. `layer` must be the actions-table text format ('L1'..'L5'), not the app's internal
+// 1-5 integer — same conversion the notification Worker already does server-side.
+export const actionContent = {
+  async get(layer: string) {
+    const token = await auth.getToken();
+    const rows = await sbFetch(`/rest/v1/actions?layer=eq.${layer}&select=*&limit=1`, {}, token);
+    if (!Array.isArray(rows)) {
+      console.warn('[actionContent.get] unexpected response:', rows);
+      return null;
+    }
+    return rows[0] || null;
+  },
+};
+
+// Logs a completed "Today's 1%" check-in to app_checkins — gives the already-live
+// notification Worker's streak/check-in-reminder logic real data to read, instead of
+// nothing. One row per user per day: upserts on (user_id, date) so re-tapping an
+// already-completed day doesn't create duplicates.
+export const checkins = {
+  // `date` defaults to today (HomeScreen's Mark as Done never passes one). The Streak
+  // Calendar screen's 2-day edit window passes an explicit past date to backfill yesterday/
+  // the day before — `backfilled` is derived by comparing against the real today, not
+  // trusted from the caller.
+  async markDone(assignedActionId: string | null, date?: string) {
+    const token = await auth.getToken();
+    const user = await auth.getSession();
+    const today = new Date().toISOString().slice(0, 10);
+    const targetDate = date || today;
+    return await sbFetch('/rest/v1/app_checkins?on_conflict=user_id,date', {
+      method: 'POST',
+      headers: { 'Prefer': 'resolution=merge-duplicates,return=representation' },
+      body: JSON.stringify({
+        user_id: user?.id,
+        date: targetDate,
+        assigned_action_id: assignedActionId,
+        completed: true,
+        completed_at: new Date().toISOString(),
+        backfilled: targetDate !== today,
+      }),
+    }, token);
+  },
+  // Undo — Streak Calendar's "Done, tap to undo" state, within the same 2-day edit window
+  // markDone's backfill uses. PATCHes the existing row rather than deleting it, so
+  // completed_at/assigned_action_id history isn't lost by a mark→undo→re-mark sequence.
+  async markUndone(date: string) {
+    const token = await auth.getToken();
+    const user = await auth.getSession();
+    if (!user?.id) return null;
+    return await sbFetch(`/rest/v1/app_checkins?user_id=eq.${user.id}&date=eq.${date}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ completed: false }),
+    }, token);
+  },
+  // Check-ins from a given date onward, for the Streak Calendar screen's 14-day grid — only
+  // ever reads the current cycle's own window (its start_date), not full history.
+  async listSince(sinceDate: string): Promise<{ date: string; completed: boolean }[]> {
+    const token = await auth.getToken();
+    const user = await auth.getSession();
+    if (!user?.id) return [];
+    const rows = await sbFetch(`/rest/v1/app_checkins?user_id=eq.${user.id}&date=gte.${sinceDate}&select=date,completed&order=date.asc`, {}, token);
+    if (!Array.isArray(rows)) {
+      console.warn('[checkins.listSince] unexpected response:', rows);
+      return [];
+    }
+    return rows;
+  },
+};
+
+// Read-only from the app's side — habit_cycles rows are only ever written by the
+// notification Worker (service_role), matching the app_membership pattern. RLS
+// (cycles_select_own) already scopes this to the signed-in user; the user_id filter here is
+// just explicit, same style as scores.list/cravings.list.
+export const habitCycles = {
+  async getMine(): Promise<any[]> {
+    const token = await auth.getToken();
+    const user = await auth.getSession();
+    if (!user?.id) return [];
+    const rows = await sbFetch(`/rest/v1/habit_cycles?user_id=eq.${user.id}&select=*&order=start_date.desc`, {}, token);
+    if (!Array.isArray(rows)) {
+      console.warn('[habitCycles.getMine] unexpected response:', rows);
+      return [];
+    }
+    return rows;
   },
 };
 

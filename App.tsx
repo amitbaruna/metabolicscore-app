@@ -21,9 +21,11 @@ import * as Sharing from 'expo-sharing';
 import * as Print from 'expo-print';
 import * as Clipboard from 'expo-clipboard';
 import { Asset } from 'expo-asset';
-import { File as ExpoFile } from 'expo-file-system';
+import { File as ExpoFile, Paths as ExpoPaths } from 'expo-file-system';
+import { PDFDocument, StandardFonts, rgb } from '@cantoo/pdf-lib';
 import Svg, { Path, Defs, LinearGradient as SvgLinearGradient, Stop as SvgStop } from 'react-native-svg';
-import { booking, membership, referral, account, pushNotifications, auth, profiles } from './src/config/supabase';
+import Constants from 'expo-constants';
+import { booking, membership, referral, account, pushNotifications, actionContent, checkins, habitCycles, auth, profiles } from './src/config/supabase';
 // Guarded — expo-notifications behaves inconsistently in Expo Go, especially for remote push
 // token registration on iOS, which really needs a real build. Same safe-load pattern as the
 // other native-adjacent modules this session.
@@ -32,6 +34,32 @@ try {
   Notifications = require('expo-notifications');
 } catch (e) {
   console.warn('[App] expo-notifications not available in this environment.');
+}
+
+// Requests notification permission (if not already granted/denied) and, only if granted,
+// registers the device's Expo push token against the signed-in user's profile. Shared by
+// both the automatic post-onboarding call and ProfileScreen's manual "enable notifications"
+// button, so there's one path instead of two that can silently drift apart. Every failure
+// mode (module unavailable, permission denied, token fetch throws) fails silently — the
+// caller decides whether to surface anything to the user.
+async function registerForPushNotificationsAsync(userId: string): Promise<'granted' | 'denied' | 'unavailable'> {
+  if (!Notifications || !userId) return 'unavailable';
+  try {
+    const { status: existingStatus } = await Notifications.getPermissionsAsync();
+    let finalStatus = existingStatus;
+    if (existingStatus !== 'granted') {
+      const { status } = await Notifications.requestPermissionsAsync();
+      finalStatus = status;
+    }
+    if (finalStatus !== 'granted') return 'denied';
+    const projectId = Constants.expoConfig?.extra?.eas?.projectId;
+    const tokenData = await Notifications.getExpoPushTokenAsync(projectId ? { projectId } : undefined);
+    await pushNotifications.saveToken(userId, tokenData.data);
+    return 'granted';
+  } catch (e) {
+    console.warn('[registerForPushNotificationsAsync] failed:', e);
+    return 'unavailable';
+  }
 }
 // react-native-razorpay intentionally removed — all payment now happens entirely outside the
 // app (WhatsApp/email → Razorpay link → confirmed by the deployed Worker's webhook). This
@@ -83,7 +111,8 @@ type ScreenId =
   | 'library' | 'cases' | 'transformations' | 'cravings' | 'weekly-cravings'
   | 'article-reader' | 'about' | 'specialisation'
   | 'symptom-tracker'
-  | 'profile' | 'customize' | 'booking' | 'report' | 'health-connect' | 'score-history';
+  | 'profile' | 'customize' | 'booking' | 'report' | 'health-connect' | 'score-history'
+  | 'streak-calendar';
 
 type UserData = {
   gender: string;
@@ -186,6 +215,28 @@ function computeStreak(doneDates: string[]): number {
     cursor = new Date(cursor.getTime() - 86400000);
   }
   return count;
+}
+
+// Calendar-date-only day difference — deliberately mirrors metabolic-notification-worker.js's
+// toDateOnly/daysBetween exactly (UTC calendar date, not a raw Date.now() - created_at
+// millisecond subtraction). If this drifted from the Worker's method, the push notification
+// and the in-app reveal card could disagree on which day's copy_variants entry to show,
+// depending on time-of-day drift between when the test was taken and when the app is opened.
+function toDateOnly(d: Date): Date {
+  return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
+}
+function daysSinceCalendar(fromISO: string): number {
+  const MS_PER_DAY = 24 * 60 * 60 * 1000;
+  return Math.round((toDateOnly(new Date()).getTime() - toDateOnly(new Date(fromISO)).getTime()) / MS_PER_DAY);
+}
+// Adds n days to a 'YYYY-MM-DD' date string, returning the same format — used to build the
+// Streak Calendar's 14-day grid from a cycle's start_date, mirroring the Worker's own
+// addDays/dateStr helpers (metabolic-notification-worker.js) so both sides derive the same
+// calendar dates from the same start_date.
+function addDaysStr(dateStr: string, n: number): string {
+  const d = new Date(dateStr);
+  d.setUTCDate(d.getUTCDate() + n);
+  return d.toISOString().slice(0, 10);
 }
 
 function fmtSlotTime(t?: string): string {
@@ -653,6 +704,7 @@ function ComplianceScreen({ onNavigate, fromProfile }: { onNavigate: (s: ScreenI
 
 function OnboardingScreen({ onNavigate }: { onNavigate: (s: ScreenId) => void }) {
   const { colors } = useTheme();
+  const { user } = useAuth();
   const { saveProfile: saveProfileCtx, baseline: ctxBaseline, setBaseline: ctxSetBaseline, setConditions: ctxSetConditions } = useAppData();
   const [step, setStep] = useState(0);
   const [name, setName] = useState('');
@@ -678,6 +730,10 @@ function OnboardingScreen({ onNavigate }: { onNavigate: (s: ScreenId) => void })
       if (age) await ctxSetBaseline({ ...ctxBaseline, age });
       if (conditions.length) await ctxSetConditions(conditions);
       if (referralCodeInput.trim()) await referral.recordSignup(referralCodeInput.trim());
+      // Post-onboarding, not first-launch — asked once here, right after the profile save,
+      // rather than the moment the app first opens. Denied/unavailable fails silently (see
+      // registerForPushNotificationsAsync) — never blocks the onNavigate('home') below.
+      if (user?.id) await registerForPushNotificationsAsync(user.id);
       console.log('[Onboarding] handleComplete finished all steps successfully');
     } catch (e) { console.warn('[Onboarding] handleComplete FAILED:', e); }
     onNavigate('home');
@@ -1543,7 +1599,7 @@ function HomeScreen({ onNavigate, hasScore, scoreResult, onSelectLayer, onNaviga
   const { colors, theme, toggleTheme } = useTheme();
   const { user } = useAuth();
   const { clinicalDepth, toggleClinicalDepth } = useClinicalDepth();
-  const { fullName, cravings: loggedCravings, deleteCraving, symptoms: ctxSymptoms, scoreHistory, refreshCravings, conditions: ctxConditions } = useAppData();
+  const { fullName, cravings: loggedCravings, deleteCraving, symptoms: ctxSymptoms, scoreHistory, refreshCravings, conditions: ctxConditions, logCheckin } = useAppData();
   useEffect(() => { refreshCravings(); }, [refreshCravings]);
   // Derived fresh every render from real data (hasScore/scoreResult come from AppDataContext,
   // scoreHistory is the live Supabase-backed list) — not captured once at mount, so it stays
@@ -1685,9 +1741,22 @@ function HomeScreen({ onNavigate, hasScore, scoreResult, onSelectLayer, onNaviga
     }).catch(() => { /* ignore */ });
   }, []);
 
-  const markActionDone = () => {
+  // Waits for logCheckin's real result before touching AsyncStorage/actionDone — previously
+  // this wrote local state unconditionally and fired the "done" UI on a timer regardless of
+  // whether the server write actually succeeded (confirmed 2026-08-07, found via the
+  // calendar screen's identical pattern surfacing the same gap). The flash still shows
+  // immediately on tap (just an acknowledgment, not a persisted claim); the actual "done"
+  // state and streak bump only commit once the write is confirmed.
+  const markActionDone = async () => {
+    console.log('[DEBUG checkin] markActionDone fired — actionRow:', actionRow, 'dominantLayerId:', dominantLayerId);
     setActionDoneFlash(true);
     const today = new Date().toISOString().slice(0, 10);
+    const ok = await logCheckin(actionRow?.id ?? null);
+    if (!ok) {
+      setActionDoneFlash(false);
+      Alert.alert('Could not save', 'Your check-in couldn\'t be saved — please check your connection and try again.');
+      return;
+    }
     AsyncStorage.getItem('ms_action_done_dates').then(saved => {
       let dates: string[] = [];
       if (saved) {
@@ -1736,6 +1805,28 @@ function HomeScreen({ onNavigate, hasScore, scoreResult, onSelectLayer, onNaviga
   const dominantLayerId = scoreResult?.dominantLayer ?? (fallbackDominantLayerId ? Number(fallbackDominantLayerId) : 2);
   const todayAction = DAILY_ACTIONS[dominantLayerId]?.[0] ?? DAILY_ACTIONS[2][0];
   const dominantLayer = LAYERS[dominantLayerId - 1] ?? LAYERS[1];
+
+  // Today's 1% reveal copy — fetches the dominant layer's fixed actions-table row and shows
+  // that day's copy_variants[dayIndex].reveal (the fuller "why" explanation) under the
+  // existing local DAILY_ACTIONS title/desc, additive rather than replacing it. daysSince
+  // must use the same calendar-date diffing as the notification Worker (daysSinceCalendar
+  // above) so the push notification's teaser and this reveal never disagree on which day's
+  // copy to show. actionRow is also what supplies assigned_action_id for the app_checkins
+  // write in markActionDone below.
+  const [actionRow, setActionRow] = useState<any>(null);
+  useEffect(() => {
+    if (!latestHistory?.created_at) { setActionRow(null); return; }
+    let cancelled = false;
+    actionContent.get(`L${dominantLayerId}`).then((row: any) => {
+      console.log('[DEBUG checkin] actionContent.get result for', `L${dominantLayerId}`, ':', row);
+      if (!cancelled) setActionRow(row);
+    }).catch((e: any) => { console.warn('[DEBUG checkin] actionContent.get threw:', e); if (!cancelled) setActionRow(null); });
+    return () => { cancelled = true; };
+  }, [dominantLayerId, latestHistory?.created_at]);
+  const dayIndex = latestHistory?.created_at
+    ? (((daysSinceCalendar(latestHistory.created_at) % 7) + 7) % 7)
+    : 0;
+  const actionRevealText: string | null = actionRow?.copy_variants?.[dayIndex]?.reveal ?? null;
 
   const renderLayerCard = (layer: typeof LAYERS[0]) => {
     const ls = layerScores[layer.id];
@@ -1905,6 +1996,11 @@ function HomeScreen({ onNavigate, hasScore, scoreResult, onSelectLayer, onNaviga
                             <Text style={{ fontSize: 13, color: colors.textSecondary, marginTop: 6, lineHeight: 20 }}>{todayAction.desc}</Text>
                           </View>
                         </View>
+                        {actionRevealText && (
+                          <View style={{ marginTop: 12, paddingTop: 12, borderTopWidth: 1, borderTopColor: colors.border }}>
+                            <Text style={{ fontSize: 12, color: colors.textSecondary, lineHeight: 18, fontStyle: 'italic' }}>{actionRevealText}</Text>
+                          </View>
+                        )}
                         <TouchableOpacity onPress={markActionDone} style={{ marginTop: 16, backgroundColor: colors.red, paddingVertical: 12, borderRadius: 12, alignItems: 'center' }}><Text style={{ color: '#fff', fontSize: 13, fontWeight: '700', letterSpacing: 0.5 }}>Mark as Done</Text></TouchableOpacity>
                       </>
                     )}
@@ -1930,6 +2026,11 @@ function HomeScreen({ onNavigate, hasScore, scoreResult, onSelectLayer, onNaviga
                     </View>
                   </Animated.View>
                 )}
+                {/* Link only — Today's 1% card itself (Mark as Done, streak logic) is
+                    unchanged, per Habit_Cycle_Engine_SPEC.md §8. */}
+                <TouchableOpacity onPress={() => onNavigate('streak-calendar')} style={{ marginTop: 10, alignSelf: 'flex-start' }}>
+                  <Text style={{ fontSize: 12, fontWeight: '600', color: colors.red }}>View streak calendar →</Text>
+                </TouchableOpacity>
               </View>
               )}
 
@@ -2785,6 +2886,25 @@ function PulseDot({ delay, color }: { delay: number; color: string }) {
 // RESULTS SCREEN
 // ============================================================
 
+// "Points may become available" — the real, per-answer computation (not a flat
+// 100 - totalScore approximation). Shared between ResultsScreen (the original, live
+// scoreResult.history) and StreakCalendarScreen (persisted scoreHistory[].answers, same
+// shape — saveScore stores result.history verbatim as .answers), so both always show the
+// exact same number and framing for the same concept, confirmed 2026-08-07 as a real bug
+// otherwise (calendar page was independently computing 100 - score, diverging from this).
+function computePointsAvailable(answers: { ansIdx: number }[] | undefined | null, totalScore: number): { avail: number; weeks: string } {
+  const avail = (answers || []).reduce((sum, h) => sum + ([0, 3, 3, 5, 4][h.ansIdx] || 0), 0);
+  const weeks = totalScore <= 30 ? '10–14' : totalScore <= 50 ? '8–12' : '6–10';
+  return { avail, weeks };
+}
+// Monday-first weekday index (0=Mon..6=Sun) for a 'YYYY-MM-DD' date string — used by
+// StreakCalendarScreen to align its 14-day grid to real calendar columns under the fixed
+// M/T/W/T/F/S/S header, rather than always starting day 0 in the first (Monday) column
+// regardless of what weekday the cycle actually started on (confirmed bug, 2026-08-07).
+function weekdayMondayFirst(dateStr: string): number {
+  return (new Date(dateStr).getUTCDay() + 6) % 7;
+}
+
 function ResultsScreen({ onNavigate, result, userData, autoExpandN3, onSelectLayer }: { onNavigate: (s: ScreenId) => void; result: ScoreResult; userData: UserData; autoExpandN3?: boolean; onSelectLayer?: (id: number) => void }) {
   const [rating, setRating] = useState(0);
   const [ratingDone, setRatingDone] = useState(false);
@@ -2887,11 +3007,7 @@ function ResultsScreen({ onNavigate, result, userData, autoExpandN3, onSelectLay
   const dominantLayers = [1, 2, 3, 4, 5].filter(i => result.sc[i] <= 11);
   const matchedCases = CASE_STUDIES.filter(cs => (CASE_LAYER_MAP[cs.id] || []).some(l => dominantLayers.includes(l))).slice(0, 3);
 
-  const avail = result.history.reduce((sum, h) => {
-    const pts = [0, 3, 3, 5, 4][h.ansIdx] || 0;
-    return sum + pts;
-  }, 0);
-  const weeks = result.totalScore <= 30 ? '10–14' : result.totalScore <= 50 ? '8–12' : '6–10';
+  const { avail, weeks } = computePointsAvailable(result.history, result.totalScore);
 
   const toggleCard = (id: string) => setExpandedCard(expandedCard === id ? null : id);
 
@@ -4822,17 +4938,10 @@ function ProfileScreen({ onNavigate, hasScore, scoreResult, onGoToCravings, onGo
       return;
     }
     setNotifStatus('requesting');
-    try {
-      const { status } = await Notifications.requestPermissionsAsync();
-      if (status !== 'granted') {
-        setNotifStatus('denied');
-        return;
-      }
-      const tokenData = await Notifications.getExpoPushTokenAsync();
-      await pushNotifications.saveToken(user.id, tokenData.data);
-      setNotifStatus('granted');
-    } catch (e) {
-      console.warn('[Profile] enableNotifications threw:', e);
+    const result = await registerForPushNotificationsAsync(user.id);
+    if (result === 'granted') setNotifStatus('granted');
+    else if (result === 'denied') setNotifStatus('denied');
+    else {
       setNotifStatus('unknown');
       Alert.alert('Could not enable notifications', 'Please try again, or check your device settings.');
     }
@@ -5873,6 +5982,266 @@ function ScoreHistoryScreen({ onNavigate }: { onNavigate: (s: ScreenId) => void 
 }
 
 // ============================================================
+// STREAK CALENDAR SCREEN (Habit_Cycle_Engine_SPEC.md §7)
+// ============================================================
+
+function StreakCalendarScreen({ onNavigate }: { onNavigate: (s: ScreenId) => void }) {
+  const { colors } = useTheme();
+  const { scoreHistory, logCheckin, logCheckinUndo } = useAppData();
+  const [cycles, setCycles] = useState<any[] | null>(null);
+  const [checkinDates, setCheckinDates] = useState<Record<string, boolean>>({});
+  const [expandedCycleId, setExpandedCycleId] = useState<string | null>(null);
+
+  useEffect(() => { habitCycles.getMine().then(setCycles).catch(() => setCycles([])); }, []);
+
+  const currentCycle = cycles?.find(c => c.status === 'active' || c.status === 'extended') ?? null;
+  const pastCycles = (cycles ?? []).filter(c => c.status === 'closed_retest' || c.status === 'closed_reset');
+
+  useEffect(() => {
+    if (!currentCycle?.start_date) { setCheckinDates({}); return; }
+    checkins.listSince(currentCycle.start_date).then(rows => {
+      const map: Record<string, boolean> = {};
+      rows.forEach(r => { if (r.completed) map[r.date] = true; });
+      setCheckinDates(map);
+    }).catch(() => setCheckinDates({}));
+  }, [currentCycle?.start_date]);
+
+  // dominantLayerId + actionRow — this screen previously had neither, so its check-in write
+  // always sent assigned_action_id: null, which violates app_checkins' NOT NULL constraint
+  // on that column (confirmed 2026-08-07, every tap, not intermittent). Same fallback chain
+  // HomeScreen uses when it only has persisted scoreHistory (not a live scoreResult): prefer
+  // the persisted dominant_layer, else derive it from the lowest of layer1-5, else default 2.
+  // v1.0 has one fixed action per layer for the whole cycle (no rotation), so this is the
+  // same lookup regardless of which day within the cycle is being toggled.
+  const latestScore = scoreHistory[0];
+  const dominantLayerId = latestScore?.dominant_layer ?? (latestScore
+    ? Number(Object.entries({ 1: latestScore.layer1, 2: latestScore.layer2, 3: latestScore.layer3, 4: latestScore.layer4, 5: latestScore.layer5 }).sort((a, b) => a[1] - b[1])[0][0])
+    : 2);
+  const [calendarActionRow, setCalendarActionRow] = useState<any>(null);
+  useEffect(() => {
+    actionContent.get(`L${dominantLayerId}`).then(setCalendarActionRow).catch(() => setCalendarActionRow(null));
+  }, [dominantLayerId]);
+
+  const todayStr = new Date().toISOString().slice(0, 10);
+
+  // Toggles a day within the 2-day edit window (today, and the 2 days before it — matches
+  // the app-wide 2-day backfill limit, e.g. streak-reset tolerance in
+  // Habit_Notification_Engine_SPEC_DRAFT.md §3). Works both directions: marks done if not
+  // done, undoes if already done. Writes to the exact same two AsyncStorage keys
+  // HomeScreen's markActionDone (App.tsx ~line 1744) reads/writes, so navigating back to
+  // Home (which fully remounts, per this app's switch-based nav) picks up the change.
+  //
+  // Waits for the server write's real result (logCheckin/logCheckinUndo now return a
+  // success boolean) before touching AsyncStorage or checkinDates — previously this updated
+  // local state unconditionally, so a failed write (e.g. the assigned_action_id NOT NULL
+  // violation below) still left Home showing "done" (confirmed 2026-08-07).
+  const toggleDayFromCalendar = async (dateStr: string, currentlyDone: boolean) => {
+    const ok = currentlyDone
+      ? await logCheckinUndo(dateStr)
+      : await logCheckin(calendarActionRow?.id ?? null, dateStr);
+
+    if (!ok) {
+      Alert.alert('Could not save', 'This check-in couldn\'t be saved — please check your connection and try again.');
+      return;
+    }
+
+    try {
+      const saved = await AsyncStorage.getItem('ms_action_done_dates');
+      let dates: string[] = [];
+      if (saved) { try { dates = JSON.parse(saved); } catch { dates = []; } }
+      dates = currentlyDone ? dates.filter(d => d !== dateStr) : Array.from(new Set([...dates, dateStr]));
+      await AsyncStorage.setItem('ms_action_done_dates', JSON.stringify(dates));
+      if (dateStr === todayStr) {
+        if (currentlyDone) await AsyncStorage.removeItem('ms_action_done_today');
+        else await AsyncStorage.setItem('ms_action_done_today', todayStr);
+      }
+    } catch { /* ignore — local streak cache is best-effort; the server write above is the
+                  source of truth and is already confirmed successful at this point */ }
+
+    setCheckinDates(prev => {
+      const next = { ...prev };
+      if (currentlyDone) delete next[dateStr]; else next[dateStr] = true;
+      return next;
+    });
+  };
+
+  const gridDays = currentCycle ? Array.from({ length: 14 }, (_, i) => {
+    const dateStr = addDaysStr(currentCycle.start_date, i);
+    const isDone = !!checkinDates[dateStr];
+    // daysSince > 0 = past, 0 = today, < 0 = future. Editable window is today and the 2 days
+    // before it (confirmed 2026-08-06, supersedes the earlier "today only" reading) — days
+    // older than that lock permanently, and future days aren't reachable yet either way.
+    const daysSince = daysSinceCalendar(dateStr);
+    const inEditWindow = daysSince >= 0 && daysSince <= 2;
+    let state: 'done' | 'done-editable' | 'missed-tappable' | 'locked';
+    if (isDone) state = inEditWindow ? 'done-editable' : 'done';
+    else if (inEditWindow) state = 'missed-tappable';
+    else state = 'locked';
+    return { dateStr, state };
+  }) : [];
+
+  const adherence = gridDays.filter(d => d.state === 'done' || d.state === 'done-editable').length;
+  const score = scoreHistory[0]?.total_score ?? 0;
+  // Same real per-answer computation ResultsScreen uses (computePointsAvailable above),
+  // sourced from persisted scoreHistory[].answers — saveScore stores result.history
+  // verbatim as .answers, so this is the identical data, not a re-derivation. Replaces the
+  // flat 100 - score approximation that was diverging from ResultsScreen's real number
+  // (confirmed 2026-08-07).
+  const { avail: pointsAvailable, weeks: pointsWeeks } = computePointsAvailable(scoreHistory[0]?.answers, score);
+
+  const messageTier =
+    adherence >= 10 ? `${adherence} days in — that consistency is exactly what moves the needle.`
+    : adherence >= 5 ? `${adherence} days followed so far — keep going, it's adding up.`
+    : `Every day you show up counts, even the small ones. Keep building from here.`;
+
+  const DAY_LETTERS = ['M', 'T', 'W', 'T', 'F', 'S', 'S'];
+  // How many blank leading cells to render before gridDays[0] so the cycle's start_date
+  // lands under its real weekday column, rather than always the first (Monday) position
+  // regardless of what day it actually started on (confirmed bug, 2026-08-07).
+  const leadingBlanks = currentCycle ? weekdayMondayFirst(currentCycle.start_date) : 0;
+
+  const cellStyle = (state: string): any => {
+    if (state === 'done') return { backgroundColor: '#22C55E', borderWidth: 0 };
+    if (state === 'done-editable') return { backgroundColor: '#22C55E', borderWidth: 2, borderColor: colors.red };
+    if (state === 'missed-tappable') return { backgroundColor: 'transparent', borderWidth: 1.5, borderColor: colors.textTertiary, borderStyle: 'dashed' };
+    return { backgroundColor: 'transparent', borderWidth: 1, borderColor: colors.border };
+  };
+
+  return (
+    <ScrollScreen bg={colors.bg} bottomPad={40}>
+      <View style={{ paddingHorizontal: 24, paddingTop: 12, flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}>
+        <TouchableOpacity onPress={() => onNavigate('home')} style={{ width: 40, height: 40, borderRadius: 20, backgroundColor: colors.card, alignItems: 'center', justifyContent: 'center' }}>
+          <Ionicons name="arrow-back" size={20} color={colors.textSecondary} />
+        </TouchableOpacity>
+        <Text style={{ fontSize: 16, fontWeight: '700', color: colors.text, textTransform: 'uppercase' }}>Streak Calendar</Text>
+        <View style={{ width: 40 }} />
+      </View>
+
+      {cycles === null ? (
+        <View style={{ paddingHorizontal: 24, marginTop: 60, alignItems: 'center' }}>
+          <ActivityIndicator color={colors.red} />
+        </View>
+      ) : !currentCycle ? (
+        <View style={{ paddingHorizontal: 24, marginTop: 60, alignItems: 'center' }}>
+          <View style={{ width: 72, height: 72, borderRadius: 20, backgroundColor: `${colors.red}14`, alignItems: 'center', justifyContent: 'center', marginBottom: 16 }}>
+            <Ionicons name="flame" size={32} color={colors.red} />
+          </View>
+          <Text style={{ fontSize: 14, fontWeight: '600', color: colors.text, textAlign: 'center' }}>Your first cycle hasn't started yet.</Text>
+          <Text style={{ fontSize: 13, color: colors.textSecondary, textAlign: 'center', marginTop: 6, lineHeight: 18 }}>Complete Today's 1% and check back — your cycle begins automatically.</Text>
+        </View>
+      ) : (
+        <View style={{ paddingHorizontal: 24, marginTop: 16 }}>
+          <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}>
+            <View>
+              <Text style={{ fontSize: 20, fontWeight: '800', color: colors.text }}>Your 1% habit</Text>
+              <Text style={{ fontSize: 12, color: colors.textSecondary, marginTop: 2 }}>Small actions, tracked daily</Text>
+            </View>
+            <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6, paddingHorizontal: 10, paddingVertical: 4, borderRadius: 6, backgroundColor: 'rgba(245,158,11,0.12)' }}>
+              <Ionicons name="flame" size={12} color="#F59E0B" />
+              <Text style={{ fontSize: 11, fontWeight: '700', color: '#F59E0B' }}>{adherence} day streak</Text>
+            </View>
+          </View>
+
+          <View style={{ marginTop: 20, borderRadius: 20, padding: 20, backgroundColor: colors.card }}>
+            <Text style={{ fontSize: 10, fontWeight: '700', letterSpacing: 1, color: colors.textSecondary, textTransform: 'uppercase' }}>Points available</Text>
+            <Text style={{ fontSize: 16, fontWeight: '700', color: colors.text, marginTop: 6 }}>+{pointsAvailable} points may be available over {pointsWeeks} weeks</Text>
+            <Text style={{ fontSize: 12, lineHeight: 18, color: colors.textSecondary, marginTop: 8 }}>Lowering your resistance may unlock <Text style={{ fontWeight: '600', color: '#22C55E' }}>+{pointsAvailable} points</Text> of recovery capacity over roughly <Text style={{ fontWeight: '600', color: colors.text }}>{pointsWeeks} weeks</Text>, with the right intervention sequence.</Text>
+          </View>
+
+          <View style={{ marginTop: 20 }}>
+            <View style={{ flexDirection: 'row' }}>
+              {DAY_LETTERS.map((l, i) => (
+                <View key={i} style={{ flex: 1, alignItems: 'center' }}>
+                  <Text style={{ fontSize: 10, fontWeight: '700', color: colors.textTertiary }}>{l}</Text>
+                </View>
+              ))}
+            </View>
+            <View style={{ flexDirection: 'row', flexWrap: 'wrap', marginTop: 8 }}>
+              {Array.from({ length: leadingBlanks }).map((_, i) => (
+                <View key={`blank-${i}`} style={{ width: `${100 / 7}%`, padding: 4 }} />
+              ))}
+              {gridDays.map((d) => (
+                <View key={d.dateStr} style={{ width: `${100 / 7}%`, padding: 4 }}>
+                  <TouchableOpacity
+                    disabled={d.state !== 'missed-tappable' && d.state !== 'done-editable'}
+                    onPress={() => {
+                      if (d.state === 'missed-tappable') toggleDayFromCalendar(d.dateStr, false);
+                      else if (d.state === 'done-editable') toggleDayFromCalendar(d.dateStr, true);
+                    }}
+                    style={[{ aspectRatio: 1, borderRadius: 10, alignItems: 'center', justifyContent: 'center' }, cellStyle(d.state)]}
+                  >
+                    {(d.state === 'done' || d.state === 'done-editable') && <Ionicons name="checkmark" size={16} color="#fff" />}
+                  </TouchableOpacity>
+                </View>
+              ))}
+            </View>
+          </View>
+
+          <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 12, marginTop: 12 }}>
+            <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+              <View style={{ width: 10, height: 10, borderRadius: 3, backgroundColor: '#22C55E' }} />
+              <Text style={{ fontSize: 11, color: colors.textSecondary }}>Done</Text>
+            </View>
+            <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+              <View style={{ width: 10, height: 10, borderRadius: 3, backgroundColor: '#22C55E', borderWidth: 1.5, borderColor: colors.red }} />
+              <Text style={{ fontSize: 11, color: colors.textSecondary }}>Done (tap to undo)</Text>
+            </View>
+            <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+              <View style={{ width: 10, height: 10, borderRadius: 3, borderWidth: 1.5, borderColor: colors.textTertiary, borderStyle: 'dashed' }} />
+              <Text style={{ fontSize: 11, color: colors.textSecondary }}>Missed (tap to mark)</Text>
+            </View>
+            <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+              <View style={{ width: 10, height: 10, borderRadius: 3, borderWidth: 1, borderColor: colors.border }} />
+              <Text style={{ fontSize: 11, color: colors.textSecondary }}>Locked</Text>
+            </View>
+          </View>
+
+          <View style={{ marginTop: 20, borderRadius: 20, padding: 18, backgroundColor: `${colors.red}14` }}>
+            <Text style={{ fontSize: 14, fontWeight: '600', color: colors.text, lineHeight: 20 }}>{messageTier}</Text>
+          </View>
+
+          <View style={{ marginTop: 16, borderRadius: 16, padding: 16, backgroundColor: colors.iconBg, flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}>
+            <Text style={{ fontSize: 12, fontWeight: '600', color: colors.textSecondary }}>This cycle</Text>
+            <Text style={{ fontSize: 12, fontWeight: '700', color: colors.text }}>{adherence} of 14 days followed</Text>
+          </View>
+        </View>
+      )}
+
+      {pastCycles.length > 0 && (
+        <View style={{ paddingHorizontal: 24, marginTop: 32 }}>
+          <Text style={{ fontSize: 16, fontWeight: '700', color: colors.text, marginBottom: 12 }}>Past cycles</Text>
+          <View style={{ gap: 12 }}>
+            {pastCycles.map((c, idx) => {
+              const isExpanded = expandedCycleId === c.id;
+              const label = `Streak ${pastCycles.length - idx}`;
+              return (
+                <TouchableOpacity key={c.id} activeOpacity={0.9} onPress={() => setExpandedCycleId(isExpanded ? null : c.id)} style={{ borderRadius: 20, backgroundColor: colors.card, borderWidth: 1.5, borderColor: isExpanded ? `${colors.red}40` : colors.border, padding: 16 }}>
+                  <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}>
+                    <Text style={{ fontSize: 14, fontWeight: '700', color: colors.text }}>{label}</Text>
+                    <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+                      <Text style={{ fontSize: 12, color: colors.textSecondary }}>{c.end_date}</Text>
+                      <Ionicons name={isExpanded ? 'chevron-up' : 'chevron-down'} size={14} color={colors.textTertiary} />
+                    </View>
+                  </View>
+                  {isExpanded && (
+                    <View style={{ marginTop: 12, paddingTop: 12, borderTopWidth: 1, borderTopColor: colors.border, gap: 8 }}>
+                      <View style={{ flexDirection: 'row', justifyContent: 'space-between' }}><Text style={{ fontSize: 12, color: colors.textSecondary }}>Started</Text><Text style={{ fontSize: 12, fontWeight: '600', color: colors.text }}>{c.start_date}</Text></View>
+                      <View style={{ flexDirection: 'row', justifyContent: 'space-between' }}><Text style={{ fontSize: 12, color: colors.textSecondary }}>Ended</Text><Text style={{ fontSize: 12, fontWeight: '600', color: colors.text }}>{c.end_date}</Text></View>
+                      <View style={{ flexDirection: 'row', justifyContent: 'space-between' }}><Text style={{ fontSize: 12, color: colors.textSecondary }}>Days followed</Text><Text style={{ fontSize: 12, fontWeight: '600', color: colors.text }}>{c.adherence_count_at_close ?? '—'} of 14</Text></View>
+                      <View style={{ flexDirection: 'row', justifyContent: 'space-between' }}><Text style={{ fontSize: 12, color: colors.textSecondary }}>Closed by</Text><Text style={{ fontSize: 12, fontWeight: '600', color: colors.text }}>{c.status === 'closed_retest' ? 'Retested' : 'Reset'}</Text></View>
+                    </View>
+                  )}
+                </TouchableOpacity>
+              );
+            })}
+          </View>
+        </View>
+      )}
+    </ScrollScreen>
+  );
+}
+
+// ============================================================
 // BOOKING SCREEN
 // ============================================================
 
@@ -6527,6 +6896,13 @@ function buildReportHtml(reportData: any, retakeDateText: string, matchedCases: 
 <head>
 <meta charset="utf-8" />
 <style>
+  /* No special bottom padding here — a CSS-side reservation (tried at both 60px and 90px)
+     can't work structurally: body padding only adds space once, at the true end of the
+     document's content flow, not at every individual paginated page break. Footer clearance is
+     now handled entirely in stampFooterOnPdf (see downloadPdfReport below), which grows each
+     real page's own height and shifts its already-rendered content up via pdf-lib — operating
+     on actual per-page geometry after expo-print has paginated the HTML, rather than guessing
+     at it from CSS beforehand. */
   body { font-family: -apple-system, Helvetica, Arial, sans-serif; color: #1A1A1A; padding: 24px; font-size: 15px; }
   /* Same background-drop bug as buildBarSvg above (WKWebView silently drops the CSS
      "background" property on iOS print) — missed when the other elements were converted to
@@ -6546,7 +6922,7 @@ function buildReportHtml(reportData: any, retakeDateText: string, matchedCases: 
   .meta-label { font-size: 10px; font-weight: 700; letter-spacing: 1px; color: rgba(255,255,255,0.8); text-transform: uppercase; }
   .meta-value { font-size: 13px; font-weight: 700; margin-top: 2px; }
   section { margin-top: 36px; }
-  h2 { font-size: 18px; font-weight: 700; text-transform: uppercase; letter-spacing: 1px; color: #444; border-bottom: 1px solid #eee; padding-bottom: 8px; }
+  h2 { font-size: 14px; font-weight: 700; text-transform: uppercase; letter-spacing: 1px; color: #444; border-bottom: 1px solid #eee; padding-bottom: 8px; }
   .score-row { display: flex; justify-content: space-between; align-items: center; }
   .score-label { font-size: 11px; text-transform: uppercase; color: #666; }
   .score-num { font-size: 46px; font-weight: 900; }
@@ -6592,23 +6968,13 @@ function buildReportHtml(reportData: any, retakeDateText: string, matchedCases: 
   .disclaimer { position: relative; overflow: hidden; margin-top: 24px; padding: 12px; border-radius: 12px; }
   .disclaimer-bg { position: absolute; top: 0; left: 0; width: 100%; height: 100%; display: block; }
   .disclaimer-content { position: relative; font-size: 12px; line-height: 1.6; color: #333; text-align: center; font-weight: 600; }
-  .footer { margin-top: 16px; text-align: center; font-size: 12px; color: #333; font-weight: 600; }
-  /* Only the footer repeats on every printed page (the header stays page-1-only, unchanged,
-     outside this table). <tfoot> is the one long-standing, widely-supported print mechanism
-     for repeating content per page — unlike @page margin boxes (only shipped in very recent
-     Safari/Chrome versions) or position:fixed (documented as unreliable across engines, still
-     an open bug in Chromium). table/tr/td default styling is stripped so the wrapper is
-     invisible and every section keeps its existing spacing exactly as before. */
-  .page-table { width: 100%; border-collapse: collapse; }
-  .page-table > tbody > tr > td, .page-table > tfoot > tr > td { padding: 0; border: none; }
-  /* "Page X of Y" via CSS Paged Media counters, rendered in the native page margin box (not
-     part of the tfoot flow above). Standard mechanism for this, but per the note directly
-     above, @page margin boxes are a recent addition to Safari/Chrome's print engines — since
-     expo-print's iOS path renders through WKWebView (Safari's engine, the same one that drops
-     background-image, see the top-of-file comment on buildBarSvg), this needs on-device
-     confirmation on both platforms before being trusted. No better cross-platform option
-     exists without a JS pagination pass, which expo-print doesn't support. */
-  @page { margin: 24pt 24pt 40pt 24pt; @bottom-center { content: "Page " counter(page) " of " counter(pages); font-size: 9px; color: #999; } }
+  /* The repeating per-page footer ("Generated by...", WhatsApp, site links, Instagram, Page X
+     of Y) used to live here as an HTML <tfoot>/@page CSS pair — both confirmed NOT working
+     on-device (tfoot didn't repeat, counter(page) didn't render), the same WKWebView print-
+     engine unreliability already hit once for background/background-image. Replaced entirely
+     by stampFooterOnPdf (pdf-lib, in downloadPdfReport below), which draws the footer directly
+     onto each already-paginated PDF page after expo-print finishes — sidesteps the print
+     engine's CSS Paged Media support entirely rather than depending on it a third time. */
 </style>
 </head>
 <body>
@@ -6625,18 +6991,6 @@ function buildReportHtml(reportData: any, retakeDateText: string, matchedCases: 
       </div>
     </div>
   </div>
-
-  <table class="page-table">
-  <tfoot>
-    <tr><td>
-      <div class="footer">
-        Generated by Metabolic Score™ · ${BRAND.fullName} · amitbaruna.com · metabolicscore.in<br/>
-        WhatsApp +91 98918 28688 · ${BRAND.instagramHandle}
-      </div>
-    </td></tr>
-  </tfoot>
-  <tbody>
-  <tr><td>
 
   <section>
     <h2>1. Score Summary</h2>
@@ -6706,11 +7060,59 @@ function buildReportHtml(reportData: any, retakeDateText: string, matchedCases: 
     <div class="disclaimer-content">${DISCLAIMER}</div>
   </div>
 
-  </td></tr>
-  </tbody>
-  </table>
 </body>
 </html>`;
+}
+
+// Draws the repeating footer (brand, contact links, page number) directly onto each
+// already-paginated PDF page using pdf-lib, replacing the HTML <tfoot>/@page CSS approach
+// removed above — both confirmed NOT working on-device (tfoot didn't repeat, counter(page)
+// didn't render), the same WKWebView print-engine unreliability already hit once for
+// background/background-image. This runs on the real, final page objects after expo-print has
+// already paginated the HTML, so it doesn't depend on the print engine's CSS Paged Media
+// support at all — `pages.length` below is the actual page count, not a CSS engine's guess.
+//
+// Clearance for the footer band is handled here too, not via CSS — a body padding-bottom
+// reservation was tried twice (60px, then 90px) and confirmed on-device to not work: CSS
+// padding only adds space once, at the end of the whole document's content flow, not at every
+// individual paginated page break, so every page but the last had zero real clearance
+// regardless of the pixel value. Fixed properly per pdf-lib's own documented pairing: `setSize`
+// grows each page's real height (also keeps CropBox/BleedBox/TrimBox/ArtBox in sync when they
+// match MediaBox, avoiding a viewer clipping the new region), and `translateContent` shifts
+// that page's *already-rendered* content up by the same amount — wrapping the existing content
+// stream in a graphics-state transform (push/translate/pop) rather than rewriting it, so
+// whatever WKWebView drew is untouched, just repositioned. That leaves a real, guaranteed-blank
+// band at y=0..FOOTER_BAND on every page, independent of whatever the HTML/CSS did. Resulting
+// pages are taller than standard US Letter — irrelevant here since this PDF is for digital
+// sharing (WhatsApp/email), not physical printing.
+//
+// Text is kept to the WinAnsi-safe ASCII subset (e.g. "-" instead of "™"/"·") since pdf-lib
+// hasn't been used in this codebase before and its built-in StandardFonts' character coverage
+// hasn't had a device-confirmed check yet — not necessarily unsupported, just an unverified
+// risk not worth taking on a first integration.
+const FOOTER_BAND = 70; // pt — real PDF points now, not CSS px, so no unit-conversion guesswork
+
+async function stampFooterOnPdf(pdfBytes: Uint8Array): Promise<Uint8Array> {
+  const pdfDoc = await PDFDocument.load(pdfBytes);
+  const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
+  const gray = rgb(0.4, 0.4, 0.4);
+  const pages = pdfDoc.getPages();
+  const total = pages.length;
+  const line1 = `Generated by Metabolic Score - ${BRAND.fullName} - amitbaruna.com - metabolicscore.in`;
+  const line2 = `WhatsApp +91 98918 28688 - Instagram ${BRAND.instagramHandle}`;
+  pages.forEach((page, i) => {
+    const { width, height } = page.getSize();
+    page.setSize(width, height + FOOTER_BAND);
+    page.translateContent(0, FOOTER_BAND);
+    const draw = (text: string, y: number, size: number) => {
+      const textWidth = font.widthOfTextAtSize(text, size);
+      page.drawText(text, { x: (width - textWidth) / 2, y, size, font, color: gray });
+    };
+    draw(line1, 38 - FOOTER_BAND, 8);
+    draw(line2, 27 - FOOTER_BAND, 8);
+    draw(`Page ${i + 1} of ${total}`, 16 - FOOTER_BAND, 8);
+  });
+  return pdfDoc.save();
 }
 
 function ReportScreen({ onNavigate, scoreResult, userData }: { onNavigate: (s: ScreenId) => void; scoreResult?: any; userData?: any }) {
@@ -6789,8 +7191,13 @@ function ReportScreen({ onNavigate, scoreResult, userData }: { onNavigate: (s: S
       const heroPhotoBase64 = await getHeroPhotoBase64();
       const html = buildReportHtml(reportData, retakeDateText, matchedCases, cascadeItems, loggedCravings, ctxSymptoms, heroPhotoBase64);
       const { uri } = await Print.printToFileAsync({ html });
+      const printedBytes = await new ExpoFile(uri).bytes();
+      const stampedBytes = await stampFooterOnPdf(printedBytes);
+      const stampedFile = new ExpoFile(ExpoPaths.cache, `metabolic-score-report-${Date.now()}.pdf`);
+      stampedFile.create();
+      stampedFile.write(stampedBytes);
       if (await Sharing.isAvailableAsync()) {
-        await Sharing.shareAsync(uri, { mimeType: 'application/pdf', dialogTitle: 'Share your Metabolic Score Report' });
+        await Sharing.shareAsync(stampedFile.uri, { mimeType: 'application/pdf', dialogTitle: 'Share your Metabolic Score Report' });
       } else {
         Alert.alert('Sharing not available on this device');
       }
@@ -7156,6 +7563,42 @@ function AppNavigator() {
     setScreen(s);
   }, []);
 
+  // Notification-tap deep-link routing. checkin_reminder/streak_milestone both land on the
+  // Today's 1% card (there's no separate streak/progress screen — streak only shows inline
+  // there); retest_reminder goes to the quiz. Unknown/missing `data.type` is a deliberate
+  // no-op, not a fallback navigation — fails closed rather than guessing where to send the
+  // user. Checks getLastNotificationResponseAsync() on mount too, so a tap that cold-starts
+  // the app from a killed state still routes correctly, not just a warm/background tap.
+  //
+  // handledNotificationId dedupes a confirmed expo-notifications behavior: on a cold-start
+  // launch tap, BOTH getLastNotificationResponseAsync() AND
+  // addNotificationResponseReceivedListener fire independently for the SAME response
+  // (expo-notifications' own useLastNotificationResponse hook exists specifically to paper
+  // over this, by comparing notification.request.identifier the same way this does).
+  // Without the guard, a cold-start tap called goToTodaysOne() twice, double-triggering the
+  // Today's 1% blink animation. The ref survives across both call sites since they share
+  // this one closure/effect run.
+  const handledNotificationId = useRef<string | null>(null);
+  useEffect(() => {
+    if (!Notifications) return;
+    const routeFromResponse = (response: any) => {
+      const identifier = response?.notification?.request?.identifier;
+      if (identifier && handledNotificationId.current === identifier) return;
+      if (identifier) handledNotificationId.current = identifier;
+      const type = response?.notification?.request?.content?.data?.type;
+      if (type === 'checkin_reminder' || type === 'streak_milestone') {
+        goToTodaysOne();
+      } else if (type === 'retest_reminder') {
+        navigate('score');
+      }
+    };
+    Notifications.getLastNotificationResponseAsync().then((response: any) => {
+      if (response) routeFromResponse(response);
+    }).catch(() => {});
+    const subscription = Notifications.addNotificationResponseReceivedListener(routeFromResponse);
+    return () => subscription?.remove?.();
+  }, [goToTodaysOne, navigate]);
+
   const navigateToResultsFromHope = useCallback(() => {
     setAutoExpandN3(true);
     setScreen('results');
@@ -7238,6 +7681,7 @@ function AppNavigator() {
     case 'report': return <ReportScreen onNavigate={navigate} scoreResult={scoreResult} userData={userData} />;
     case 'health-connect': return <HealthConnectScreen onNavigate={navigate} />;
     case 'score-history': return <ScoreHistoryScreen onNavigate={navigate} />;
+    case 'streak-calendar': return <StreakCalendarScreen onNavigate={navigate} />;
     default: return <HomeScreen onNavigate={navigate} hasScore={hasScore} />;
   }
 }

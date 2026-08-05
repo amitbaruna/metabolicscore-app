@@ -38,12 +38,31 @@ export const SCHEMA_MANIFEST: Record<string, TableManifest> = {
   app_profiles: {
     columns: [
       'id', 'email', 'full_name', 'onboarded', 'gender', 'conditions',
-      'symptoms', 'goals', 'fat_deposition', 'baseline', 'mini_quiz', 'push_token',
+      'symptoms', 'goals', 'fat_deposition', 'baseline', 'mini_quiz',
+      'expo_push_token', 'push_token_updated_at',
     ],
     source:
       'src/config/supabase.ts (auth.signUp insert, profiles.upsert, profiles.updateFields, pushNotifications.saveToken) ' +
       '+ src/context/AppDataContext.tsx (setSymptoms/setGoals/setFatDeposition/setBaseline/setConditions/setMiniQuizAnswers/saveProfile) ' +
-      '+ App.tsx OnboardingScreen.handleComplete',
+      '+ App.tsx OnboardingScreen.handleComplete. ' +
+      'push_token (old, mismatched name) replaced by expo_push_token/push_token_updated_at ' +
+      '2026-08-05 — the deployed notification Worker only ever read expo_push_token, so the ' +
+      'old column name meant no token the app saved was ever actually found by the Worker.',
+  },
+
+  // Read-only from the app's side (actionContent.get in src/config/supabase.ts) — content
+  // rows are managed directly in Supabase, not written by this app. Columns used by the app:
+  // `layer` ('L1'..'L5' text) to look up a row, and `copy_variants` (jsonb array of 7
+  // { teaser, reveal } objects, one per day of the weekly cycle) for the check-in card's
+  // rotating "reveal" text.
+  actions: {
+    columns: [],
+    source: 'src/config/supabase.ts (actionContent.get) — read-only, no app write path.',
+  },
+
+  app_checkins: {
+    columns: ['user_id', 'date', 'assigned_action_id', 'completed', 'completed_at', 'backfilled'],
+    source: 'src/config/supabase.ts (checkins.markDone) + src/context/AppDataContext.tsx (logCheckin)',
   },
 
   // No code path in this repo writes to a table by this name — mini-quiz answers are

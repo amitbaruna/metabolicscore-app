@@ -143,6 +143,290 @@ Update this at the end of every session (either with Claude Code or with Claude 
 chat) — what got fixed, what's still open. Keep entries short; this is a fast
 "where did we leave off" scan, not a full changelog. Newest entry on top.
 
+### 2026-08-06 — PDF footer bug closed; full push notification engine + habit cycle
+engine built, deployed, and device-tested; multiple real production bugs found and
+fixed via evidence-based investigation, not guesswork
+
+**Scope note:** this session ran morning through ~3:45am, spanning PDF debugging,
+extensive planning/strategy discussion (business trajectory, brand/data/IP moat
+sequencing, Cursor vs. Claude Code division of labor), and then a long, iterative
+build-test-fix cycle on the notification and habit-cycle systems. Far exceeded the
+original 4-6 session estimate for "push notifications" — grew substantially through
+the session as real gaps surfaced during actual device testing, not scope creep for
+its own sake. Each addition below was a genuine finding, confirmed with evidence
+before being fixed.
+
+---
+
+#### 1. PDF footer positioning bug — CLOSED
+
+Root cause confirmed via direct PDF coordinate extraction (not source-reading alone,
+which had already failed twice in prior sessions): `translateContent()`'s shift was
+still active when the footer's `drawText()` calls executed immediately after it,
+double-applying the offset. Fixed by compensating the three footer y-coordinates
+(`y - FOOTER_BAND`). Verified via fresh PDF export + coordinate re-extraction —
+overlap gone, footer correctly positioned. **Resolved and confirmed, not just
+patched.**
+
+#### 2. Push Notification Engine — BUILT, DEPLOYED, DEVICE-CONFIRMED WORKING
+
+**Supabase:**
+- New tables: `app_checkins`, `actions`, `notification_log`
+- New columns: `app_profiles.expo_push_token`, `app_profiles.push_token_updated_at`
+- `actions` table populated: all 5 layers (L1-L5), each with a 7-day teaser/reveal
+  content cycle (`copy_variants` as `[{teaser, reveal}, ...]`), locked-copy final
+- **Recurring bug class hit 3 times tonight:** tables created with RLS policies but
+  missing table-level `GRANT` statements for `authenticated`/`service_role` — same
+  root cause as the 2026-07-27 `app_profiles`/`unmatched_payments` incident,
+  recurring on every new table created since. Fixed for `app_checkins`, `actions`,
+  and (proactively, this time) `habit_cycles`. **Repo migration files exist for
+  `actions` (`grant_actions_table_access.sql`) and `habit_cycles`
+  (`create_habit_cycles.sql`); `app_checkins`'s grant fix was applied directly in
+  Supabase, not via a migration file in the repo — worth adding one so it's not
+  the one exception if this class of bug needs auditing again later.**
+
+**Cloudflare Worker (`metabolic-app-notification`):**
+- Deployed via Cloudflare dashboard "Edit code" (not wrangler CLI — see Process
+  Notes below)
+- Cron trigger: `0 15 * * *` (15:00 UTC = 8:30pm IST daily)
+- Secrets: `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY` (secret key, not
+  publishable — this distinction caused real confusion mid-session, now correct)
+- Logic: retest window (day 9/14) → habit cycle evaluation (new, see §3) → streak
+  milestone → check-in reminder, max 1 push/user/day
+- **Real bug found and fixed:** `pickCheckinContent()` — the function meant to pull
+  personalized day-of-cycle content into push notifications — never actually
+  existed in the deployed code, despite a comment implying it did. Every check-in
+  reminder was silently sending generic fallback copy. Built for real this session;
+  confirmed on-device with correct personalized L3 content in the actual push
+  notification.
+
+**App-side (`App.tsx`, `supabase.ts`, `AppDataContext.tsx`):**
+- Push token capture wired into `OnboardingScreen.handleComplete` + `ProfileScreen`
+  manual toggle (shared function, fixed missing `projectId` in the old version)
+- Notification-tap deep-link routing: `checkin_reminder`/`streak_milestone` →
+  `goToTodaysOne()`, `retest_reminder` → score screen. Handles both warm/background
+  taps and cold-start taps.
+- **Bug fixed:** cold-start taps were double-firing routing (both
+  `addNotificationResponseReceivedListener` and `getLastNotificationResponseAsync()`
+  independently triggered the same action) — deduped via notification identifier.
+- **Bug fixed:** `logCheckin`/`checkins.markDone()` write to `app_checkins` was
+  silently failing (missing grants, see above) with zero surfaced error — matches
+  the exact "console.warn-only, nothing surfaced" pattern already documented
+  elsewhere in this codebase.
+- **Bug fixed, structural:** `logCheckin`/`logCheckinUndo` returned `Promise<void>`,
+  giving callers no way to know if a write actually succeeded — both `HomeScreen`
+  and the new `StreakCalendarScreen` were updating local/AsyncStorage state
+  optimistically *before* confirming the write. Now return `Promise<boolean>`;
+  both callers gate the optimistic update on actual success and show
+  `Alert.alert("Couldn't save", ...)` on failure instead of silently proceeding.
+  Fixed in both places since they shared the identical gap.
+
+#### 3. Habit Cycle Engine — SPEC'D, BUILT, DEPLOYED, DEVICE-CONFIRMED
+
+New subsystem (`Habit_Cycle_Engine_SPEC.md`, in repo) — makes a "cycle" a real
+tracked entity (`habit_cycles` table: start_date, end_date, status) rather than
+derived math, so users who never retest have a defined path back to a fresh cycle.
+
+- **State machine:** active → (day 14, no retest) → branches on adherence:
+  ≥10/14 = push retest now; 5-9/14 = extend 7 days, push retest at day 21
+  regardless; 0-4/14 = close as reset, immediately open a fresh cycle. Day 21 is a
+  hard stop on the extended tier — pushes retest either way, no further extension.
+- Cycle bootstrap/evaluation **decoupled from push-token possession** (bug found
+  and fixed: was only running for push-token holders, meaning anyone who never
+  enabled notifications got no cycle data at all — now runs for anyone with a
+  completed test; only the actual notification *send* stays token-gated).
+- **New Streak Calendar screen** (`StreakCalendarScreen`, reached via "View streak
+  calendar →" link on the existing Today's 1% card, which itself is unchanged):
+  14-day grid, 4 cell states (done / done-tap-to-undo / missed-tap-to-mark /
+  locked), 2-day toggle-editable window in both directions, points-available card,
+  dynamic motivational message, cycle summary, collapsible past-cycle history
+  cards.
+  - **Bug fixed:** grid rendered days sequentially from a fixed visual position
+    instead of aligning to real weekday columns — `start_date` always appeared
+    under "M" regardless of actual weekday. Fixed with a leading-blanks offset
+    based on real weekday calculation.
+  - **Bug fixed:** calendar's tap-to-mark passed a hardcoded `null` for
+    `assigned_action_id`, violating the column's NOT NULL constraint on every
+    attempt (not intermittent). Fixed by computing `dominantLayerId` on this
+    screen (mirroring Home's existing fallback chain) and fetching the real
+    action row before writing.
+  - **Points-available bug fixed:** calendar was computing its own flat
+    `100 − score` value, diverging from the Results screen's real, more specific
+    calculation ("+34 points may be available over 8-12 weeks," tied to fat loss
+    resistance/recovery capacity). Refactored into one shared
+    `computePointsAvailable()` function; both screens now show identical
+    value and framing. (Minor follow-up still open: card styling doesn't yet
+    visually match Results screen's weight/color — see Next Session below.)
+
+#### 4. Process notes — worth remembering going forward
+
+- **All Worker code changes must go through Claude Code + the repo — never pasted
+  directly from this chat into Cloudflare's dashboard**, even for a quick fix.
+  Doing this mid-session created two silently diverging copies of the same file
+  (one live on Cloudflare via manual paste, one in the repo via Claude Code),
+  which directly caused the `pickCheckinContent()` confusion in §2 — Claude Code's
+  investigation was accurately reporting on the repo's version, which genuinely
+  never had that function, while an ad-hoc pasted version briefly live on
+  Cloudflare did.
+- **`wrangler deploy` is not configured for the notification Worker** in this repo
+  — running it from the project root auto-detects and tries to deploy the entire
+  Expo app as a static Cloudflare Pages site instead (wrong target entirely).
+  Deploys for `metabolic-app-notification` go through the Cloudflare dashboard's
+  "Edit code" → paste → Deploy flow until/unless a proper `wrangler.toml` gets set
+  up for it specifically.
+- When copying Worker code out of a PowerShell terminal for review, long lines get
+  silently truncated/wrapped — caused an apparent-but-false "incomplete file"
+  scare mid-session. Safer to open the file directly in a text editor, or have it
+  uploaded directly, rather than copying from terminal scrollback.
+
+**Scoped for next session (nothing below is started):**
+
+1. **Bell/inbox notification sync** — architecture agreed (reads from
+   `notification_log`, no new writes needed), full brief written, never sent/built.
+2. **Retest-outcome card** (Results screen) — fully spec'd (5 branches by
+   adherence + score delta, all copy finalized), not started.
+3. **Completion-UX redesign for "Mark as Done"** — real design gap identified:
+   current checkmark-based interaction borrows diagnostic/form-entry visual
+   language for what should be a habit-reward moment. Three concrete directions
+   agreed, not yet built:
+   - Motion/fill animation on completion instead of a static state swap (highest
+     leverage, lowest effort)
+   - Identity-framed micro-copy at the completion moment specifically (not a
+     full rewrite of app language)
+   - Milestone completions (day 3/7/14/30) should visually scale in significance,
+     not look identical to a routine day
+   - Explicitly ruled out: leaderboards, competitive framing, streak-as-guilt —
+     stays on the healthy side of habit design, consistent with existing
+     non-punitive streak-break copy.
+4. **Points-available card styling** on the Streak Calendar — number needs to
+   visually match Results screen's weight/color (currently correct value, wrong
+   visual treatment).
+5. **Known edge case, not urgent:** "today" is computed differently in different
+   places relative to the UTC/IST boundary (midnight-5:30am IST window where the
+   server's UTC date and the device's local calendar date disagree) — worth a
+   consistency review across Worker and app, not causing active problems.
+6. **Android** — deliberately deferred entirely; iOS-only testing so far.
+7. **Git/documentation hygiene** — tonight's changes need `git add` / commit /
+   push (multiple batches were staged but not committed across the session) and
+   this summary needs to actually land in CLAUDE.md, not just exist as a draft.
+
+### 2026-08-04 (cont'd 2) — Footer positioning still broken on device; root-cause investigation inconclusive, logged honestly rather than guessed
+
+**Confirmed working:** headline font size (14px), `app_report_downloads`
+tracking, pdf-lib footer-on-every-page approach structurally sound (footer
+and page numbers now appear on every page).
+
+**Root cause investigation, inconclusive — logged honestly, not guessed:**
+- Original hypothesis (footer drawn at pre-resize y-coordinates) was checked
+  against `@cantoo/pdf-lib`'s actual source and does NOT match documented
+  behavior — `setSize()` preserves the page's `y=0` origin, `translateContent()`
+  shifts existing content up, so the footer's unchanged `y=16-38` coordinates
+  should already land correctly in the new bottom gap. This hypothesis was
+  disproven, not confirmed — do not treat it as the cause.
+- Two follow-up hypotheses (CropBox/TrimBox clipping on either platform; a
+  `@cantoo/pdf-lib` fork deviation from upstream) were both investigated and
+  ruled out via direct source inspection of expo-print's native renderers
+  (iOS: `ExpoWKViewPrintPDFRenderer.swift`, ends up with MediaBox only, no
+  separate CropBox; Android: `PrintDocumentAdapter` with `NO_MARGINS`, same) and
+  the fork's changelog (no changes to page-geometry methods).
+- Net result: per all available static-code investigation, the footer
+  SHOULD be positioned correctly. It is not, confirmed on device. The actual
+  cause is unknown — needs either a fresh on-device retest with more precise
+  observation of exactly where the blank gap sits relative to the footer
+  text/content (e.g. is the gap above the footer, between the footer and the
+  last line of real content, or duplicated somewhere — rather than assuming
+  it's simply "outside" the blank band), or direct inspection of the
+  generated PDF's raw page content stream (not possible without device/PDF-
+  inspection tooling in this environment).
+
+**Next session: do not re-guess a root cause from source-reading alone —
+this has been tried twice and failed. Get precise on-device visual evidence
+first (exact gap position), or extract/share the actual generated PDF's raw
+content for direct inspection.**
+
+### 2026-08-04 — About Amit Baruna PDF section + repeating footer built; three visual polish passes; iOS background-drop bug found and fixed in 5 more PDF elements
+
+**About Amit Baruna closing section + repeating footer built** (`App.tsx`,
+`buildReportHtml`/new `buildAboutSectionHtml`):
+- New `getHeroPhotoBase64()` helper — `Hero.png` moved to
+  `src/assets/about/hero.png` (same bundled-asset convention already used by
+  `profile.pdf`/`mystory.png`), read via the new `expo-file-system` dependency's
+  `File.base64()` API and embedded as a `data:` URI directly into the PDF's HTML.
+  Deliberately never referenced by a rendered RN `Image` component — the photo
+  must never appear anywhere in the live app itself, only in the exported PDF.
+- New coral (`#F5C4B3`) card: circular photo, bio copy, three credential tags
+  (`ABOUT_STATS.years`/`ABOUT_STATS.clients` reused rather than hardcoded, plus a
+  static "Featured in Indian Express" string) — the report's final numbered
+  section, directly above the disclaimer.
+- Footer (`<tfoot>`) extended with WhatsApp (+91 98918 28688) and
+  metabolicscore.in alongside the existing amitbaruna.com/Instagram line. Added a
+  `@page`/`counter(page)` "Page X of Y" rule — flagged from the start as an
+  on-device risk, since expo-print's iOS path renders through WKWebView/Safari's
+  print engine, which only recently added `@page` margin-box support.
+
+**Three visual polish passes, same session:**
+- Section headline (`h2`) size increased 14px→18px; section-to-section vertical
+  spacing increased 20px→36px.
+- Real Cases rows: since clickable links don't survive PDF export (documented
+  limitation), each case now shows its existing `hook` field (a short
+  testimonial quote already used elsewhere in the app) as a plain-text
+  description under the result/layer text — no new data added.
+- One correction mid-session: the top title block (`.brand`/`.title`) was never
+  actually touched by any of the above — confirmed via investigation that the
+  "reading too large" report was about the section headlines, not the title, so
+  no title-size change was made.
+
+**iOS background/background-image bug — found and fixed in the 5 PDF elements
+missed when bars/badges/thumbnails were originally converted (2026-08-03):**
+- `.header` (main navy header block) and `.band-badge` (dynamic inline
+  `style="background:..."` for the score band) — both converted to an SVG
+  `<rect>` fill layered behind the actual text via a `position:absolute` SVG +
+  `position:relative` content wrapper, keeping the exact same colors (`#0D1B2A`
+  navy, `reportData.band.color`). `.band-badge` needed a new
+  `buildBandBadgeSvg()` helper since `band.status` text length varies too much
+  ("Well Regulated" vs. "Significant Metabolic Impairment") for the existing
+  fixed-width `buildBadgeSvg`.
+- A follow-up sweep (grepped the whole file for `background:`/`background-image:`)
+  found three more instances missed the first pass: `.about-card` (coral),
+  `.about-tag` (white pill), `.disclaimer` (light-gray box) — all fixed the same
+  way. `.about-tag` needed its own `buildTagSvg()` helper (dynamic-width text
+  pill, same estimate-from-character-count approach as the band badge, since no
+  real text-metrics API is available in this string-building context).
+- `tsc --noEmit` stayed at the same 10 pre-existing, unrelated errors (Image prop
+  types, craving/insight union types) after every edit this session — confirmed
+  after each change, nothing new introduced.
+
+Nothing in this session was staged or committed — per rule 8, pending Amit's own
+review. See the entry directly below: all of the above was confirmed working on
+a real device the same day.
+
+### 2026-08-04 (cont'd) — PDF report feature closed out: final device-confirmed pass on today's build, including the About section and all iOS background-fill conversions
+
+**Device-confirmed working, final test passed:**
+- About Amit Baruna section (photo, bio, three credential tags, coral card
+  background) — confirmed rendering correctly on device.
+- Header, band badge, and all other converted background-color elements —
+  confirmed correct color now rendering on iOS after the SVG-fill conversion.
+- All 5 instances of the CSS background/background-image iOS bug (.header,
+  .band-badge, .about-card, .about-tag, .disclaimer) — confirmed fixed and
+  verified on real device, not just in source.
+
+**Still not explicitly re-confirmed in this final pass, carry forward if
+revisited:**
+- Footer repeating on every page (built via thead/tfoot, not explicitly
+  re-verified in the final device test).
+- "Page X of Y" counter — known risk (CSS counter(page) inside @page margin
+  box, unreliable on WKWebView) — not explicitly re-confirmed working or
+  broken.
+- app_report_downloads tracking row after the GRANT fix — not explicitly
+  re-confirmed in the final test.
+
+This closes out the PDF report feature build (download button, cascade
+grammar bug, N1 determinism bug, visual redesign, About section, footer, iOS
+rendering fixes) as functionally complete for v1.0, with the three items
+above worth a quick spot-check next time the PDF is opened, but not
+blocking.
+
 ### 2026-08-03 — PDF Report export built end-to-end (expo-print + click tracking); Cascade Map added to the PDF; cascade narrative root-layer bug found and fixed at the source
 
 **Device-confirmed:** the N2 "Hidden Mechanism" infinite-loading fix from 2026-08-01
