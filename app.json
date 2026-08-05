@@ -16,7 +16,17 @@
     "android": {
       "package": "com.amitbaruna.metabolicscore"
     },
-    "plugins": ["expo-notifications"],
+    "plugins": [
+      "expo-notifications",
+      [
+        "@sentry/react-native/expo",
+        {
+          "url": "https://sentry.io/",
+          "project": "react-native",
+          "organization": "metabolic-score"
+        }
+      ]
+    ],
     "extra": {
       "eas": {
         "projectId": "d2a7deb6-603c-4933-afbb-036644ba4ecd"

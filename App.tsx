@@ -98,6 +98,144 @@ import {
   fetchNarrative, buildReadinessBriefPayload, buildMainNarrativePayload, buildWhereToBeginPayload,
   type HistoryEntry, type ScoreResult,
 } from './src/data/metabolicEngine';
+import * as Sentry from '@sentry/react-native';
+
+// ── Sentry PII/PHI scrubbing (2026-08-06) ───────────────────────────────────────────────
+// This app handles clinical data (symptoms, quiz answers, layer/cascade scores) that must
+// never leave the device via an error report. Rather than chasing specific object paths
+// (fragile — a new field added later could slip through unnoticed), this walks whatever
+// structured data an event/log/breadcrumb actually carries and redacts any key whose name
+// matches a known sensitive pattern, regardless of where it appears. Key names are pulled
+// from this app's real schema/variable names (Supabase column names in src/config/
+// supabase.ts payloads + in-app field names in src/context/AppDataContext.tsx's types),
+// not guessed.
+const SENTRY_SENSITIVE_KEYS = [
+  // app_profiles clinical/identity fields
+  'symptoms', 'conditions', 'goals', 'baseline', 'mini_quiz', 'miniquiz', 'miniQuiz',
+  'lastQuizAnswers', 'email', 'full_name', 'fullname', 'fullName',
+  // app_scores / ScoreResult fields — layer scores and dominant_layer reveal health status
+  // even without any symptom text (a low L3 score alone is itself a clinical finding)
+  'total_score', 'totalscore', 'totalScore', 'layer1', 'layer2', 'layer3', 'layer4', 'layer5',
+  'dominant_layer', 'dominantlayer', 'dominantLayer', 'dominant_pattern', 'dominantPattern',
+  'cascade_risk', 'cascaderisk', 'cascadeRisk', 'rcs', 'rcsinfo', 'rcsInfo',
+  'sc', 'scoreresult', 'scoreResult', 'answers', 'history', 'patternEngine', 'hl',
+  // app_cravings fields
+  'cravings', 'craving_type', 'cravingtype', 'cravingType',
+  'craving_context', 'cravingcontext', 'cravingContext',
+  'craving_time', 'cravingtime', 'cravingTime', 'timing',
+  'mapped_layer', 'mappedlayer', 'mappedLayer',
+  // device identifier — not health data, but no reason for it to leave the device either
+  'expo_push_token', 'expopushtoken', 'expoPushToken', 'push_token', 'pushtoken', 'pushToken',
+];
+
+function isSentrySensitiveKey(key: string): boolean {
+  const normalized = key.toLowerCase().replace(/[_-]/g, '');
+  return SENTRY_SENSITIVE_KEYS.some(k => normalized === k.toLowerCase().replace(/[_-]/g, ''));
+}
+
+// Recursively redacts any value under a sensitive key, anywhere in the structure — not
+// specific paths. Returns a new structure rather than mutating in place, since the input
+// may be shared with the SDK's own internal scope state. Depth-bounded (matches Sentry's
+// own normalizeDepth default of 3, given a little headroom) so this can't loop on a
+// circular reference or balloon on a huge object.
+function scrubSentrySensitiveData(value: any, depth = 0): any {
+  if (depth > 6 || value == null) return value;
+  if (Array.isArray(value)) return value.map(v => scrubSentrySensitiveData(v, depth + 1));
+  if (typeof value === 'object') {
+    const out: Record<string, any> = {};
+    for (const [key, val] of Object.entries(value)) {
+      out[key] = isSentrySensitiveKey(key) ? '[Scrubbed]' : scrubSentrySensitiveData(val, depth + 1);
+    }
+    return out;
+  }
+  return value;
+}
+
+Sentry.init({
+  dsn: 'https://63b481aa553e4db1e5431524fe0a6db9@o4511860626620416.ingest.us.sentry.io/4511860646412288',
+
+  // Adds more context data to events (IP address, cookies, user, etc.)
+  // For more information, visit: https://docs.sentry.io/platforms/react-native/data-management/data-collected/
+  sendDefaultPii: true,
+
+  // Enable Logs
+  enableLogs: true,
+
+  // Session Replay — disabled entirely, 2026-08-06. Sample rates at 0 mean no replay is
+  // ever recorded, regardless of the mask* settings below (which are left in place, hard-
+  // set rather than relying on defaults, for whenever this gets re-enabled). Reason: one
+  // documented masking bug already exists (sentry-react-native#6122 — masking can get
+  // silently ignored on Android/New Architecture, though only in the safe/over-masking
+  // direction so far), it's a comparatively young SDK feature, and this app shows real
+  // clinical data on nearly every screen (Results, Profile, Symptom Tracker, Layers, Home).
+  // Revisit only after an independent on-device check, on both platforms, that a symptom/
+  // score screen actually renders masked in a captured replay — not before.
+  replaysSessionSampleRate: 0,
+  replaysOnErrorSampleRate: 0,
+  integrations: [Sentry.mobileReplayIntegration({
+    maskAllText: true,
+    maskAllImages: true,
+    maskAllVectors: true,
+  })],
+
+  // Error/transaction events. Scrubs event.user, event.extra, event.contexts, event.tags,
+  // and event.request (cookies/headers — sendDefaultPii above is what populates these)
+  // recursively by key name. Breadcrumb *data* payloads are scrubbed the same way here;
+  // console-category breadcrumbs themselves are dropped entirely in beforeBreadcrumb below,
+  // since their message is free text a key-name scrubber can't safely inspect.
+  beforeSend(event) {
+    if (event.user) {
+      delete event.user.email;
+      delete event.user.username;
+      delete (event.user as any).full_name;
+      if (event.user.ip_address) delete event.user.ip_address;
+    }
+    if (event.extra) event.extra = scrubSentrySensitiveData(event.extra);
+    if (event.contexts) event.contexts = scrubSentrySensitiveData(event.contexts);
+    if (event.tags) event.tags = scrubSentrySensitiveData(event.tags) as any;
+    if (event.request) {
+      delete event.request.cookies;
+      delete (event.request as any).headers;
+    }
+    if (event.breadcrumbs) {
+      event.breadcrumbs = event.breadcrumbs
+        .filter(b => b.category !== 'console')
+        .map(b => (b.data ? { ...b, data: scrubSentrySensitiveData(b.data) } : b));
+    }
+    return event;
+  },
+
+  // Sentry's structured Logs feature (enableLogs above) — a SEPARATE pipeline from
+  // beforeSend, does not go through it at all. Its console-capture integration is on by
+  // default, and this codebase's console.* calls routinely include user.id, email, and raw
+  // symptom/craving objects as arguments (several added tonight alone: '[DEBUG checkin]',
+  // '[saveProfile]', '[DEBUG symptom]'). Console log arguments are free text/values, not a
+  // structured key/value payload, so they can't be safely pattern-scrubbed after the fact —
+  // the correct fix is dropping every auto-captured console log outright, identified via
+  // its sentry.origin attribute, not trying to redact their contents.
+  beforeSendLog(log) {
+    if (log.attributes?.['sentry.origin'] === 'auto.log.console') return null;
+    if (log.attributes) log.attributes = scrubSentrySensitiveData(log.attributes);
+    return log;
+  },
+
+  // Classic breadcrumb capture (dom/fetch/xhr/history/console) — a third, separate
+  // mechanism from both beforeSend's event.breadcrumbs (which only sees what's already
+  // been collected by the time an event fires) and beforeSendLog. Dropping console
+  // breadcrumbs at creation here is redundant with the beforeSend filter above by design —
+  // belt-and-suspenders, since this is the SDK's own documented place to do it, and it
+  // stops them from ever sitting in the scope's breadcrumb buffer at all, not just at send
+  // time. Other breadcrumb types (fetch/xhr especially, which can carry request URLs/query
+  // params) get the same key-name scrub as everything else.
+  beforeBreadcrumb(breadcrumb) {
+    if (breadcrumb.category === 'console') return null;
+    if (breadcrumb.data) breadcrumb.data = scrubSentrySensitiveData(breadcrumb.data);
+    return breadcrumb;
+  },
+
+  // uncomment the line below to enable Spotlight (https://spotlightjs.com)
+  // spotlight: __DEV__,
+});
 
 const { width: SCREEN_WIDTH } = Dimensions.get('window');
 
@@ -2916,7 +3054,7 @@ function ResultsScreen({ onNavigate, result, userData, autoExpandN3, onSelectLay
   const shareScoreImage = async () => {
     try {
       const uri = await shareCardRef.current?.capture?.();
-      if (uri && await Sharing.isAvailableAsync()) {
+      if (uri && (await Sharing.isAvailableAsync())) {
         await Sharing.shareAsync(uri, { dialogTitle: 'Share your Metabolic Score' });
       } else if (uri) {
         Alert.alert('Sharing not available on this device');
@@ -4770,7 +4908,7 @@ function SpecialisationScreen({ onNavigate }: { onNavigate: (s: ScreenId) => voi
       setDownloading(true);
       const asset = Asset.fromModule(require('./src/assets/about/profile.pdf'));
       await asset.downloadAsync();
-      if (asset.localUri && await Sharing.isAvailableAsync()) {
+      if (asset.localUri && (await Sharing.isAvailableAsync())) {
         await Sharing.shareAsync(asset.localUri, { dialogTitle: "Amit Baruna's Profile" });
       }
     } catch (e) {
@@ -7736,7 +7874,7 @@ if (typeof (global as any).ErrorUtils !== 'undefined') {
   });
 }
 
-export default function App() {
+export default Sentry.wrap(function App() {
   const [fontsReady, setFontsReady] = useState(false);
 
   useEffect(() => {
@@ -7774,7 +7912,7 @@ export default function App() {
       </ThemeProvider>
     </ErrorBoundary>
   );
-}
+});
 
 function AppInner() {
   const { theme } = useTheme();

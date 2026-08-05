@@ -309,6 +309,28 @@ derived math, so users who never retest have a defined path back to a fresh cycl
 7. **Git/documentation hygiene** — tonight's changes need `git add` / commit /
    push (multiple batches were staged but not committed across the session) and
    this summary needs to actually land in CLAUDE.md, not just exist as a draft.
+8. **Sentry error tracking — wizard completed successfully** (run manually,
+   outside Claude Code, after the wizard proved impossible to drive through
+   Claude Code's sandboxed terminal — no real TTY, crashed with
+   `ERR_TTY_INIT_FAILED` even with `--non-interactive`; see prior turn's notes if
+   this recurs). `Sentry.init()`/`Sentry.wrap()` added to `App.tsx`, `@sentry/
+   react-native/expo` config plugin added to `app.json`, `metro.config.js`
+   created, `SENTRY_AUTH_TOKEN` correctly isolated to `.env.local`
+   (git-ignored, verified via repo-wide grep — not hardcoded anywhere else).
+   **Not yet device-tested** — needs a fresh EAS build since it's a new native
+   module (same category as `expo-notifications`).
+   **Before that first real test — required, not optional:** the wizard's
+   default `Sentry.init()` config actively risks capturing personal health
+   data, confirmed via diff review, via three separate mechanisms, not just
+   one: `sendDefaultPii: true` (IP/cookies/user id), `enableLogs: true` (would
+   likely capture this app's existing `console.log` statements, several of
+   which already log emails/user ids/symptom data directly — `[saveProfile]`,
+   `[DEBUG symptom]`, `[DEBUG checkin]`), and Session Replay
+   (`replaysSessionSampleRate`/`mobileReplayIntegration()` — screen-recording
+   style, default masking behavior not yet verified against current Sentry
+   docs). A `beforeSend` hook to scrub symptoms/scores/quiz answers from
+   error payloads must be added and verified before any real event is ever
+   sent — not a nice-to-have, a precondition for the first device test.
 
 ### 2026-08-04 (cont'd 2) — Footer positioning still broken on device; root-cause investigation inconclusive, logged honestly rather than guessed
 
