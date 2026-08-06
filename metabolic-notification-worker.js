@@ -445,7 +445,12 @@ async function runDailyNotificationJob(env) {
         user_id: userId,
         type: chosen.type,
         sent_at: new Date().toISOString(),
-        metadata: { title: chosen.title }
+        // body added 2026-08-07 — was never logged even though it's sent in the actual push
+        // (see messages.push above), so notification_log couldn't back a real "what did
+        // this notification say" bell/inbox UI, only a bare title. Rows logged before this
+        // change only have title in metadata; the app's read path treats a missing body as
+        // absent, not an error.
+        metadata: { title: chosen.title, body: chosen.body }
       });
     }
   }

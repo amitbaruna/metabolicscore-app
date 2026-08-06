@@ -25,7 +25,7 @@ import { File as ExpoFile, Paths as ExpoPaths } from 'expo-file-system';
 import { PDFDocument, StandardFonts, rgb } from '@cantoo/pdf-lib';
 import Svg, { Path, Defs, LinearGradient as SvgLinearGradient, Stop as SvgStop } from 'react-native-svg';
 import Constants from 'expo-constants';
-import { booking, membership, referral, account, pushNotifications, actionContent, checkins, habitCycles, auth, profiles } from './src/config/supabase';
+import { booking, membership, referral, account, pushNotifications, actionContent, checkins, habitCycles, notificationLog, auth, profiles } from './src/config/supabase';
 // Guarded — expo-notifications behaves inconsistently in Expo Go, especially for remote push
 // token registration on iOS, which really needs a real build. Same safe-load pattern as the
 // other native-adjacent modules this session.
@@ -250,7 +250,7 @@ type ScreenId =
   | 'article-reader' | 'about' | 'specialisation'
   | 'symptom-tracker'
   | 'profile' | 'customize' | 'booking' | 'report' | 'health-connect' | 'score-history'
-  | 'streak-calendar';
+  | 'streak-calendar' | 'insights';
 
 type UserData = {
   gender: string;
@@ -1730,6 +1730,238 @@ function getTimeOfDayGreeting(): string {
 }
 
 // ============================================================
+// NOTIFICATION BELL PANEL (reads notification_log, no new writes)
+// ============================================================
+
+function formatNotifRelativeTime(iso: string): string {
+  const then = new Date(iso).getTime();
+  const diffSec = Math.max(0, Math.floor((Date.now() - then) / 1000));
+  if (diffSec < 60) return 'Just now';
+  const diffMin = Math.floor(diffSec / 60);
+  if (diffMin < 60) return `${diffMin}m ago`;
+  const diffHr = Math.floor(diffMin / 60);
+  if (diffHr < 24) return `${diffHr}h ago`;
+  const diffDay = Math.floor(diffHr / 24);
+  if (diffDay < 7) return `${diffDay}d ago`;
+  return new Date(iso).toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+}
+
+const NOTIF_TYPE_ICON: Record<string, { name: any; color: string }> = {
+  checkin_reminder: { name: 'flash-outline', color: '#F59E0B' },
+  streak_milestone: { name: 'flame', color: '#F59E0B' },
+  retest_reminder: { name: 'refresh-outline', color: '#4DA8FF' },
+  cycle_retest_push: { name: 'calendar-outline', color: '#7C5CFF' },
+  cycle_extend_nudge: { name: 'time-outline', color: '#7C5CFF' },
+  cycle_reset_nudge: { name: 'sparkles-outline', color: '#7C5CFF' },
+};
+const NOTIF_DEFAULT_ICON = { name: 'notifications-outline', color: '#EF4444' };
+
+// One row, swipe-left to dismiss. Same PanResponder/Animated.Value swipe pattern already
+// used for the "Today's 1% complete" dismiss card in HomeScreen — kept as its own component
+// (rather than reusing that exact instance) since each row needs independent gesture state
+// in a list, which a single shared PanResponder can't provide.
+function NotificationRow({ row, onDismiss, onDragStateChange, onPressRow }: { row: any; onDismiss: (id: string) => void; onDragStateChange: (dragging: boolean) => void; onPressRow: (row: any) => void }) {
+  const { colors } = useTheme();
+  const translateX = useRef(new Animated.Value(0)).current;
+  const panResponder = useRef(
+    PanResponder.create({
+      onStartShouldSetPanResponderCapture: () => false,
+      onMoveShouldSetPanResponderCapture: (_, g) => {
+        const claim = Math.abs(g.dx) > 6 && Math.abs(g.dx) > Math.abs(g.dy) * 1.5;
+        if (claim) console.log('[DEBUG notif-swipe] onMoveShouldSetPanResponderCapture CLAIMED — dx:', g.dx, 'dy:', g.dy);
+        return claim;
+      },
+      onMoveShouldSetPanResponder: (_, g) => Math.abs(g.dx) > 6 && Math.abs(g.dx) > Math.abs(g.dy) * 1.5,
+      // TEMPORARY diagnostic logging (2026-08-07) — remove once the swipe-dismiss root
+      // cause is confirmed on-device. Static code review (twice, including against the
+      // proven dismissPanResponder pattern on HomeScreen's Today's 1% card, which this
+      // mirrors line-for-line) found no logic discrepancy — there's no static-analysis or
+      // offline-probe equivalent for a touch/gesture bug the way there is for e.g. a DB
+      // grant issue, so this is instrumented instead of guessed at further. Watch for:
+      // does CLAIMED ever print at all (proves whether the ScrollView is winning the
+      // gesture before this row ever sees it)? Does GRANTED follow it? Does RELEASE fire
+      // with dx past -90? Does DISMISS actually get called?
+      onPanResponderGrant: () => {
+        console.log('[DEBUG notif-swipe] onPanResponderGrant — row.id:', row.id);
+        onDragStateChange(true);
+      },
+      onPanResponderMove: (_, g) => { if (g.dx < 0) translateX.setValue(g.dx); },
+      onPanResponderRelease: (_, g) => {
+        console.log('[DEBUG notif-swipe] onPanResponderRelease — row.id:', row.id, 'final dx:', g.dx, 'past threshold:', g.dx < -90);
+        onDragStateChange(false);
+        if (g.dx < -90) {
+          console.log('[DEBUG notif-swipe] dismissing row.id:', row.id);
+          Animated.timing(translateX, { toValue: -500, duration: 200, useNativeDriver: true }).start(() => onDismiss(row.id));
+        } else {
+          Animated.spring(translateX, { toValue: 0, useNativeDriver: true }).start();
+        }
+      },
+      onPanResponderTerminate: () => {
+        console.log('[DEBUG notif-swipe] onPanResponderTerminate — row.id:', row.id, '(responder was taken away mid-gesture, likely by the ScrollView or Modal)');
+        onDragStateChange(false);
+      },
+      onPanResponderTerminationRequest: () => false,
+    })
+  ).current;
+
+  const meta = row.metadata || {};
+  const iconInfo = NOTIF_TYPE_ICON[row.type] || NOTIF_DEFAULT_ICON;
+  // checkin_reminder's title is generic boilerplate ("Today's 1% is waiting") — the real,
+  // specific content is the personalized body (from pickCheckinContent's day-of-cycle
+  // teaser). Show body as the primary line for this type only; other types keep title
+  // primary + body as a secondary subtitle, unchanged. Falls back to title if a
+  // checkin_reminder row predates the body-logging fix (2026-08-07) and has none.
+  const isCheckinReminder = row.type === 'checkin_reminder';
+  const primaryText = isCheckinReminder ? (meta.body || meta.title || 'Notification') : (meta.title || 'Notification');
+  const secondaryText = isCheckinReminder ? null : meta.body;
+
+  return (
+    // Solid, fully opaque card (matching Home's other cards — e.g. the "protect itself"/
+    // Metabolic Story cards' own colors.card + border treatment) — deliberately more
+    // opaque than the translucent panel it sits in, so text stays legible regardless of
+    // what shows through behind the panel itself.
+    <Animated.View {...panResponder.panHandlers} style={{ transform: [{ translateX }], borderRadius: 16, backgroundColor: colors.card, borderWidth: 1, borderColor: colors.border, marginBottom: 10 }}>
+      {/* TouchableOpacity nested inside the X's own TouchableOpacity below is standard RN
+          behavior — a tap starting within the smaller inner X button's bounds is claimed
+          by that inner touchable, not this outer one, so dismiss and navigate never
+          conflict. A tap outside the X (title/body/icon/empty space) routes; the
+          PanResponder above only claims the responder on real horizontal movement, so a
+          simple tap still reaches this TouchableOpacity's onPress normally. */}
+      <TouchableOpacity activeOpacity={0.7} onPress={() => onPressRow(row)} style={{ flexDirection: 'row', gap: 12, padding: 14 }}>
+        <View style={{ width: 36, height: 36, borderRadius: 18, backgroundColor: `${iconInfo.color}20`, alignItems: 'center', justifyContent: 'center' }}>
+          <Ionicons name={iconInfo.name} size={16} color={iconInfo.color} />
+        </View>
+        <View style={{ flex: 1 }}>
+          <Text style={{ fontSize: 14, fontWeight: '700', color: colors.text }}>{primaryText}</Text>
+          {/* metadata.body only exists on rows logged after 2026-08-07 (see
+              metabolic-notification-worker.js) — older rows just show title, not an error. */}
+          {!!secondaryText && <Text style={{ fontSize: 12, color: colors.textSecondary, marginTop: 2, lineHeight: 17 }} numberOfLines={2}>{secondaryText}</Text>}
+          <Text style={{ fontSize: 10, color: colors.textTertiary, marginTop: 4 }}>{formatNotifRelativeTime(row.sent_at)}</Text>
+        </View>
+        {/* Explicit, gesture-free dismiss — guaranteed to work regardless of the swipe
+            investigation above. Swipe remains wired as a secondary option. */}
+        <TouchableOpacity onPress={() => onDismiss(row.id)} hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }} style={{ padding: 2 }}>
+          <Ionicons name="close" size={16} color={colors.textTertiary} />
+        </TouchableOpacity>
+      </TouchableOpacity>
+    </Animated.View>
+  );
+}
+
+// Panel over Home — dimmed backdrop (tap to close) + a card with its own X. Dismissing a
+// row is not persisted to notification_log (no read/dismissed column exists on that table,
+// and none was asked for) — instead it's tracked in HomeScreen's shared dismissedIds set
+// (not local to this component), so it survives closing/reopening the panel within the same
+// Home session, and so the bell badge (also derived from that same set) always matches what
+// this panel would actually show if opened right now — corrected 2026-08-07, this used to
+// be purely local state here and the badge was an independent, un-synced number.
+function NotificationBellPanel({ visible, onClose, dismissedIds, onDismiss: onDismissShared, onSelectRow }: { visible: boolean; onClose: () => void; dismissedIds: Set<string>; onDismiss: (id: string) => void; onSelectRow: (row: any) => void }) {
+  const { colors } = useTheme();
+  const [rows, setRows] = useState<any[] | null>(null);
+  // Set true the instant any row's swipe is actually granted, cleared on release/terminate
+  // — disables the list ScrollView's own scrolling for that window so it stops competing
+  // with the row's horizontal drag (see NotificationRow's onDragStateChange comment).
+  const [rowDragging, setRowDragging] = useState(false);
+
+  useEffect(() => {
+    if (!visible) return;
+    // dismissedIds deliberately NOT in this effect's deps — filtering happens once, using
+    // whatever was dismissed as of the moment the panel opens. Re-running this fetch on
+    // every dismiss (which a dismissedIds dependency would trigger, since it's a new Set
+    // reference each time) would mean a needless network round-trip and a visible flicker
+    // for something handleDismiss below already keeps correct locally + in the shared set.
+    notificationLog.list().then(fetched => {
+      const filtered = fetched.filter(r => !dismissedIds.has(r.id));
+      console.log('[DEBUG notif-empty] fetched:', fetched.length, 'after dismissedIds filter:', filtered.length);
+      setRows(filtered);
+    }).catch(() => setRows([]));
+  }, [visible]);
+
+  // TEMPORARY diagnostic (2026-08-07) — no logic bug found on code review for the
+  // "empty state doesn't show after clearing everything" report; this logs the real
+  // rows.length at the moment of every dismiss so the next device test gives actual
+  // numbers instead of another guess, same discipline as the swipe investigation.
+  const handleDismiss = (id: string) => {
+    setRows(prev => {
+      const next = (prev || []).filter(r => r.id !== id);
+      console.log('[DEBUG notif-empty] handleDismiss — id:', id, 'rows before:', prev?.length, 'after:', next.length);
+      return next;
+    });
+    onDismissShared(id);
+  };
+
+  const handleClearAll = () => {
+    console.log('[DEBUG notif-empty] handleClearAll — clearing', rows?.length, 'rows');
+    (rows || []).forEach(r => onDismissShared(r.id));
+    setRows([]);
+  };
+
+  return (
+    <Modal visible={visible} transparent animationType="fade" onRequestClose={onClose}>
+      <TouchableWithoutFeedback onPress={onClose}>
+        <View style={{ flex: 1, backgroundColor: 'rgba(0,0,0,0.5)' }} />
+      </TouchableWithoutFeedback>
+      {/* top:0,left:0,right:0 gives this SafeAreaView a DEFINITE width (spans the full
+          screen unambiguously) rather than top:0,right:0 alone, which left it with no
+          explicit width/left and no way to size itself except from its own content —
+          circular against the child's width:'65%' (a percentage needs a definite parent
+          to resolve against). That collapsed the panel's real width toward zero, and its
+          overflow:hidden then clipped everything that would've overflowed a near-zero box
+          — confirmed 2026-08-07 as the root cause of both the invisible title/body text
+          and the wrapping "Notifications" header (same underlying bug, not two). The panel
+          itself right-anchors via alignSelf:'flex-end' now, not via the outer container's
+          own position. */}
+      <SafeAreaView style={{ position: 'absolute', top: 0, left: 0, right: 0 }} edges={['top']} pointerEvents="box-none">
+        {/* Narrow, top-right anchored (near the bell icon) rather than near-full-width —
+            65% of screen width. Background is a translucent tint of colors.card (the
+            "${color}HEX" alpha-suffix pattern already used throughout this file, e.g.
+            ${colors.red}20) rather than a real blur — chosen deliberately over expo-blur
+            for now (2026-08-07) to avoid a third un-rebuilt native dependency stacked on
+            top of expo-notifications/Sentry this same session; revisit real blur once
+            those get their rebuild. */}
+        <View style={{ width: '65%', alignSelf: 'flex-end', marginRight: 16, marginTop: 8, borderRadius: 20, backgroundColor: `${colors.card}E6`, maxHeight: '70%', overflow: 'hidden' }}>
+          <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', padding: 16, borderBottomWidth: 1, borderBottomColor: colors.border }}>
+            <Text style={{ fontSize: 15, fontWeight: '700', color: colors.text }} numberOfLines={1}>Notifications</Text>
+            <TouchableOpacity onPress={onClose} hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}>
+              <Ionicons name="close" size={20} color={colors.textSecondary} />
+            </TouchableOpacity>
+          </View>
+          {rows === null ? (
+            <View style={{ padding: 40, alignItems: 'center' }}>
+              <ActivityIndicator color={colors.red} />
+            </View>
+          ) : rows.length === 0 ? (
+            <View style={{ padding: 40, alignItems: 'center' }}>
+              <View style={{ width: 56, height: 56, borderRadius: 28, backgroundColor: `${colors.red}14`, alignItems: 'center', justifyContent: 'center', marginBottom: 12 }}>
+                <Ionicons name="checkmark-circle-outline" size={26} color={colors.red} />
+              </View>
+              {/* TEMPORARY diagnostic background (2026-08-07) — remove once confirmed. No
+                  logic bug found on code review this time (unlike the earlier title/body
+                  issue, which had a provable mechanism); this makes the actual rendered
+                  bounds of this Text visible regardless of its own text color, so the next
+                  screenshot distinguishes "renders but invisible" from "not in the tree at
+                  all" instead of guessing further. */}
+              <Text style={{ fontSize: 13, fontWeight: '600', color: colors.text, backgroundColor: 'yellow' }}>You're all caught up :)</Text>
+            </View>
+          ) : (
+            <>
+              <ScrollView style={{ maxHeight: 480 }} contentContainerStyle={{ padding: 12 }} scrollEnabled={!rowDragging}>
+                {rows.map(row => <NotificationRow key={row.id} row={row} onDismiss={handleDismiss} onDragStateChange={setRowDragging} onPressRow={(r) => { onClose(); onSelectRow(r); }} />)}
+              </ScrollView>
+              {/* Local-only, same as the per-card X — clears this panel's current view,
+                  not notification_log itself. Only shown with something to clear. */}
+              <TouchableOpacity onPress={handleClearAll} style={{ padding: 14, borderTopWidth: 1, borderTopColor: colors.border, alignItems: 'center' }}>
+                <Text style={{ fontSize: 13, fontWeight: '600', color: colors.red }}>Clear All</Text>
+              </TouchableOpacity>
+            </>
+          )}
+        </View>
+      </SafeAreaView>
+    </Modal>
+  );
+}
+
+// ============================================================
 // HOME SCREEN
 // ============================================================
 
@@ -1737,7 +1969,7 @@ function HomeScreen({ onNavigate, hasScore, scoreResult, onSelectLayer, onNaviga
   const { colors, theme, toggleTheme } = useTheme();
   const { user } = useAuth();
   const { clinicalDepth, toggleClinicalDepth } = useClinicalDepth();
-  const { fullName, cravings: loggedCravings, deleteCraving, symptoms: ctxSymptoms, scoreHistory, refreshCravings, conditions: ctxConditions, logCheckin } = useAppData();
+  const { fullName, cravings: loggedCravings, deleteCraving, symptoms: ctxSymptoms, scoreHistory, refreshCravings, conditions: ctxConditions, logCheckin, dismissedNotifIds, markNotifDismissed } = useAppData();
   useEffect(() => { refreshCravings(); }, [refreshCravings]);
   // Derived fresh every render from real data (hasScore/scoreResult come from AppDataContext,
   // scoreHistory is the live Supabase-backed list) — not captured once at mount, so it stays
@@ -1747,6 +1979,18 @@ function HomeScreen({ onNavigate, hasScore, scoreResult, onSelectLayer, onNaviga
   // link below), not derived data — null means "no override, follow the real data."
   const [previewOverride, setPreviewOverride] = useState<boolean | null>(null);
   const showPostTest = previewOverride ?? hasRealScore;
+  const [bellOpen, setBellOpen] = useState(false);
+  // Bell badge = 7-day activity minus whatever's been locally dismissed in the panel —
+  // corrected 2026-08-07, so the badge always matches what the panel would actually show
+  // if opened right now, not an independent raw count. dismissedNotifIds is the single
+  // shared source of truth for "dismissed," passed down to NotificationBellPanel so both
+  // the badge and the panel's own list read the same set. Lives in AppDataContext, not
+  // local useState here — confirmed root cause, 2026-08-07: this screen fully unmounts on
+  // every navigation away and back (see CLAUDE.md), so component-local state here doesn't
+  // survive a Home → Profile → Home round trip the way "session-local" was meant to.
+  const [notif7dRows, setNotif7dRows] = useState<{ id: string }[]>([]);
+  useEffect(() => { notificationLog.listLast7Days().then(setNotif7dRows).catch(() => {}); }, []);
+  const notifCount7d = notif7dRows.filter(r => !dismissedNotifIds.has(r.id)).length;
   const [streak, setStreak] = useState(0);
   const [myBooking, setMyBooking] = useState<any>(null);
   useEffect(() => { booking.getMyBooking().then(setMyBooking).catch(() => {}); }, []);
@@ -1807,6 +2051,17 @@ function HomeScreen({ onNavigate, hasScore, scoreResult, onSelectLayer, onNaviga
     if (!highlightTodaysOne) return;
     triggerTodaysOneBlink();
   }, [highlightTodaysOne]);
+  // Bell-panel row tap routing. checkin_reminder and streak_milestone both trigger the same
+  // Today's 1% blink a "Want to work on this?" cascade tap would — restored 2026-08-07
+  // alongside the Today's 1% card itself, so the push listener and the in-app bell panel
+  // land on the same place for the same notification types instead of diverging.
+  const handleSelectNotification = (row: any) => {
+    if (row.type === 'checkin_reminder' || row.type === 'streak_milestone') {
+      triggerTodaysOneBlink();
+    } else if (row.type === 'retest_reminder') {
+      onNavigate('score');
+    }
+  };
   // Same safe pattern as Today's 1% — opacity only, never border/padding, so it can't shake
   // the layout the way an earlier attempt at this did. Fires once whenever Clinical Depth
   // turns off, drawing attention to the new qualitative framing appearing in its place.
@@ -1918,9 +2173,18 @@ function HomeScreen({ onNavigate, hasScore, scoreResult, onSelectLayer, onNaviga
   const layerScores: Record<number, number> = scoreResult?.sc ?? fallbackLayerScores ?? {};
   const hasLayerScores = Object.keys(layerScores).length > 0;
   const sortedLayers = hasLayerScores ? [...LAYERS].sort((a, b) => (layerScores[a.id] ?? 0) - (layerScores[b.id] ?? 0)) : LAYERS;
+  // Corrected 2026-08-07: this was the one field the earlier scoreResult-vs-scoreHistory
+  // fallback pass (score/band/dominantLayerId/layerScores above, Metabolic Story, Latest
+  // Insights, Case Studies, cravings, symptoms) missed — it read scoreResult.history only,
+  // with no fallback to the persisted equivalent, so "Your Signal" quotes silently vanished
+  // after sign-in without retaking the quiz. Same ?? fallback precedence as layerScores
+  // above, not a new pattern: scoreResult.history and ScoreHistoryEntry.answers are the
+  // same shape (saveScore stores result.history verbatim as .answers), so this is a direct
+  // swap of the source array, not a new derivation.
   const getLayerSignal = (layerId: number): string | null => {
-    if (!scoreResult?.history) return null;
-    const layerQs = scoreResult.history.filter((h: any) => h.layer === layerId);
+    const history = scoreResult?.history ?? latestHistory?.answers;
+    if (!history) return null;
+    const layerQs = history.filter((h: any) => h.layer === layerId);
     if (layerQs.length === 0) return null;
     const worst = layerQs.sort((a: any, b: any) => a.score - b.score)[0];
     if (!worst?.selected?.length) return null;
@@ -2028,10 +2292,14 @@ function HomeScreen({ onNavigate, hasScore, scoreResult, onSelectLayer, onNaviga
               <TouchableOpacity onPress={toggleTheme} style={{ width: 40, height: 40, borderRadius: 20, backgroundColor: colors.card, borderWidth: 1, borderColor: colors.border, alignItems: 'center', justifyContent: 'center' }}>
                 <Ionicons name={theme === 'dark' ? 'sunny' : theme === 'light' ? 'moon' : 'star'} size={16} color={colors.text} />
               </TouchableOpacity>
-              <View style={{ width: 40, height: 40, borderRadius: 20, backgroundColor: colors.card, borderWidth: 1, borderColor: colors.border, alignItems: 'center', justifyContent: 'center' }}>
+              <TouchableOpacity onPress={() => setBellOpen(true)} style={{ width: 40, height: 40, borderRadius: 20, backgroundColor: colors.card, borderWidth: 1, borderColor: colors.border, alignItems: 'center', justifyContent: 'center' }}>
                 <Ionicons name="notifications" size={16} color={colors.text} />
-                <View style={{ position: 'absolute', top: 8, right: 9, width: 7, height: 7, borderRadius: 4, backgroundColor: colors.red }} />
-              </View>
+                {notifCount7d > 0 && (
+                  <View style={{ position: 'absolute', top: -3, right: -3, minWidth: 16, height: 16, borderRadius: 8, backgroundColor: colors.red, alignItems: 'center', justifyContent: 'center', paddingHorizontal: 3 }}>
+                    <Text style={{ fontSize: 9, fontWeight: '700', color: '#fff' }}>{notifCount7d > 9 ? '9+' : notifCount7d}</Text>
+                  </View>
+                )}
+              </TouchableOpacity>
               <TouchableOpacity onPress={() => onNavigate('profile')} style={{ width: 40, height: 40, borderRadius: 20, backgroundColor: colors.card, borderWidth: 1, borderColor: colors.border, alignItems: 'center', justifyContent: 'center' }}>
                 <Text style={{ fontSize: 13, fontWeight: '700', color: colors.text }}>{(fullName || user?.email || 'A').charAt(0).toUpperCase()}</Text>
               </TouchableOpacity>
@@ -2552,6 +2820,7 @@ function HomeScreen({ onNavigate, hasScore, scoreResult, onSelectLayer, onNaviga
         </ScrollView>
         <BottomNav active="home" onNavigate={onNavigate} hasScore={hasScore} />
       </SafeAreaView>
+      <NotificationBellPanel visible={bellOpen} onClose={() => setBellOpen(false)} dismissedIds={dismissedNotifIds} onDismiss={markNotifDismissed} onSelectRow={handleSelectNotification} />
     </View>
   );
 }
@@ -3035,6 +3304,47 @@ function computePointsAvailable(answers: { ansIdx: number }[] | undefined | null
   const weeks = totalScore <= 30 ? '10–14' : totalScore <= 50 ? '8–12' : '6–10';
   return { avail, weeks };
 }
+// Retest-outcome card copy — 5 locked messages (Amit, 2026-08-08), branching on adherence
+// first (low/mid adherence makes the score delta itself unreliable to read anything into,
+// so it pre-empts every delta branch below it), then on score delta once adherence is high
+// enough to trust. windowDays is the cycle's own actual span (14 normally, 21 once
+// extended — never hardcoded), so "the last N days" always matches the real cycle length
+// the adherence count was drawn from, not a fixed literal.
+function buildRetestOutcomeCard(delta: number, adherence: number, windowDays: number): { tier: 1 | 2 | 3 | 4 | 5; message: string; needsCta: boolean } {
+  if (adherence < 10) {
+    return {
+      tier: 1,
+      message: `Your score didn't move much this cycle — looking back, ${adherence} of the last ${windowDays} days had a completed check-in. Worth giving the habit a real, consistent run before your next retest — that's really the fairest test.`,
+      needsCta: false,
+    };
+  }
+  if (delta >= 5) {
+    return {
+      tier: 2,
+      message: `Solid — your score is up ${delta} points, and you followed through ${adherence} of the last ${windowDays} days. That's not a coincidence.`,
+      needsCta: false,
+    };
+  }
+  if (delta >= 1) {
+    return {
+      tier: 3,
+      message: `Small but real movement — your score is up ${delta} points, and you followed through ${adherence} of the last ${windowDays} days. That's the habit starting to work. Worth keeping the streak going into the next cycle.`,
+      needsCta: false,
+    };
+  }
+  if (delta >= -4) {
+    return {
+      tier: 4,
+      message: `You followed through consistently — ${adherence} of the last ${windowDays} days — and your score held steady. That's worth a closer look. If you'd like, a short conversation with Amit might help pinpoint what's underneath this.`,
+      needsCta: true,
+    };
+  }
+  return {
+    tier: 5,
+    message: `You followed through consistently — ${adherence} of the last ${windowDays} days — but your score moved in the other direction this cycle. That's not a sign you did anything wrong; it usually means something else is actively at play. Worth a short conversation with Amit to look closer.`,
+    needsCta: true,
+  };
+}
 // Monday-first weekday index (0=Mon..6=Sun) for a 'YYYY-MM-DD' date string — used by
 // StreakCalendarScreen to align its 14-day grid to real calendar columns under the fixed
 // M/T/W/T/F/S/S header, rather than always starting day 0 in the first (Monday) column
@@ -3043,7 +3353,7 @@ function weekdayMondayFirst(dateStr: string): number {
   return (new Date(dateStr).getUTCDay() + 6) % 7;
 }
 
-function ResultsScreen({ onNavigate, result, userData, autoExpandN3, onSelectLayer }: { onNavigate: (s: ScreenId) => void; result: ScoreResult; userData: UserData; autoExpandN3?: boolean; onSelectLayer?: (id: number) => void }) {
+function ResultsScreen({ onNavigate, result, userData, autoExpandN3, onSelectLayer, previousTotalScore }: { onNavigate: (s: ScreenId) => void; result: ScoreResult; userData: UserData; autoExpandN3?: boolean; onSelectLayer?: (id: number) => void; previousTotalScore?: number | null }) {
   const [rating, setRating] = useState(0);
   const [ratingDone, setRatingDone] = useState(false);
   const [localReveal, setLocalReveal] = useState(false);
@@ -3147,6 +3457,46 @@ function ResultsScreen({ onNavigate, result, userData, autoExpandN3, onSelectLay
 
   const { avail, weeks } = computePointsAvailable(result.history, result.totalScore);
 
+  // Retest-outcome card — only ever relevant right after a genuine retest (previousTotalScore
+  // is only passed by AppNavigator on the live scoreResult path, captured from scoreHistory[0]
+  // *before* saveScore's optimistic prepend, never on the reconstructed-from-history path — see
+  // handleScoreComplete). Adherence is read from the actual habit_cycles record + its real
+  // app_checkins, not re-derived from raw date math, per Amit's explicit instruction
+  // (2026-08-08) — same APIs StreakCalendarScreen already uses (habitCycles.getMine(),
+  // checkins.listSince), not new endpoints.
+  const isGenuineRetest = previousTotalScore != null;
+  const [retestCycles, setRetestCycles] = useState<any[] | null>(null);
+  useEffect(() => {
+    if (!isGenuineRetest) return;
+    habitCycles.getMine().then(setRetestCycles).catch(() => setRetestCycles([]));
+  }, [isGenuineRetest]);
+  // Prefer the currently open cycle; fall back to the most recently closed one in case the
+  // Worker's day-14/21 cron already closed it out by the time this retest landed (the app has
+  // no way to know which happened first). Doesn't special-case the closed_reset-then-immediate-
+  // retest edge case (a brand-new cycle with near-zero adherence) — not covered by the spec,
+  // not built.
+  const retestCurrentCycle = retestCycles?.find(c => c.status === 'active' || c.status === 'extended') ?? retestCycles?.[0] ?? null;
+  const [retestAdherence, setRetestAdherence] = useState<number | null>(null);
+  useEffect(() => {
+    if (!retestCurrentCycle?.start_date) { setRetestAdherence(null); return; }
+    const rangeEnd = retestCurrentCycle.end_date ?? new Date().toISOString().slice(0, 10);
+    checkins.listSince(retestCurrentCycle.start_date).then(rows => {
+      setRetestAdherence(rows.filter(r => r.completed && r.date <= rangeEnd).length);
+    }).catch(() => setRetestAdherence(null));
+  }, [retestCurrentCycle?.start_date, retestCurrentCycle?.end_date]);
+  // Real elapsed span of the cycle itself (14 normally, 21 once extended) — derived from the
+  // cycle's own start/end dates, not assumed, so the copy's "last N days" always matches what
+  // retestAdherence was actually counted over.
+  const retestWindowDays = retestCurrentCycle
+    ? Math.round((toDateOnly(new Date(retestCurrentCycle.end_date ?? new Date().toISOString().slice(0, 10))).getTime() - toDateOnly(new Date(retestCurrentCycle.start_date)).getTime()) / 86400000) + 1
+    : 14;
+  const retestDelta = isGenuineRetest ? result.totalScore - (previousTotalScore as number) : 0;
+  const retestOutcome = (isGenuineRetest && retestAdherence != null)
+    ? buildRetestOutcomeCard(retestDelta, retestAdherence, retestWindowDays)
+    : null;
+  const retestDeltaColor = retestDelta > 0 ? '#22C55E' : retestDelta < 0 ? '#EF4444' : colors.amber;
+  const retestDeltaIcon = retestDelta > 0 ? 'trending-up' : retestDelta < 0 ? 'trending-down' : 'remove';
+
   const toggleCard = (id: string) => setExpandedCard(expandedCard === id ? null : id);
 
   // PIPELINE 3: Retest countdown — days remaining until next retest is recommended.
@@ -3217,6 +3567,34 @@ function ResultsScreen({ onNavigate, result, userData, autoExpandN3, onSelectLay
           </>
         )}
       </View>
+
+      {/* Retest outcome — appears once, only right after a genuine retest (previousTotalScore
+          set means real prior data exists). Never shown on a first-ever test or when just
+          viewing a past result later (reconstructed-from-history path doesn't pass
+          previousTotalScore at all, see AppNavigator's case 'results'). */}
+      {retestOutcome && (
+        <View style={{ paddingHorizontal: 24, marginTop: 20 }}>
+          <View style={{ borderRadius: 20, padding: 20, backgroundColor: colors.card }}>
+            <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' }}>
+              <Text style={{ fontSize: 10, fontWeight: '700', letterSpacing: 1, color: colors.textSecondary, textTransform: 'uppercase' }}>Since Your Last Test</Text>
+              <View style={{ backgroundColor: colors.iconBg, borderRadius: 20, paddingHorizontal: 10, paddingVertical: 4 }}>
+                <Text style={{ fontSize: 11, fontWeight: '700', color: colors.text }}>{retestAdherence} of {retestWindowDays} days</Text>
+              </View>
+            </View>
+            <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8, marginTop: 12 }}>
+              <Ionicons name={retestDeltaIcon as any} size={20} color={retestDeltaColor} />
+              <Text style={{ fontSize: 22, fontWeight: '900', color: retestDeltaColor }}>{retestDelta > 0 ? `+${retestDelta}` : retestDelta}</Text>
+              <Text style={{ fontSize: 13, fontWeight: '600', color: colors.text }}>points since last test</Text>
+            </View>
+            <Text style={{ fontSize: 13, lineHeight: 20, color: colors.textSecondary, marginTop: 12 }}>{retestOutcome.message}</Text>
+            {retestOutcome.needsCta && (
+              <TouchableOpacity onPress={() => onNavigate('booking')} style={{ marginTop: 16, backgroundColor: colors.red, paddingVertical: 12, borderRadius: 12, alignItems: 'center' }}>
+                <Text style={{ color: '#fff', fontSize: 13, fontWeight: '700', letterSpacing: 0.5 }}>Talk to Amit</Text>
+              </TouchableOpacity>
+            )}
+          </View>
+        </View>
+      )}
 
       <View style={{ paddingHorizontal: 24, marginTop: 20 }}>
         <View style={{ borderRadius: 16, padding: 18, backgroundColor: `${result.rcsInfo.color}14`, borderLeftWidth: 3, borderLeftColor: result.rcsInfo.color }}>
@@ -3514,6 +3892,157 @@ function ResultsScreen({ onNavigate, result, userData, autoExpandN3, onSelectLay
 }
 
 // ============================================================
+// INSIGHTS HUB SCREEN (Insights tab entry point — bottom nav destination)
+// ============================================================
+
+function InsightsHubScreen({ onNavigate, hasScore, scoreResult }: { onNavigate: (s: ScreenId) => void; hasScore?: boolean; scoreResult?: any }) {
+  const { colors } = useTheme();
+  const { clinicalDepth } = useClinicalDepth();
+  const { scoreHistory } = useAppData();
+  const latestHistory = scoreHistory[0];
+
+  // Same dominant-layer fallback chain LayersHubScreen itself uses — prefer the live
+  // in-session result, fall back to the latest persisted assessment.
+  const dominantLayerId = scoreResult?.dominantLayer ?? latestHistory?.dominant_layer ?? null;
+  const dominantLayer = dominantLayerId ? LAYERS[dominantLayerId - 1] : null;
+  // Simple-mode name uses LAYER_PLAIN_SHORT ('Energy'), not LayersHubScreen's own
+  // LAYER_PLAIN (a full sentence fragment, "How your body manages energy") — this card is
+  // a compact icon-row summary next to a small "L3" badge, where the short form actually
+  // fits; LayersHubScreen's longer descriptive form doesn't apply to this layout.
+  const dominantLayerDisplayName = dominantLayer
+    ? (clinicalDepth ? dominantLayer.name : LAYER_PLAIN_SHORT[dominantLayerId - 1])
+    : null;
+
+  // Streak — re-derived the same way HomeScreen's own Today's 1% card does (same
+  // computeStreak() function, same ms_action_done_dates AsyncStorage key), not a second
+  // streak concept. This screen has no other access to HomeScreen's local state.
+  const [streak, setStreak] = useState(0);
+  useEffect(() => {
+    AsyncStorage.getItem('ms_action_done_dates').then(saved => {
+      let dates: string[] = [];
+      if (saved) { try { dates = JSON.parse(saved); } catch { dates = []; } }
+      setStreak(computeStreak(dates));
+    }).catch(() => {});
+  }, []);
+
+  // Same shared computePointsAvailable() ResultsScreen/StreakCalendarScreen use — prefers
+  // the live in-session result (freshest), falls back to the persisted latest assessment.
+  const totalScore = scoreResult?.totalScore ?? latestHistory?.total_score ?? 0;
+  const answers = scoreResult?.history ?? latestHistory?.answers;
+  const { avail: pointsAvailable, weeks: pointsWeeks } = computePointsAvailable(answers, totalScore);
+
+  const hasRealScore = hasScore || !!scoreResult || scoreHistory.length > 0;
+
+  return (
+    <View style={{ flex: 1, backgroundColor: colors.bg }}>
+      <SafeAreaView style={{ flex: 1 }} edges={['top']}>
+        <ScrollView style={{ flex: 1 }} contentContainerStyle={{ paddingBottom: 100 }} showsVerticalScrollIndicator={false}>
+          <View style={{ paddingHorizontal: 24, paddingTop: 12, paddingBottom: 12 }}>
+            <Text style={{ fontSize: 24, fontWeight: '700', color: colors.text }}>Insights</Text>
+            <Text style={{ fontSize: 14, color: colors.textSecondary, marginTop: 4 }}>Your layers, habit, and progress — all in one place.</Text>
+          </View>
+
+          {!hasRealScore ? (
+            <View style={{ paddingHorizontal: 24, marginTop: 40, alignItems: 'center' }}>
+              <View style={{ width: 72, height: 72, borderRadius: 20, backgroundColor: `${colors.red}14`, alignItems: 'center', justifyContent: 'center', marginBottom: 16 }}>
+                <Ionicons name="bulb-outline" size={32} color={colors.red} />
+              </View>
+              <Text style={{ fontSize: 14, fontWeight: '600', color: colors.text, textAlign: 'center' }}>Take your first Metabolic Score to unlock Insights.</Text>
+              <TouchableOpacity onPress={() => onNavigate('score')} style={{ marginTop: 20, backgroundColor: colors.red, paddingVertical: 12, paddingHorizontal: 24, borderRadius: 12 }}>
+                <Text style={{ color: '#fff', fontSize: 14, fontWeight: '700' }}>Take the Test</Text>
+              </TouchableOpacity>
+            </View>
+          ) : (
+            <View style={{ paddingHorizontal: 24, gap: 16 }}>
+              {/* 5 Layers — icon row (reuses LayerIcon, same component CascadeVisualization/
+                  LayersHubScreen already use, not recreated), dominant layer highlighted with
+                  a thicker ring + soft glow. Direct navigate on tap, per confirmed approach —
+                  no inline expand step. */}
+              <TouchableOpacity activeOpacity={0.95} onPress={() => onNavigate('layers')} style={{ borderRadius: 20, padding: 20, backgroundColor: colors.card }}>
+                <Text style={{ fontSize: 11, fontWeight: '700', letterSpacing: 1, color: colors.textSecondary, textTransform: 'uppercase' }}>5 Layers</Text>
+                <View style={{ flexDirection: 'row', justifyContent: 'space-between', marginTop: 14 }}>
+                  {LAYERS.map(layer => {
+                    const isDominant = layer.id === dominantLayerId;
+                    return (
+                      <View
+                        key={layer.id}
+                        style={{
+                          width: 44, height: 44, borderRadius: 22, backgroundColor: colors.bg,
+                          alignItems: 'center', justifyContent: 'center',
+                          borderWidth: isDominant ? 2 : 0, borderColor: isDominant ? layer.color : 'transparent',
+                          shadowColor: isDominant ? layer.color : 'transparent',
+                          shadowOpacity: isDominant ? 0.5 : 0, shadowRadius: isDominant ? 8 : 0,
+                          shadowOffset: { width: 0, height: 0 }, elevation: isDominant ? 4 : 0,
+                        }}
+                      >
+                        <LayerIcon name={layer.icon} size={20} color={layer.color} />
+                      </View>
+                    );
+                  })}
+                </View>
+                {dominantLayer && (
+                  <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8, marginTop: 14 }}>
+                    <View style={{ paddingHorizontal: 8, paddingVertical: 3, borderRadius: 6, backgroundColor: `${dominantLayer.color}20` }}>
+                      <Text style={{ fontSize: 10, fontWeight: '800', color: dominantLayer.color }}>L{dominantLayerId}</Text>
+                    </View>
+                    <Text style={{ fontSize: 14, fontWeight: '700', color: colors.text }}>{dominantLayerDisplayName}</Text>
+                  </View>
+                )}
+                <View style={{ marginTop: 12, paddingTop: 12, borderTopWidth: 1, borderTopColor: colors.border, alignItems: 'center' }}>
+                  <Text style={{ fontSize: 11, color: colors.textTertiary }}>Tap to see full breakdown →</Text>
+                </View>
+              </TouchableOpacity>
+
+              {/* Today's Habit — same streak concept as Home's Today's 1% card. */}
+              <TouchableOpacity activeOpacity={0.95} onPress={() => onNavigate('streak-calendar')} style={{ borderRadius: 20, padding: 20, backgroundColor: colors.card }}>
+                <Text style={{ fontSize: 11, fontWeight: '700', letterSpacing: 1, color: colors.textSecondary, textTransform: 'uppercase' }}>Today's Habit</Text>
+                <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8, marginTop: 10 }}>
+                  <Ionicons name="flame" size={20} color="#F59E0B" />
+                  <Text style={{ fontSize: 20, fontWeight: '800', color: colors.text }}>{streak} day streak</Text>
+                </View>
+                <View style={{ marginTop: 12, paddingTop: 12, borderTopWidth: 1, borderTopColor: colors.border, alignItems: 'center' }}>
+                  <Text style={{ fontSize: 11, color: colors.textTertiary }}>Tap to view streak calendar →</Text>
+                </View>
+              </TouchableOpacity>
+
+              {/* Points Available — same computePointsAvailable() as ResultsScreen/
+                  StreakCalendarScreen, single source of truth for the value. Visual
+                  treatment now matches Results' own "Fat loss resistance & potential" card
+                  exactly (icon+label header row, big green number row, descriptive
+                  sentence below), not a plainer card — per 2026-08-07 ask. Copy is the
+                  exact same wording used on both those screens too, not a third variant. */}
+              <View style={{ borderRadius: 20, padding: 20, backgroundColor: colors.card, borderWidth: 1, borderColor: '#22C55E30' }}>
+                <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8, marginBottom: 12 }}>
+                  <Ionicons name="trending-up" size={16} color="#22C55E" />
+                  <Text style={{ fontSize: 10, fontWeight: '700', letterSpacing: 1, color: '#22C55E', textTransform: 'uppercase' }}>Points Available</Text>
+                </View>
+                <View style={{ flexDirection: 'row', alignItems: 'baseline', gap: 8, marginBottom: 8 }}>
+                  <Text style={{ fontSize: 22, fontWeight: '900', color: '#22C55E' }}>+{pointsAvailable}</Text>
+                  <Text style={{ fontSize: 13, fontWeight: '600', color: colors.text }}>points may be available over {pointsWeeks} weeks</Text>
+                </View>
+                <Text style={{ fontSize: 12, lineHeight: 18, color: colors.textSecondary }}>Lowering your resistance may unlock <Text style={{ fontWeight: '600', color: '#22C55E' }}>+{pointsAvailable} points</Text> of recovery capacity over roughly <Text style={{ fontWeight: '600', color: colors.text }}>{pointsWeeks} weeks</Text>, with the right intervention sequence.</Text>
+              </View>
+
+              {/* Honest placeholder — not functional, just so the screen doesn't feel
+                  incomplete. No overclaiming on timeline, matching this project's clinical
+                  language discipline. */}
+              <View style={{ borderRadius: 20, padding: 20, backgroundColor: colors.card, borderWidth: 1, borderColor: colors.border, borderStyle: 'dashed' }}>
+                <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
+                  <Ionicons name="time-outline" size={16} color={colors.textTertiary} />
+                  <Text style={{ fontSize: 11, fontWeight: '700', letterSpacing: 1, color: colors.textTertiary, textTransform: 'uppercase' }}>Coming Soon</Text>
+                </View>
+                <Text style={{ fontSize: 13, color: colors.textSecondary, marginTop: 10, lineHeight: 19 }}>Longitudinal trends across your assessments, and wearable data integration, are planned for a future phase — not available yet.</Text>
+              </View>
+            </View>
+          )}
+        </ScrollView>
+        <BottomNav active="insights" onNavigate={onNavigate} hasScore={hasScore} />
+      </SafeAreaView>
+    </View>
+  );
+}
+
+// ============================================================
 // LAYERS HUB SCREEN
 // ============================================================
 
@@ -3577,7 +4106,10 @@ function LayersHubScreen({ onNavigate, onSelectLayer, hasScore, scoreResult }: {
             })}
           </View>
         </ScrollView>
-        <BottomNav active="layers" onNavigate={onNavigate} hasScore={hasScore} />
+        {/* active="insights" (not "layers") — this screen is now reached via the Insights
+            tab's "5 Layers" card, not a direct bottom-nav destination, so the Insights tab
+            should stay highlighted while viewing it. */}
+        <BottomNav active="insights" onNavigate={onNavigate} hasScore={hasScore} />
       </SafeAreaView>
     </View>
   );
@@ -7654,7 +8186,7 @@ function BottomNav({ active, onNavigate, hasScore }: { active: string; onNavigat
   return (
     <View style={{ borderTopWidth: 1, borderTopColor: colors.border, backgroundColor: colors.bg, flexDirection: 'row', alignItems: 'flex-end', justifyContent: 'space-around', paddingHorizontal: 8, paddingTop: 8, paddingBottom: 8 }}>
       {renderTab({ id: 'home', icon: 'home', label: 'Home', screen: 'home' })}
-      {renderTab({ id: 'layers', icon: 'layers', label: 'Layers', screen: 'layers' })}
+      {renderTab({ id: 'insights', icon: 'bulb', label: 'Insights', screen: 'insights' })}
       <TouchableOpacity onPress={() => onNavigate(hasScore ? 'score-history' : 'score')} style={{ flex: 1, alignItems: 'center', gap: 2 }}>
         <View style={{ width: 56, height: 56, borderRadius: 28, backgroundColor: colors.red, borderWidth: 3, borderColor: colors.bg, alignItems: 'center', justifyContent: 'center', marginTop: -24, shadowColor: '#D42B2B', shadowOffset: { width: 0, height: 4 }, shadowOpacity: 0.4, shadowRadius: 12, elevation: 8 }}>
           <Ionicons name="flash" size={24} color="#fff" />
@@ -7680,6 +8212,13 @@ function AppNavigator() {
   // freshly logged-in account never inherits the previous account's quiz result.
   // Same identity signal (user?.id) that AppDataContext's own identity-change check is built from.
   useEffect(() => { setScoreResult(null); }, [user?.id]);
+  // Captured in handleScoreComplete, BEFORE saveScore() runs — saveScore optimistically
+  // prepends the just-completed test to scoreHistory synchronously, so by the time
+  // ResultsScreen mounts scoreHistory[0] is already the current test, not the previous one.
+  // Capturing here avoids depending on that timing at all. Reset alongside scoreResult on
+  // identity change for the same reason (never let a new account inherit a stale value).
+  const [previousTotalScore, setPreviousTotalScore] = useState<number | null>(null);
+  useEffect(() => { setPreviousTotalScore(null); }, [user?.id]);
   const [userData, setUserData] = useState<UserData>({ gender: 'Male', age: '26–35', conditions: [], sleepScore: 5, stressScore: 5, gutScore: 5 });
   const [selectedLayer, setSelectedLayer] = useState(1);
   const [selectedArticle, setSelectedArticle] = useState<Insight | null>(null);
@@ -7767,6 +8306,9 @@ function AppNavigator() {
   }, [user, loading]);
 
   const handleScoreComplete = (result: ScoreResult, data: UserData) => {
+    // Must read scoreHistory[0] here, before saveScore() below mutates it — see
+    // previousTotalScore's declaration above for why.
+    setPreviousTotalScore(scoreHistory[0]?.total_score ?? null);
     setScoreResult(result);
     setUserData(data);
     setLastQuizAnswers(result.history);
@@ -7800,8 +8342,9 @@ function AppNavigator() {
       // itself returns null for rows saved before the 2026-07-30 cascade_risk/dominant_layer
       // persistence fix, so pre-fix rows correctly still show nothing (HomeScreen) here.
       const effectiveScoreResult = scoreResult ?? (scoreHistory[0] ? reconstructScoreResultFromHistory(scoreHistory[0]) : null);
-      return effectiveScoreResult ? <ResultsScreen onNavigate={navigate} result={effectiveScoreResult as ScoreResult} userData={userData} autoExpandN3={autoExpandN3} onSelectLayer={(id) => setSelectedLayer(id)} /> : <HomeScreen onNavigate={navigate} hasScore={hasScore} />;
+      return effectiveScoreResult ? <ResultsScreen onNavigate={navigate} result={effectiveScoreResult as ScoreResult} userData={userData} autoExpandN3={autoExpandN3} onSelectLayer={(id) => setSelectedLayer(id)} previousTotalScore={scoreResult ? previousTotalScore : null} /> : <HomeScreen onNavigate={navigate} hasScore={hasScore} />;
     }
+    case 'insights': return <InsightsHubScreen onNavigate={navigate} hasScore={hasScore || !!scoreResult} scoreResult={scoreResult} />;
     case 'layers': return <LayersHubScreen onNavigate={navigate} onSelectLayer={(id) => { setSelectedLayer(id); navigate('layer-detail'); }} hasScore={hasScore || !!scoreResult} scoreResult={scoreResult} />;
     case 'layer-detail': return <LayerDetailScreen onNavigate={navigate} layerId={selectedLayer} onSelectArticle={(a) => { setSelectedArticle(a); navigate('article-reader'); }} />;
     case 'library': return <LibraryScreen onNavigate={navigate} hasScore={hasScore || !!scoreResult} scoreResult={scoreResult} onSelectArticle={(a) => { setSelectedArticle(a); navigate('article-reader'); }} />;
