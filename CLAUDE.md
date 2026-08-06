@@ -332,6 +332,83 @@ derived math, so users who never retest have a defined path back to a fresh cycl
    error payloads must be added and verified before any real event is ever
    sent — not a nice-to-have, a precondition for the first device test.
 
+#### Addendum — Sentry crash reporting set up (PHI-safe), item 8 above now complete
+
+**Sentry error/crash tracking — CONFIGURED, NOT YET DEVICE-TESTED.**
+
+- Set up via the official Sentry wizard (`npx @sentry/wizard@latest -i reactNative`),
+  run manually in a real terminal (Claude Code's sandboxed environment can't render
+  the wizard's interactive confirm() prompts — hits `ERR_TTY_INIT_FAILED`; this is a
+  known environment limitation, not a wizard bug. Worth remembering for any future
+  CLI tool requiring interactive prompts).
+- Correctly detected as an Expo/EAS managed project — added `@sentry/react-native/expo`
+  to `app.json`'s plugin array, did NOT touch native android/ios folders (there are
+  none to touch in this managed setup; confirmed live via wizard output: "Detected
+  Expo Continuous Native Generation (CNG) setup. Skipping native files patching").
+- Auth token written to `.env.local`, confirmed git-ignored — not hardcoded in
+  `app.json` (which would ship inside the app bundle, readable at runtime).
+- **PHI-scrubbing `beforeSend` hook built and staged** — `scrubSentrySensitiveData()`
+  recursively walks the full event payload and redacts any key matching a name list
+  (symptoms, conditions, goals, baseline, mini_quiz, all app_scores fields including
+  variable names like `sc`/`scoreResult`/`rcsInfo`/`patternEngine`/`cascade_risk`,
+  craving fields, email, full_name, expo_push_token) — name-based, not path-based, so
+  it survives future refactors rather than needing updates every time internal
+  structure changes.
+- **Two additional leak points found and closed, beyond the original ask** — both
+  bypass `beforeSend` entirely, so neither would have been caught by the scrubber
+  above on its own:
+  1. `enableLogs` auto-captures every `console.*` call through Sentry's structured
+     Logs pipeline, which never touches `beforeSend` at all. Closed via
+     `beforeSendLog`, which drops every auto-captured console log outright.
+  2. Sentry's separate, older breadcrumb-capture mechanism also records console
+     output (as `category: 'console'` breadcrumbs) independent of the Logs
+     feature above. Closed via `beforeBreadcrumb`, dropping console breadcrumbs at
+     creation — belt-and-suspenders with a matching filter also left in
+     `beforeSend`'s own breadcrumb handling.
+- **Session Replay: DISABLED for now** (`replaysSessionSampleRate: 0`,
+  `replaysOnErrorSampleRate: 0`) — a documented, unresolved masking bug exists on
+  Android (sentry-react-native#6122, safe-direction failure mode but unverified fix),
+  and this app's screens (Profile, Symptom Tracker, Layers, Home) are unusually
+  sensitive. Mask settings (`maskAllText: true`, `maskAllVectors: true`) left
+  hard-set in the code for whenever Replay gets re-enabled later, with reasoning
+  documented inline — don't need to re-derive this next time.
+- **Not yet done:** first real device test. `Sentry.captureException` requires a
+  fresh EAS build (native module, same category as `expo-notifications` earlier
+  this session) — the dev client currently on-device doesn't have it compiled in.
+  The `beforeSend`/`beforeSendLog`/`beforeBreadcrumb` review was completed *before*
+  any real event has been sent — no live data has touched Sentry's servers yet,
+  which is exactly the right order.
+
+**Next session, in order: build → install → tap the wizard's test button → confirm
+in Sentry dashboard → confirm scrubbing actually worked on a real payload (check
+that no symptom/score/PII data appears in the captured event).**
+
+---
+
+#### App icon / logo — PARKED, not urgent
+
+Explored several directions tonight (5-layers-as-rings concept, matching the "5
+Layers of Metabolic Permission" brand). Landed on: dark background, ring shape
+paired with a letter (M or MS), inspired structurally by ZEE5's ring+wordmark
+icon — but staying to a single deep monochrome red-to-maroon tone rather than
+multiple colors (multi-color felt distracting/less professional on review).
+
+**Real finding from testing at actual app-icon scale (~56px, in a realistic home
+screen grid mockup):** the 5-ring detail blurs into a soft glow at that size —
+only the deep tone and the letter actually read clearly at true size, not the
+ring count itself. This is normal for detailed icons at small scale, not a flaw
+specific to this design.
+
+**Open decision for next time:** whether the *tiny app icon* should be a
+simplified, bolder 2-3-ring version optimized for legibility at true size, while
+the full detailed 5-ring version is reserved for contexts with more room (splash
+screen, website header, About page). Also still undecided: "M" alone (cleaner,
+more legible small) vs. "MS" (more literal, slightly busier at small size) —
+current lean is toward "M" as the primary app icon.
+
+Deliberately not pursued further tonight — parked for a fresh, unhurried design
+session rather than rushed at the end of a long night.
+
 ### 2026-08-04 (cont'd 2) — Footer positioning still broken on device; root-cause investigation inconclusive, logged honestly rather than guessed
 
 **Confirmed working:** headline font size (14px), `app_report_downloads`
