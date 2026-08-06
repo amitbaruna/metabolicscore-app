@@ -143,169 +143,132 @@ Update this at the end of every session (either with Claude Code or with Claude 
 chat) — what got fixed, what's still open. Keep entries short; this is a fast
 "where did we leave off" scan, not a full changelog. Newest entry on top.
 
-### 2026-08-08 — Retest-outcome card built (Results screen)
+### 2026-08-07 — Bell/inbox redesign completed; Insights hub built; Home card
+restoration correction; retest-outcome card built (closes the "in-app
+notification" arc)
 
-New card, `ResultsScreen`, rendered once right after the score-gauge reveal and
-before the Fat Loss Readiness/Layer Breakdown cards — only when the current test
-is a genuine retest (real prior `app_scores` data exists).
+**1. Notification bell — redesigned and fixed through several real bugs:**
+- Panel narrowed to ~65% width, anchored top-right near the bell (was
+  incorrectly full-width due to a circular sizing dependency: an unbounded
+  parent + percentage-width child collapsed toward zero under Yoga's layout
+  resolution — fixed by giving the parent an unambiguous width and
+  right-anchoring via `alignSelf: 'flex-end'`).
+- Each notification is now its own solid card (matching Home's card style),
+  explicit X per card (works regardless of swipe), swipe-dismiss kept as
+  secondary. Simulated/translucent background (not real blur — avoided
+  stacking a third un-rebuilt native dependency alongside `expo-notifications`
+  and Sentry; real `expo-blur` can be a fast-follow once those get their EAS
+  build).
+- Tap-to-navigate added: routes by `type`, matching the same logic as the
+  push-tap listener (kept in sync after a later correction, see below).
+- Count badge added: last-7-days activity minus locally-dismissed IDs (shared
+  state, not per-component), so badge always matches what the panel would
+  show if opened — capped at "9+". Not a true "unread" count (no persisted
+  read-state, by design).
+- **`checkin_reminder` notifications now show `metadata.body`** (the real
+  personalized message) as the primary text instead of the generic `title`
+  ("Today's 1% is waiting") — both were always being stored correctly, this
+  was a display-only fix.
+- **Dismissed-notification persistence bug fixed:** dismissed items were
+  reappearing on tab switch (not just app restart) — root cause: this app's
+  screens fully unmount/remount on every navigation, so `dismissedNotifIds`
+  living in `HomeScreen`'s local state reset on every switch. Moved into
+  `AppDataContext` (same pattern already used for cross-account isolation),
+  which persists for the session and only resets on identity change.
+- **Clear All added** — same local-only semantics as per-card dismiss.
+- Empty state ("You're all caught up 🙂") — investigated with debug logging,
+  root cause NOT found by end of session; deprioritized as low-value polish
+  after ~2 hours of investigation. **Still open, low priority.**
 
-**Score delta — found and avoided a real race condition before writing any
-UI.** `saveScore()` (`AppDataContext.tsx`) optimistically prepends the
-just-completed test to `scoreHistory` synchronously, before `ResultsScreen` even
-mounts — so by render time `scoreHistory[0]` is already the current test, not
-the previous one. Using it as "previous" would have been a timing-dependent
-assumption. Instead, `AppNavigator.handleScoreComplete` now captures
-`scoreHistory[0]?.total_score` into a new `previousTotalScore` state **before**
-calling `saveScore()`, and passes it to `ResultsScreen` as an explicit prop —
-deterministic regardless of render/effect timing. Only passed on the live
-`scoreResult` path, never the reconstructed-from-history one (viewing an old
-result later), which is what makes the card "appears once, only right after a
-genuine retest" rather than needing a separate visibility flag.
+**2. Home card removal/restoration — a correction worth remembering.**
+An instruction to "remove the redundant strip" was ambiguous and got
+interpreted as removing the entire Today's 1% card from Home. Confirmed via
+`git diff` against the last commit that no separate strip ever existed
+distinct from the card — it was one unit. **Fully restored, verbatim**: both
+states (pending/complete), all backing state (streak, blink animation,
+swipe-dismiss, `markActionDone`), and every cascade reference (push-tap
+listener, both HomeScreen and ProfileScreen cascade cards, the bell panel's
+own tap handler). The complete-state tap-to-navigate-to-streak-calendar
+feature (built earlier this session) was preserved through the
+restore/correction cycle. **Lesson: when an instruction involves removing
+something, confirm via diff what actually exists before implementing —
+ambiguity here cost a full extra round-trip.**
 
-**Adherence — reused existing APIs, no new endpoints.** Same
-`habitCycles.getMine()` / `checkins.listSince()` calls `StreakCalendarScreen`
-already uses. Current cycle = active/extended row, falling back to the most
-recently closed one (in case the Worker's cron already closed it by the time the
-retest landed — the app has no way to know which happened first; the
-closed-then-immediately-retested edge case with a brand-new near-zero-adherence
-cycle isn't specially handled, wasn't in scope). Adherence count = completed
-`app_checkins` bounded by the cycle's own `start_date`/`end_date` — not a
-hardcoded 14, so it's correct for both normal (14-day) and extended (21-day)
-cycles. `retestWindowDays` (the "N" in "last N days") is derived the same way
-from the cycle's real span, per Amit's own catch: the locked copy literally says
-"last 14 days," which would read wrong for an extended cycle if hardcoded.
+**3. Insights Hub — new screen, replaces the "Layers" tab.**
+- Bottom nav: "Layers" → "Insights", icon → bulb. `LayersHubScreen` itself
+  unchanged, just reached differently (plus still directly, unchanged).
+- New `InsightsHubScreen`, 4 cards: **5 Layers** (reuses real `LayerIcon`
+  components, dominant layer visually highlighted, `L{N}` badge + name wired
+  to the existing Clinical Depth Mode toggle — plain name in Simple mode,
+  clinical name in Clinical mode — direct-navigates to the full breakdown on
+  tap); **Today's Habit** (streak, navigates to Streak Calendar); **Points
+  Available** (shared `computePointsAvailable()`, restyled to exactly match
+  Results screen's "Fat Loss Resistance & Potential" card, not just the same
+  value); **Coming Soon** (honest placeholder for longitudinal/wearable data,
+  no timeline claims).
+- Bug found and fixed in the same pass: "Your Signal" quote under 5 Layers
+  (e.g. the N2 mechanism line) was missing after logout/login — same known
+  bug class as last week's `scoreResult ?? scoreHistory[0]` fallback pattern
+  (already applied to Metabolic Score, Metabolic Story, Latest Insights,
+  Case Studies, cravings, symptoms), this field had been missed in that pass.
+  Now fixed identically on Home; confirmed the Insights Hub's own compact
+  5-Layers card has no equivalent field to begin with, so no second fix
+  needed there.
 
-**Branch logic (`buildRetestOutcomeCard`, new pure function near
-`computePointsAvailable`)** — adherence gates first (below 10 of the window
-makes the delta itself unreliable to read anything into), then delta once
-adherence clears that bar: ≥+5 / +1 to +4 / 0 to −4 / ≤−5. All 5 messages are
-Amit's exact locked copy (2026-08-08), each with `${adherence}`/`${windowDays}`
-substituted in place of the literal "14." Only the two negative/flat-delta,
-high-adherence branches (held steady, or regressed) get the "Talk to Amit" CTA,
-linking to the same `onNavigate('booking')` flow used everywhere else in the
-app — no new booking path.
+**4. Retest-outcome card — built, closes out the last major "in-app
+notification" item from the original scope.**
+- Lives on Results screen, right after the score-gauge reveal, before Fat
+  Loss Readiness/Layer Breakdown. Only renders on the live just-completed-quiz
+  path (gated on an explicit `previousTotalScore` prop), never when revisiting
+  past results.
+- **Real race condition found and avoided**: `saveScore()` optimistically
+  prepends the new test to `scoreHistory` synchronously, before
+  `ResultsScreen` mounts — so `scoreHistory[0]` is already the *current* test
+  by render time, not the previous one. Fixed by capturing the previous score
+  in `handleScoreComplete` *before* `saveScore()` runs, passed down as an
+  explicit prop instead of relying on array-index timing.
+- Adherence reuses existing `habitCycles.getMine()`/`checkins.listSince()`
+  (same APIs Streak Calendar uses). Window length correctly derived from the
+  cycle's real `start_date`/`end_date` (14 or 21 days) — **not** hardcoded to
+  14 like Streak Calendar's own grid currently is (flagged as a small
+  pre-existing inconsistency in that screen, not fixed, not blocking).
+- 5 branches, exact locked copy, deterministic (no LLM call): <10 adherence →
+  encourage habit regardless of score; ≥10 adherence branches by delta (≥+5
+  strong / +1–4 margin / 0 to −4 soft nudge-to-book / ≤−5 gentler regression
+  message). Booking CTA only on the two branches that need it, reuses
+  existing booking flow.
+- Colors reuse ProfileScreen's existing trajectory-indicator green/red pair
+  rather than inventing new ones.
+- **Confirmed working on real device** with a live retest showing a real
+  delta.
 
-**Visual:** same rounded-card style as the other Results cards. Delta shown
-with an icon+color pair reused from `ProfileScreen`'s existing
-"↗/↘ since last" trajectory indicator (`#22C55E` up / `#EF4444` down — matching
-established precedent instead of inventing a new negative color), amber
-(`colors.amber`, already used elsewhere on this screen) for exactly flat.
-Adherence shown as a small pill badge next to the section label.
+---
 
-`npx tsc --noEmit`: still exactly 10 pre-existing errors, confirmed clean.
-Nothing committed — staged only, pending Amit's review per rule 8.
+**Scoped for next session:**
 
-### 2026-08-07 — Insights Hub tab + notification bell panel built; Today's 1% card removed from Home then fully restored same session (see correction below); last scoreResult→scoreHistory fallback gap closed
-
-Continuation of the 2026-08-06 session (same overnight run, crossed midnight).
-
-**Correction, same session:** the Today's 1% card removal described below was a
-misreading of an ambiguous instruction — Amit's actual intent was only to remove
-a genuinely separate, persistent leftover strip *if one existed distinct from the
-card itself*. Investigated via direct diff against the last real commit before
-touching anything again: no such separate strip existed — the pending state, the
-complete state (checkmark/streak/X-dismiss), and the dismissed-to-`null` state
-were always one single unit. So per Amit's own fallback instruction, this was a
-full restore, not a partial one. Restored, verbatim from the pre-removal code:
-`streak`/`actionDone`/`actionDoneFlash` state, the swipe-to-dismiss
-(`dismissedToday`/`dismissX`/`dismissPanResponder`), the blink mechanism
-(`todaysOneBlinkAnim`/`todaysOneRef`/`triggerTodaysOneBlink`/the
-`highlightTodaysOne` effect), the `ms_action_done_dates` load effect,
-`markActionDone` (incl. its `[DEBUG checkin]` log, kept for fidelity — not yet
-cleaned up), `todayAction`/`actionRow`/`dayIndex`/`actionRevealText`, and the
-full JSX card. Also restored: `AppNavigator`'s `goToTodaysOne`/
-`highlightTodaysOne`, the `'home'`/`'profile'` prop pass-throughs, both
-`HomeScreen` cascade `onWorkOnThis` sites (→ `triggerTodaysOneBlink`), both
-`ProfileScreen` cascade sites (→ `onGoToTodaysOne`), and the push-notification
-tap listener's `checkin_reminder`/`streak_milestone` routing (→ `goToTodaysOne()`,
-reverted from the interim `streak-calendar` redirect). One deliberate net-new
-piece, requested explicitly this time rather than assumed: the notification bell
-panel's own row-tap handler (`handleSelectNotification`, new this session, not
-part of the original pre-removal code) now also calls `triggerTodaysOneBlink()`
-for those two types instead of navigating to the Streak Calendar — since the
-panel opens from Home already, no navigation is needed, and this keeps the bell
-panel and the push listener landing on the same place for the same notification
-types. `npx tsc --noEmit`: still exactly 10 pre-existing errors after the full
-restore, confirmed clean. The Streak Calendar screen itself, its "View streak
-calendar →" link from the restored card, the Insights Hub's own "Today's Habit"
-card, and everything else described below (Insights Hub, notification bell panel
-build, the `getLayerSignal` fix, the Points Available restyle) are unaffected —
-this correction only reverted the strip-removal piece.
-
-**Insights Hub (`InsightsHubScreen`, new) — bottom-nav "Layers" tab renamed
-"Insights" (icon → `bulb`).** 4 cards: 5 Layers (icon row, dominant-layer
-highlight, taps through to the original full breakdown — kept intact as
-`LayersHubScreen`, only its own `BottomNav active` value changed so the Insights
-tab stays highlighted), Today's Habit (own `computeStreak()`-derived streak, taps
-to the Streak Calendar), Points Available (restyled this session — see below),
-Coming Soon placeholder. Has its own empty state pre-first-test.
-
-**Notification bell panel (`NotificationBellPanel`/`NotificationRow`, new) on
-Home** — `Modal`-based, reads `notification_log` (client-side `SELECT` only,
-never written by the app — see `grant_notification_log_table_access.sql`, same
-missing-GRANT bug class hit 3x already 2026-08-06, caught proactively this time).
-65% width, top-right anchored, translucent `${colors.card}E6` background (chosen
-over real `expo-blur` to avoid a third un-rebuilt native dependency). Per-row X
-button, swipe-to-dismiss, "Clear All," 7-day count badge on the bell icon (caps at
-"9+"). Tap routes: `checkin_reminder`/`streak_milestone` → Streak Calendar,
-`retest_reminder` → score screen.
-- **Bug fixed, same root cause as the Streak Calendar grid bug (2026-08-06):**
-  panel text invisible / header wrapping — a percentage-width child of an
-  absolutely-positioned parent with no definite width (`top:0,right:0`, no
-  `left`). Fixed the same way: `top:0,left:0,right:0` on the parent,
-  `alignSelf:'flex-end'` on the child.
-- `dismissedNotifIds` was resetting on every tab switch — confirmed root cause
-  (not hypothesized): this app's screens fully unmount/remount on every
-  navigation (documented architecture fact, not new). Fixed by lifting
-  `dismissedNotifIds`/`markNotifDismissed` into `AppDataContext` (persists across
-  navigation, resets only on identity change like the rest of that context).
-- **Still open, not resolved this session:** swipe-to-dismiss still has a
-  temporary `[DEBUG notif-swipe]` diagnostic log in `NotificationRow`, pending a
-  real device test. A temporary yellow `backgroundColor` diagnostic was also left
-  on the empty-state `Text` — outcome not yet confirmed on device. Both need
-  removing once verified.
-
-**Today's 1%/streak strip removed from Home entirely** — now redundant with
-Insights' own "Today's Habit" card, which routes to the same Streak Calendar
-where the actual mark-as-done/streak UI lives (today's grid cell there does the
-same completion action the strip's "Mark as Done" button used to). Removed
-`HomeScreen`'s pending/complete-state card, swipe-dismiss, blink animation, and
-"View streak calendar →" link, plus all its backing state
-(`streak`/`actionDone`/`actionDoneFlash`/`dismissedToday`/`todaysOneBlinkAnim`/etc.)
-and the dedicated `goToTodaysOne`/`highlightTodaysOne` plumbing that existed only
-to jump to and blink that card (`AppNavigator`, `ProfileScreen`, the push-tap
-listener, both `HomeScreen` `CascadeVisualization` "Want to work on this?" call
-sites). Every former caller now just calls `onNavigate('streak-calendar')`
-directly instead — simpler than keeping a dedicated callback alive for a target
-that no longer needs special-casing. `ProfileScreen`'s two
-`CascadeVisualization` call sites (its own "Want to work on this?" cascade cards)
-updated the same way, since they'd been left referencing the now-removed
-`onGoToTodaysOne` prop.
-- Possible follow-up, not done: `HOME_SECTIONS`/`'daily-focus'` entry (likely
-  `src/data/appData.ts`, referenced by `CustomizeHomeScreen`) toggled the now-gone
-  strip and is probably orphaned — not cleaned up, wasn't explicitly requested.
-
-**Points Available card (Insights Hub) restyled to match Results screen's "Fat
-loss resistance & potential" card exactly** — same rounded card treatment,
-green accent color/label row, `+N points... over N weeks` framing, supporting
-sentence. Previously had its own different, plainer treatment (2026-08-06's
-"Minor follow-up" item, now closed).
-
-**Last fallback-pattern gap closed:** the same `scoreResult ?? scoreHistory[0]`
-fallback already applied throughout (Metabolic Score, Metabolic Story, 5 Layers,
-Latest Insights, Case Studies, cravings, symptoms) had missed one field —
-HomeScreen's `getLayerSignal` (the "Your Signal" quote under 5 Layers, e.g. "I
-feel constantly on edge even when nothing is wrong") was still reading only live
-`scoreResult.history`, so it went blank after sign-in without retaking the test
-this session. Fixed to read `scoreResult?.history ?? latestHistory?.answers`,
-consistent with the established pattern rather than a new approach. **Scope
-note:** the Insights Hub's own "5 Layers" card doesn't show a per-layer signal
-quote at all (more compact design than Home's) — nothing to fix there, the fix
-only applied where the field actually exists (Home).
-
-`npx tsc --noEmit`: still exactly 10 pre-existing errors (7 `ImageSourcePropType`,
-3 craving/insight union types) after this whole batch — confirmed clean, nothing
-new introduced. Nothing committed — staged only, pending Amit's review per rule 8.
+1. **Retest-outcome card — also surface under Insights?** New idea from
+   tonight, not yet scoped. Real design question: one-time-on-Results only
+   (current behavior) vs. also becoming a persistent "how did your last cycle
+   go" card in Insights. Needs its own quick scoping pass, not a copy-paste.
+2. **App icon/logo** — still parked. User leaning toward a detailed
+   "AI-meets-human, chrome and red" concept; flagged concern is whether fine
+   circuit-line/muscle detail survives real app-icon scale (~60px) — same
+   lesson already proven with a much simpler 5-ring concept earlier this
+   week. Real-size test on-device recommended before deciding; alternative is
+   a simplified adaptation keeping the concept's spirit with reduced detail.
+3. **PostHog product analytics** — decided as the tool, not yet built. Own
+   dedicated session (daily/session activity, click tracking, heatmaps,
+   content-engagement tracking) — explicitly separate from Sentry.
+4. **Bell empty state** ("You're all caught up 🙂" not appearing) — real bug,
+   investigated without a confirmed root cause, deprioritized as low-value
+   after ~2 hours. Revisit if it becomes a real problem, not urgent.
+5. **`HOME_SECTIONS`/`'daily-focus'` dead code** in `src/data/appData.ts` —
+   flagged as likely orphaned after the Home-card removal/restoration cycle,
+   not touched, low-risk 30-second cleanup whenever convenient.
+6. **`StreakCalendarScreen`'s grid hardcoding 14 days** even for extended
+   (21-day) cycles — small pre-existing inconsistency found while building
+   the retest-outcome card, not fixed, not urgent.
+7. **Android** — still entirely untested, iOS-only so far.
 
 ### 2026-08-06 — PDF footer bug closed; full push notification engine + habit cycle
 engine built, deployed, and device-tested; multiple real production bugs found and
@@ -450,8 +413,9 @@ derived math, so users who never retest have a defined path back to a fresh cycl
 1. **Bell/inbox notification sync** — architecture agreed (reads from
    `notification_log`, no new writes needed), full brief written, never sent/built.
 2. **Retest-outcome card** (Results screen) — fully spec'd (5 branches by
-   adherence + score delta, all copy finalized), not started. **Built 2026-08-08,
-   see that session's entry near the top of this log.**
+   adherence + score delta, all copy finalized), not started. **Built and
+   device-confirmed 2026-08-07, see that session's entry near the top of this
+   log.**
 3. **Completion-UX redesign for "Mark as Done"** — real design gap identified:
    current checkmark-based interaction borrows diagnostic/form-entry visual
    language for what should be a habit-reward moment. Three concrete directions
