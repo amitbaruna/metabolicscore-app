@@ -11,7 +11,7 @@ import {
   FlatList, Image, Modal, ActivityIndicator, Alert, KeyboardAvoidingView, Keyboard, Share, PanResponder,
 } from 'react-native';
 import { StatusBar } from 'expo-status-bar';
-import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
+import { SafeAreaProvider, SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
 import { Ionicons, MaterialCommunityIcons, FontAwesome5 } from '@expo/vector-icons';
 import * as Font from 'expo-font';
 import { LinearGradient } from 'expo-linear-gradient';
@@ -21,11 +21,11 @@ import * as Sharing from 'expo-sharing';
 import * as Print from 'expo-print';
 import * as Clipboard from 'expo-clipboard';
 import { Asset } from 'expo-asset';
-import { File as ExpoFile, Paths as ExpoPaths } from 'expo-file-system';
+import { File as ExpoFile, Paths as ExpoPaths, writeAsStringAsync } from 'expo-file-system';
 import { PDFDocument, StandardFonts, rgb } from '@cantoo/pdf-lib';
-import Svg, { Path, Defs, LinearGradient as SvgLinearGradient, Stop as SvgStop } from 'react-native-svg';
+import Svg, { Path, Defs, LinearGradient as SvgLinearGradient, Stop as SvgStop, Line, G, Circle, Text as SvgText } from 'react-native-svg';
 import Constants from 'expo-constants';
-import { booking, membership, referral, account, pushNotifications, actionContent, checkins, habitCycles, auth, profiles } from './src/config/supabase';
+import { booking, membership, referral, account, pushNotifications, actionContent, checkins, habitCycles, notificationLog, auth, profiles } from './src/config/supabase';
 // Guarded — expo-notifications behaves inconsistently in Expo Go, especially for remote push
 // token registration on iOS, which really needs a real build. Same safe-load pattern as the
 // other native-adjacent modules this session.
@@ -34,6 +34,52 @@ try {
   Notifications = require('expo-notifications');
 } catch (e) {
   console.warn('[App] expo-notifications not available in this environment.');
+}
+
+// react-native-health — optional native module for Apple HealthKit sync.
+// Guarded: null in Expo Go or if the native module isn't linked. Only works in a
+// native EAS build (which the user already runs). Whoop, Apple Watch, Oura, and
+// any device that writes to Apple Health will work — we read from HealthKit, not
+// from the device directly.
+let AppleHealthKit: any = null;
+try {
+  const mod = require('react-native-health');
+  // Log raw module structure for diagnostics
+  console.log('[App] react-native-health raw require result:', typeof mod, JSON.stringify(mod)?.slice(0, 200));
+  if (mod && typeof mod === 'object') {
+    console.log('[App] react-native-health keys:', Object.keys(mod).join(', '));
+  }
+  // Direct check: is the native module actually linked into NativeModules at all?
+  // NOTE: under New Architecture, NativeModules IS global.nativeModuleProxy — a
+  // native host object (see react-native's own NativeModules.js). Host objects
+  // implement a `get` trap but not `ownKeys`, so Object.keys(NativeModules) and
+  // Object.keys(NativeModules.AppleHealthKit) are expected to read empty/thin
+  // REGARDLESS of whether the module is actually linked — enumeration is not a
+  // reliable signal on New Arch. Testing direct property access instead (which
+  // goes through the proxy's `get` trap, not enumeration) — this is also exactly
+  // what matters, since react-native-health's own wrapper builds its export via
+  // `Object.assign({}, NativeModules.AppleHealthKit, {Constants:...})`, which
+  // only copies enumerable own properties. If the native module's methods exist
+  // but aren't enumerable under the New Arch proxy, Object.assign would silently
+  // drop them even though the module is genuinely linked and working — in which
+  // case the real bug is react-native-health's wrapper, not New Architecture.
+  const RN = require('react-native');
+  const nativeModule = RN.NativeModules?.AppleHealthKit;
+  console.log('[App] NativeModules.AppleHealthKit typeof:', typeof nativeModule, '| in NativeModules:', 'AppleHealthKit' in (RN.NativeModules || {}));
+  console.log('[App] NativeModules.AppleHealthKit direct method access — typeof .initHealthKit:', typeof nativeModule?.initHealthKit);
+  console.log('[App] (for reference, expected to read thin/empty on New Arch regardless of linking — see note above) enumerable own keys:', nativeModule ? Object.keys(nativeModule).join(', ') || '(none)' : nativeModule);
+  // Try .default (ESM interop), direct, or named HealthKit export
+  AppleHealthKit = mod?.default || mod?.HealthKit || (typeof mod === 'function' ? mod : null) || null;
+  if (!AppleHealthKit && mod) {
+    // Last resort: if the module is an object, use it directly even if we're unsure
+    if (typeof mod.initHealthKit === 'function') {
+      AppleHealthKit = mod;
+    }
+  }
+  console.log('[App] AppleHealthKit resolved:', !!AppleHealthKit,
+    AppleHealthKit ? 'has initHealthKit: ' + typeof AppleHealthKit.initHealthKit : '');
+} catch (e) {
+  console.warn('[App] react-native-health not available:', e);
 }
 
 // Requests notification permission (if not already granted/denied) and, only if granted,
@@ -250,7 +296,7 @@ type ScreenId =
   | 'article-reader' | 'about' | 'specialisation'
   | 'symptom-tracker'
   | 'profile' | 'customize' | 'booking' | 'report' | 'health-connect' | 'score-history'
-  | 'streak-calendar';
+  | 'streak-calendar' | 'insights';
 
 type UserData = {
   gender: string;
@@ -1730,6 +1776,247 @@ function getTimeOfDayGreeting(): string {
 }
 
 // ============================================================
+// NOTIFICATION BELL PANEL (reads notification_log, no new writes)
+// ============================================================
+
+function formatNotifRelativeTime(iso: string): string {
+  const then = new Date(iso).getTime();
+  const diffSec = Math.max(0, Math.floor((Date.now() - then) / 1000));
+  if (diffSec < 60) return 'Just now';
+  const diffMin = Math.floor(diffSec / 60);
+  if (diffMin < 60) return `${diffMin}m ago`;
+  const diffHr = Math.floor(diffMin / 60);
+  if (diffHr < 24) return `${diffHr}h ago`;
+  const diffDay = Math.floor(diffHr / 24);
+  if (diffDay < 7) return `${diffDay}d ago`;
+  return new Date(iso).toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+}
+
+const NOTIF_TYPE_ICON: Record<string, { name: any; color: string }> = {
+  checkin_reminder: { name: 'flash-outline', color: '#F59E0B' },
+  streak_milestone: { name: 'flame', color: '#F59E0B' },
+  retest_reminder: { name: 'refresh-outline', color: '#4DA8FF' },
+  cycle_retest_push: { name: 'calendar-outline', color: '#7C5CFF' },
+  cycle_extend_nudge: { name: 'time-outline', color: '#7C5CFF' },
+  cycle_reset_nudge: { name: 'sparkles-outline', color: '#7C5CFF' },
+};
+const NOTIF_DEFAULT_ICON = { name: 'notifications-outline', color: '#EF4444' };
+
+// One row, swipe-left to dismiss. Same PanResponder/Animated.Value swipe pattern already
+// used for the "Today's 1% complete" dismiss card in HomeScreen — kept as its own component
+// (rather than reusing that exact instance) since each row needs independent gesture state
+// in a list, which a single shared PanResponder can't provide.
+function NotificationRow({ row, onDismiss, onDragStateChange, onPressRow }: { row: any; onDismiss: (id: string) => void; onDragStateChange: (dragging: boolean) => void; onPressRow: (row: any) => void }) {
+  const { colors } = useTheme();
+  const translateX = useRef(new Animated.Value(0)).current;
+  const panResponder = useRef(
+    PanResponder.create({
+      onStartShouldSetPanResponderCapture: () => false,
+      onMoveShouldSetPanResponderCapture: (_, g) => {
+        const claim = Math.abs(g.dx) > 6 && Math.abs(g.dx) > Math.abs(g.dy) * 1.5;
+        if (claim) console.log('[DEBUG notif-swipe] onMoveShouldSetPanResponderCapture CLAIMED — dx:', g.dx, 'dy:', g.dy);
+        return claim;
+      },
+      onMoveShouldSetPanResponder: (_, g) => Math.abs(g.dx) > 6 && Math.abs(g.dx) > Math.abs(g.dy) * 1.5,
+      // TEMPORARY diagnostic logging (2026-08-07) — remove once the swipe-dismiss root
+      // cause is confirmed on-device. Static code review (twice, including against the
+      // proven dismissPanResponder pattern on HomeScreen's Today's 1% card, which this
+      // mirrors line-for-line) found no logic discrepancy — there's no static-analysis or
+      // offline-probe equivalent for a touch/gesture bug the way there is for e.g. a DB
+      // grant issue, so this is instrumented instead of guessed at further. Watch for:
+      // does CLAIMED ever print at all (proves whether the ScrollView is winning the
+      // gesture before this row ever sees it)? Does GRANTED follow it? Does RELEASE fire
+      // with dx past -90? Does DISMISS actually get called?
+      onPanResponderGrant: () => {
+        console.log('[DEBUG notif-swipe] onPanResponderGrant — row.id:', row.id);
+        onDragStateChange(true);
+      },
+      onPanResponderMove: (_, g) => { if (g.dx < 0) translateX.setValue(g.dx); },
+      onPanResponderRelease: (_, g) => {
+        console.log('[DEBUG notif-swipe] onPanResponderRelease — row.id:', row.id, 'final dx:', g.dx, 'past threshold:', g.dx < -90);
+        onDragStateChange(false);
+        if (g.dx < -90) {
+          console.log('[DEBUG notif-swipe] dismissing row.id:', row.id);
+          Animated.timing(translateX, { toValue: -500, duration: 200, useNativeDriver: true }).start(() => onDismiss(row.id));
+        } else {
+          Animated.spring(translateX, { toValue: 0, useNativeDriver: true }).start();
+        }
+      },
+      onPanResponderTerminate: () => {
+        console.log('[DEBUG notif-swipe] onPanResponderTerminate — row.id:', row.id, '(responder was taken away mid-gesture, likely by the ScrollView or Modal)');
+        onDragStateChange(false);
+      },
+      onPanResponderTerminationRequest: () => false,
+    })
+  ).current;
+
+  const meta = row.metadata || {};
+  const iconInfo = NOTIF_TYPE_ICON[row.type] || NOTIF_DEFAULT_ICON;
+  // checkin_reminder's title is generic boilerplate ("Today's 1% is waiting") — the real,
+  // specific content is the personalized body (from pickCheckinContent's day-of-cycle
+  // teaser). Show body as the primary line for this type only; other types keep title
+  // primary + body as a secondary subtitle, unchanged. Falls back to title if a
+  // checkin_reminder row predates the body-logging fix (2026-08-07) and has none.
+  const isCheckinReminder = row.type === 'checkin_reminder';
+  const primaryText = isCheckinReminder ? (meta.body || meta.title || 'Notification') : (meta.title || 'Notification');
+  const secondaryText = isCheckinReminder ? null : meta.body;
+
+  return (
+    // Solid, fully opaque card (matching Home's other cards — e.g. the "protect itself"/
+    // Metabolic Story cards' own colors.card + border treatment) — deliberately more
+    // opaque than the translucent panel it sits in, so text stays legible regardless of
+    // what shows through behind the panel itself.
+    <Animated.View {...panResponder.panHandlers} style={{ transform: [{ translateX }], borderRadius: 16, backgroundColor: colors.card, borderWidth: 1, borderColor: colors.border, marginBottom: 10 }}>
+      {/* TouchableOpacity nested inside the X's own TouchableOpacity below is standard RN
+          behavior — a tap starting within the smaller inner X button's bounds is claimed
+          by that inner touchable, not this outer one, so dismiss and navigate never
+          conflict. A tap outside the X (title/body/icon/empty space) routes; the
+          PanResponder above only claims the responder on real horizontal movement, so a
+          simple tap still reaches this TouchableOpacity's onPress normally. */}
+      <TouchableOpacity activeOpacity={0.7} onPress={() => onPressRow(row)} style={{ flexDirection: 'row', gap: 12, padding: 14 }}>
+        <View style={{ width: 36, height: 36, borderRadius: 18, backgroundColor: `${iconInfo.color}20`, alignItems: 'center', justifyContent: 'center' }}>
+          <Ionicons name={iconInfo.name} size={16} color={iconInfo.color} />
+        </View>
+        <View style={{ flex: 1 }}>
+          <Text style={{ fontSize: 14, fontWeight: '700', color: colors.text }}>{primaryText}</Text>
+          {/* metadata.body only exists on rows logged after 2026-08-07 (see
+              metabolic-notification-worker.js) — older rows just show title, not an error. */}
+          {!!secondaryText && <Text style={{ fontSize: 12, color: colors.textSecondary, marginTop: 2, lineHeight: 17 }} numberOfLines={2}>{secondaryText}</Text>}
+          <Text style={{ fontSize: 10, color: colors.textTertiary, marginTop: 4 }}>{formatNotifRelativeTime(row.sent_at)}</Text>
+        </View>
+        {/* Explicit, gesture-free dismiss — guaranteed to work regardless of the swipe
+            investigation above. Swipe remains wired as a secondary option. */}
+        <TouchableOpacity onPress={() => onDismiss(row.id)} hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }} style={{ padding: 2 }}>
+          <Ionicons name="close" size={16} color={colors.textTertiary} />
+        </TouchableOpacity>
+      </TouchableOpacity>
+    </Animated.View>
+  );
+}
+
+// Panel over Home — dimmed backdrop (tap to close) + a card with its own X. Dismissing a
+// row is not persisted to notification_log (no read/dismissed column exists on that table,
+// and none was asked for) — instead it's tracked in HomeScreen's shared dismissedIds set
+// (not local to this component), so it survives closing/reopening the panel within the same
+// Home session, and so the bell badge (also derived from that same set) always matches what
+// this panel would actually show if opened right now — corrected 2026-08-07, this used to
+// be purely local state here and the badge was an independent, un-synced number.
+function NotificationBellPanel({ visible, onClose, dismissedIds, onDismiss: onDismissShared, onSelectRow }: { visible: boolean; onClose: () => void; dismissedIds: Set<string>; onDismiss: (id: string) => void; onSelectRow: (row: any) => void }) {
+  const { colors } = useTheme();
+  const [rows, setRows] = useState<any[] | null>(null);
+  // Set true the instant any row's swipe is actually granted, cleared on release/terminate
+  // — disables the list ScrollView's own scrolling for that window so it stops competing
+  // with the row's horizontal drag (see NotificationRow's onDragStateChange comment).
+  const [rowDragging, setRowDragging] = useState(false);
+
+  useEffect(() => {
+    if (!visible) return;
+    // dismissedIds deliberately NOT in this effect's deps — filtering happens once, using
+    // whatever was dismissed as of the moment the panel opens. Re-running this fetch on
+    // every dismiss (which a dismissedIds dependency would trigger, since it's a new Set
+    // reference each time) would mean a needless network round-trip and a visible flicker
+    // for something handleDismiss below already keeps correct locally + in the shared set.
+    notificationLog.list().then(fetched => {
+      const filtered = fetched.filter(r => !dismissedIds.has(r.id));
+      console.log('[DEBUG notif-empty] fetched:', fetched.length, 'after dismissedIds filter:', filtered.length);
+      setRows(filtered);
+    }).catch(() => setRows([]));
+  }, [visible]);
+
+  // TEMPORARY diagnostic (2026-08-07) — no logic bug found on code review for the
+  // "empty state doesn't show after clearing everything" report; this logs the real
+  // rows.length at the moment of every dismiss so the next device test gives actual
+  // numbers instead of another guess, same discipline as the swipe investigation.
+  const handleDismiss = (id: string) => {
+    setRows(prev => {
+      const next = (prev || []).filter(r => r.id !== id);
+      console.log('[DEBUG notif-empty] handleDismiss — id:', id, 'rows before:', prev?.length, 'after:', next.length);
+      return next;
+    });
+    onDismissShared(id);
+  };
+
+  const handleClearAll = () => {
+    console.log('[DEBUG notif-empty] handleClearAll — clearing', rows?.length, 'rows');
+    (rows || []).forEach(r => onDismissShared(r.id));
+    setRows([]);
+  };
+
+  return (
+    <Modal visible={visible} transparent animationType="fade" onRequestClose={onClose}>
+      {/* Modal presents its children in a separate native view hierarchy (its own
+          UIViewController on iOS) — the app-root SafeAreaProvider measures the main
+          window only, so insets don't reliably reach content inside a Modal even though
+          React Context nominally does. Confirmed 2026-08-08 as why the app-root
+          SafeAreaProvider fix (which corrected every normal screen) left this panel
+          rendering exactly as before. Nesting a nested SafeAreaProvider here gives this
+          Modal's own native window a fresh, correctly-measured insets source. */}
+      <SafeAreaProvider>
+        <TouchableWithoutFeedback onPress={onClose}>
+          <View style={{ flex: 1, backgroundColor: 'rgba(0,0,0,0.5)' }} />
+        </TouchableWithoutFeedback>
+        {/* top:0,left:0,right:0 gives this SafeAreaView a DEFINITE width (spans the full
+            screen unambiguously) rather than top:0,right:0 alone, which left it with no
+            explicit width/left and no way to size itself except from its own content —
+            circular against the child's width:'65%' (a percentage needs a definite parent
+            to resolve against). That collapsed the panel's real width toward zero, and its
+            overflow:hidden then clipped everything that would've overflowed a near-zero box
+            — confirmed 2026-08-07 as the root cause of both the invisible title/body text
+            and the wrapping "Notifications" header (same underlying bug, not two). The panel
+            itself right-anchors via alignSelf:'flex-end' now, not via the outer container's
+            own position. */}
+        <SafeAreaView style={{ position: 'absolute', top: 0, left: 0, right: 0 }} edges={['top']} pointerEvents="box-none">
+        {/* Narrow, top-right anchored (near the bell icon) rather than near-full-width —
+            65% of screen width. Background is a translucent tint of colors.card (the
+            "${color}HEX" alpha-suffix pattern already used throughout this file, e.g.
+            ${colors.red}20) rather than a real blur — chosen deliberately over expo-blur
+            for now (2026-08-07) to avoid a third un-rebuilt native dependency stacked on
+            top of expo-notifications/Sentry this same session; revisit real blur once
+            those get their rebuild. */}
+        <View style={{ width: '65%', alignSelf: 'flex-end', marginRight: 16, marginTop: 8, borderRadius: 20, backgroundColor: `${colors.card}E6`, maxHeight: '70%', overflow: 'hidden' }}>
+          <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', padding: 16, borderBottomWidth: 1, borderBottomColor: colors.border }}>
+            <Text style={{ fontSize: 15, fontWeight: '700', color: colors.text }} numberOfLines={1}>Notifications</Text>
+            <TouchableOpacity onPress={onClose} hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}>
+              <Ionicons name="close" size={20} color={colors.textSecondary} />
+            </TouchableOpacity>
+          </View>
+          {rows === null ? (
+            <View style={{ padding: 40, alignItems: 'center' }}>
+              <ActivityIndicator color={colors.red} />
+            </View>
+          ) : rows.length === 0 ? (
+            <View style={{ padding: 40, alignItems: 'center' }}>
+              <View style={{ width: 56, height: 56, borderRadius: 28, backgroundColor: `${colors.red}14`, alignItems: 'center', justifyContent: 'center', marginBottom: 12 }}>
+                <Ionicons name="checkmark-circle-outline" size={26} color={colors.red} />
+              </View>
+              {/* TEMPORARY diagnostic background (2026-08-07) — remove once confirmed. No
+                  logic bug found on code review this time (unlike the earlier title/body
+                  issue, which had a provable mechanism); this makes the actual rendered
+                  bounds of this Text visible regardless of its own text color, so the next
+                  screenshot distinguishes "renders but invisible" from "not in the tree at
+                  all" instead of guessing further. */}
+              <Text style={{ fontSize: 13, fontWeight: '600', color: colors.text, backgroundColor: 'yellow' }}>You're all caught up :)</Text>
+            </View>
+          ) : (
+            <>
+              <ScrollView style={{ maxHeight: 480 }} contentContainerStyle={{ padding: 12 }} scrollEnabled={!rowDragging}>
+                {rows.map(row => <NotificationRow key={row.id} row={row} onDismiss={handleDismiss} onDragStateChange={setRowDragging} onPressRow={(r) => { onClose(); onSelectRow(r); }} />)}
+              </ScrollView>
+              {/* Local-only, same as the per-card X — clears this panel's current view,
+                  not notification_log itself. Only shown with something to clear. */}
+              <TouchableOpacity onPress={handleClearAll} style={{ padding: 14, borderTopWidth: 1, borderTopColor: colors.border, alignItems: 'center' }}>
+                <Text style={{ fontSize: 13, fontWeight: '600', color: colors.red }}>Clear All</Text>
+              </TouchableOpacity>
+            </>
+          )}
+        </View>
+      </SafeAreaView>
+      </SafeAreaProvider>
+    </Modal>
+  );
+}
+
+// ============================================================
 // HOME SCREEN
 // ============================================================
 
@@ -1737,7 +2024,7 @@ function HomeScreen({ onNavigate, hasScore, scoreResult, onSelectLayer, onNaviga
   const { colors, theme, toggleTheme } = useTheme();
   const { user } = useAuth();
   const { clinicalDepth, toggleClinicalDepth } = useClinicalDepth();
-  const { fullName, cravings: loggedCravings, deleteCraving, symptoms: ctxSymptoms, scoreHistory, refreshCravings, conditions: ctxConditions, logCheckin } = useAppData();
+  const { fullName, cravings: loggedCravings, deleteCraving, symptoms: ctxSymptoms, scoreHistory, refreshCravings, conditions: ctxConditions, logCheckin, dismissedNotifIds, markNotifDismissed } = useAppData();
   useEffect(() => { refreshCravings(); }, [refreshCravings]);
   // Derived fresh every render from real data (hasScore/scoreResult come from AppDataContext,
   // scoreHistory is the live Supabase-backed list) — not captured once at mount, so it stays
@@ -1747,6 +2034,18 @@ function HomeScreen({ onNavigate, hasScore, scoreResult, onSelectLayer, onNaviga
   // link below), not derived data — null means "no override, follow the real data."
   const [previewOverride, setPreviewOverride] = useState<boolean | null>(null);
   const showPostTest = previewOverride ?? hasRealScore;
+  const [bellOpen, setBellOpen] = useState(false);
+  // Bell badge = 7-day activity minus whatever's been locally dismissed in the panel —
+  // corrected 2026-08-07, so the badge always matches what the panel would actually show
+  // if opened right now, not an independent raw count. dismissedNotifIds is the single
+  // shared source of truth for "dismissed," passed down to NotificationBellPanel so both
+  // the badge and the panel's own list read the same set. Lives in AppDataContext, not
+  // local useState here — confirmed root cause, 2026-08-07: this screen fully unmounts on
+  // every navigation away and back (see CLAUDE.md), so component-local state here doesn't
+  // survive a Home → Profile → Home round trip the way "session-local" was meant to.
+  const [notif7dRows, setNotif7dRows] = useState<{ id: string }[]>([]);
+  useEffect(() => { notificationLog.listLast7Days().then(setNotif7dRows).catch(() => {}); }, []);
+  const notifCount7d = notif7dRows.filter(r => !dismissedNotifIds.has(r.id)).length;
   const [streak, setStreak] = useState(0);
   const [myBooking, setMyBooking] = useState<any>(null);
   useEffect(() => { booking.getMyBooking().then(setMyBooking).catch(() => {}); }, []);
@@ -1807,6 +2106,17 @@ function HomeScreen({ onNavigate, hasScore, scoreResult, onSelectLayer, onNaviga
     if (!highlightTodaysOne) return;
     triggerTodaysOneBlink();
   }, [highlightTodaysOne]);
+  // Bell-panel row tap routing. checkin_reminder and streak_milestone both trigger the same
+  // Today's 1% blink a "Want to work on this?" cascade tap would — restored 2026-08-07
+  // alongside the Today's 1% card itself, so the push listener and the in-app bell panel
+  // land on the same place for the same notification types instead of diverging.
+  const handleSelectNotification = (row: any) => {
+    if (row.type === 'checkin_reminder' || row.type === 'streak_milestone') {
+      triggerTodaysOneBlink();
+    } else if (row.type === 'retest_reminder') {
+      onNavigate('score');
+    }
+  };
   // Same safe pattern as Today's 1% — opacity only, never border/padding, so it can't shake
   // the layout the way an earlier attempt at this did. Fires once whenever Clinical Depth
   // turns off, drawing attention to the new qualitative framing appearing in its place.
@@ -1918,9 +2228,18 @@ function HomeScreen({ onNavigate, hasScore, scoreResult, onSelectLayer, onNaviga
   const layerScores: Record<number, number> = scoreResult?.sc ?? fallbackLayerScores ?? {};
   const hasLayerScores = Object.keys(layerScores).length > 0;
   const sortedLayers = hasLayerScores ? [...LAYERS].sort((a, b) => (layerScores[a.id] ?? 0) - (layerScores[b.id] ?? 0)) : LAYERS;
+  // Corrected 2026-08-07: this was the one field the earlier scoreResult-vs-scoreHistory
+  // fallback pass (score/band/dominantLayerId/layerScores above, Metabolic Story, Latest
+  // Insights, Case Studies, cravings, symptoms) missed — it read scoreResult.history only,
+  // with no fallback to the persisted equivalent, so "Your Signal" quotes silently vanished
+  // after sign-in without retaking the quiz. Same ?? fallback precedence as layerScores
+  // above, not a new pattern: scoreResult.history and ScoreHistoryEntry.answers are the
+  // same shape (saveScore stores result.history verbatim as .answers), so this is a direct
+  // swap of the source array, not a new derivation.
   const getLayerSignal = (layerId: number): string | null => {
-    if (!scoreResult?.history) return null;
-    const layerQs = scoreResult.history.filter((h: any) => h.layer === layerId);
+    const history = scoreResult?.history ?? latestHistory?.answers;
+    if (!history) return null;
+    const layerQs = history.filter((h: any) => h.layer === layerId);
     if (layerQs.length === 0) return null;
     const worst = layerQs.sort((a: any, b: any) => a.score - b.score)[0];
     if (!worst?.selected?.length) return null;
@@ -2028,10 +2347,14 @@ function HomeScreen({ onNavigate, hasScore, scoreResult, onSelectLayer, onNaviga
               <TouchableOpacity onPress={toggleTheme} style={{ width: 40, height: 40, borderRadius: 20, backgroundColor: colors.card, borderWidth: 1, borderColor: colors.border, alignItems: 'center', justifyContent: 'center' }}>
                 <Ionicons name={theme === 'dark' ? 'sunny' : theme === 'light' ? 'moon' : 'star'} size={16} color={colors.text} />
               </TouchableOpacity>
-              <View style={{ width: 40, height: 40, borderRadius: 20, backgroundColor: colors.card, borderWidth: 1, borderColor: colors.border, alignItems: 'center', justifyContent: 'center' }}>
+              <TouchableOpacity onPress={() => setBellOpen(true)} style={{ width: 40, height: 40, borderRadius: 20, backgroundColor: colors.card, borderWidth: 1, borderColor: colors.border, alignItems: 'center', justifyContent: 'center' }}>
                 <Ionicons name="notifications" size={16} color={colors.text} />
-                <View style={{ position: 'absolute', top: 8, right: 9, width: 7, height: 7, borderRadius: 4, backgroundColor: colors.red }} />
-              </View>
+                {notifCount7d > 0 && (
+                  <View style={{ position: 'absolute', top: -3, right: -3, minWidth: 16, height: 16, borderRadius: 8, backgroundColor: colors.red, alignItems: 'center', justifyContent: 'center', paddingHorizontal: 3 }}>
+                    <Text style={{ fontSize: 9, fontWeight: '700', color: '#fff' }}>{notifCount7d > 9 ? '9+' : notifCount7d}</Text>
+                  </View>
+                )}
+              </TouchableOpacity>
               <TouchableOpacity onPress={() => onNavigate('profile')} style={{ width: 40, height: 40, borderRadius: 20, backgroundColor: colors.card, borderWidth: 1, borderColor: colors.border, alignItems: 'center', justifyContent: 'center' }}>
                 <Text style={{ fontSize: 13, fontWeight: '700', color: colors.text }}>{(fullName || user?.email || 'A').charAt(0).toUpperCase()}</Text>
               </TouchableOpacity>
@@ -2552,6 +2875,7 @@ function HomeScreen({ onNavigate, hasScore, scoreResult, onSelectLayer, onNaviga
         </ScrollView>
         <BottomNav active="home" onNavigate={onNavigate} hasScore={hasScore} />
       </SafeAreaView>
+      <NotificationBellPanel visible={bellOpen} onClose={() => setBellOpen(false)} dismissedIds={dismissedNotifIds} onDismiss={markNotifDismissed} onSelectRow={handleSelectNotification} />
     </View>
   );
 }
@@ -3514,6 +3838,757 @@ function ResultsScreen({ onNavigate, result, userData, autoExpandN3, onSelectLay
 }
 
 // ============================================================
+// INSIGHTS HUB SCREEN (Insights tab entry point — bottom nav destination)
+// ============================================================
+
+function InsightsHubScreen({ onNavigate, hasScore, scoreResult }: { onNavigate: (s: ScreenId) => void; hasScore?: boolean; scoreResult?: any }) {
+  const { colors } = useTheme();
+  const { clinicalDepth } = useClinicalDepth();
+  const { scoreHistory } = useAppData();
+  const latestHistory = scoreHistory[0];
+  const prevHistory = scoreHistory[1];
+
+  const dominantLayerId = scoreResult?.dominantLayer ?? latestHistory?.dominant_layer ?? null;
+  const dominantLayer = dominantLayerId ? LAYERS[dominantLayerId - 1] : null;
+  const dominantLayerDisplayName = dominantLayer
+    ? (clinicalDepth ? dominantLayer.name : LAYER_PLAIN_SHORT[dominantLayerId - 1])
+    : null;
+
+  const [streak, setStreak] = useState(0);
+  const [actionDoneDates, setActionDoneDates] = useState<string[]>([]);
+  const [cravingDates, setCravingDates] = useState<string[]>([]);
+  const [healthConnected, setHealthConnected] = useState(false);
+  const [showThenNow, setShowThenNow] = useState(false);
+  const [healthData, setHealthData] = useState<Record<string, any> | null>(null);
+
+  useEffect(() => {
+    AsyncStorage.getItem('ms_action_done_dates').then(saved => {
+      let dates: string[] = [];
+      if (saved) { try { dates = JSON.parse(saved); } catch { dates = []; } }
+      setActionDoneDates(dates);
+      setStreak(computeStreak(dates));
+    }).catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    AsyncStorage.getItem('ms_cravings').then(saved => {
+      if (saved) { try { setCravingDates(JSON.parse(saved).map((c: any) => c.date || c.created_at || '').filter(Boolean)); } catch {} }
+    }).catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    AsyncStorage.getItem('ms_health_sync_time').then(v => setHealthConnected(!!v)).catch(() => {});
+    AsyncStorage.getItem('ms_health_data').then(v => { if (v) { try { setHealthData(JSON.parse(v)); } catch {} } }).catch(() => {});
+  }, []);
+
+  const totalScore = scoreResult?.totalScore ?? latestHistory?.total_score ?? 0;
+  const answers = scoreResult?.history ?? latestHistory?.answers;
+  const { avail: pointsAvailable, weeks: pointsWeeks } = computePointsAvailable(answers, totalScore);
+  const hasRealScore = hasScore || !!scoreResult || scoreHistory.length > 0;
+
+  const layerKeys: { key: 'layer1'|'layer2'|'layer3'|'layer4'|'layer5'; layer: typeof LAYERS[0] }[] = [
+    { key: 'layer1', layer: LAYERS[0] }, { key: 'layer2', layer: LAYERS[1] },
+    { key: 'layer3', layer: LAYERS[2] }, { key: 'layer4', layer: LAYERS[3] },
+    { key: 'layer5', layer: LAYERS[4] },
+  ];
+
+  // ── Derived data for cards ──
+
+  // Sparkline data: last N total scores (newest first → reverse for left-to-right)
+  const sparkData = scoreHistory.slice(0, 8).map(s => s.total_score).reverse();
+
+  // Brief from generateWeeklyBrief
+  const brief = useMemo(() => generateWeeklyBrief(scoreHistory.slice(0, 8).map(s => ({ total_score: s.total_score, date: s.date }))), [scoreHistory]);
+
+  // Layer deltas (latest vs previous)
+  const layerDeltas = useMemo(() => {
+    if (!latestHistory || !prevHistory) return null;
+    return layerKeys.map(({ key, layer }) => {
+      const cur = latestHistory[key] ?? 0;
+      const prev = prevHistory[key] ?? 0;
+      return { layer, key, cur, prev, delta: cur - prev };
+    });
+  }, [latestHistory, prevHistory]);
+
+  // Most improved / most declined layer
+  const biggestMover = useMemo(() => {
+    if (!layerDeltas) return null;
+    const best = layerDeltas.reduce((a, b) => b.delta > a.delta ? b : a);
+    return best.delta !== 0 ? best : null;
+  }, [layerDeltas]);
+
+  // Layer trend data for chart (requires >= 3 assessments)
+  const layerTrendData = useMemo(() => {
+    if (scoreHistory.length < 3) return null;
+    const reversed = [...scoreHistory].reverse().slice(0, 10); // oldest first, max 10
+    return layerKeys.map(({ key, layer }) => ({
+      layer,
+      points: reversed.map(s => s[key] ?? 0),
+    }));
+  }, [scoreHistory]);
+
+  // Weekly insight map: last 7 days
+  const weekDays = useMemo(() => {
+    const days: { dateStr: string; label: string; short: string; hasAction: boolean; hasCraving: boolean; hasAssessment: boolean; assessmentScore?: number }[] = [];
+    const today = new Date();
+    for (let i = 6; i >= 0; i--) {
+      const d = new Date(today);
+      d.setDate(d.getDate() - i);
+      const dateStr = d.toISOString().slice(0, 10);
+      days.push({
+        dateStr,
+        label: d.toLocaleDateString('en-US', { weekday: 'short' }),
+        short: d.getDate().toString(),
+        hasAction: actionDoneDates.includes(dateStr),
+        hasCraving: cravingDates.some(cd => cd.startsWith(dateStr)),
+        hasAssessment: scoreHistory.some(s => { try { return new Date(s.date).toISOString().slice(0, 10) === dateStr; } catch { return false; } }),
+        assessmentScore: scoreHistory.find(s => { try { return new Date(s.date).toISOString().slice(0, 10) === dateStr; } catch { return false; } })?.total_score,
+      });
+    }
+    return days;
+  }, [actionDoneDates, cravingDates, scoreHistory]);
+
+  // Keep / Watch insights
+  const keepWatch = useMemo(() => {
+    if (!layerDeltas) return null;
+    const keepItems = layerDeltas.filter(d => d.delta > 0).sort((a, b) => b.delta - a.delta);
+    const watchItems = layerDeltas.filter(d => d.delta < 0).sort((a, b) => a.delta - b.delta);
+    return { keep: keepItems, watch: watchItems };
+  }, [layerDeltas]);
+
+  // Health metrics with week-over-week (placeholder structure for when health sync is real)
+  const healthMetrics = useMemo(() => {
+    if (!healthData) return null;
+    return healthData;
+  }, [healthData]);
+
+  // ── WEARABLE DAILY INSIGHTS ──
+  const wearableInsights = useMemo(() => {
+    if (!healthMetrics) return [];
+    const insights: { icon: string; color: string; title: string; body: string }[] = [];
+    // Get quiz answers for context (sleep Q1, stress Q2)
+    const answers = scoreResult?.history ?? latestHistory?.answers;
+    const q1Sleep = answers?.[0]; // first quiz question about sleep
+    const q2Stress = answers?.[1]; // second quiz question about stress
+    const sleepScore = latestHistory?.layer1;
+    const neuroScore = latestHistory?.layer2;
+    const metabolicScore = latestHistory?.layer3;
+
+    // Sleep insight — connect to Layer 1 (Circadian) score
+    const sleepAvg = parseFloat(healthMetrics.total_sleep_avg || '0');
+    if (sleepAvg > 0 && sleepScore != null) {
+      if (sleepAvg < 6 && sleepScore < 10) {
+        insights.push({ icon: 'moon', color: '#EF4444', title: 'Sleep + Circadian Rhythm Needs Work', body: `You're averaging ${healthMetrics.total_sleep_avg}h and your Circadian layer scores ${sleepScore}/20. Irregular sleep timing directly suppresses melatonin and cortisol cycling. Your quiz confirms this — focus on a fixed bedtime within the next 3 days.` });
+      } else if (sleepAvg < 6 && sleepScore >= 10) {
+        insights.push({ icon: 'moon', color: '#F59E0B', title: 'Sleep Duration Below Target', body: `Averaging ${healthMetrics.total_sleep_avg}h despite a decent Circadian score (${sleepScore}/20). Your rhythm is okay but you're not getting enough hours. Even 30 minutes earlier could move the needle.` });
+      } else if (sleepAvg >= 7 && sleepAvg <= 9) {
+        insights.push({ icon: 'moon', color: '#22C55E', title: 'Sleep Aligns With Your Score', body: `${healthMetrics.total_sleep_avg}h average supports your Circadian score of ${sleepScore}/20. Your bedtime consistency is reinforcing the rhythm your body needs.` });
+      } else if (sleepAvg > 9) {
+        insights.push({ icon: 'moon', color: '#F59E0B', title: 'Oversleeping Detected', body: `Averaging ${healthMetrics.total_sleep_avg}h may indicate recovery debt. Combined with your Circadian score of ${sleepScore}/20, focus on sleep quality over quantity.` });
+      }
+    }
+    // HRV insight — connect to Layer 2 (Neurochemical) and stress
+    const hrvVal = parseInt(healthMetrics.hrv_avg || '0');
+    if (hrvVal > 0) {
+      if (hrvVal < 30 && neuroScore != null && neuroScore < 10) {
+        insights.push({ icon: 'heart-circle', color: '#EF4444', title: 'Low HRV Matches Stress Pattern', body: `${healthMetrics.hrv_avg}ms HRV and your Neurochemical layer at ${neuroScore}/20 both signal elevated sympathetic load. Your quiz stress answer (${q2Stress === 1 || q2Stress === 2 ? 'high' : 'moderate'}) confirms this. Breathwork and reducing caffeine after noon will help.` });
+      } else if (hrvVal >= 50) {
+        insights.push({ icon: 'heart-circle', color: '#22C55E', title: 'Strong Recovery Capacity', body: `${healthMetrics.hrv_avg}ms HRV shows good parasympathetic tone${neuroScore != null ? ` — aligned with your Neurochemical score of ${neuroScore}/20` : ''}. Your nervous system is handling stress well.` });
+      }
+      const hrvWow = healthMetrics.hrv_wow;
+      if (hrvWow && Math.abs(hrvWow) >= 5) {
+        insights.push({ icon: 'trending-up', color: hrvWow > 0 ? '#22C55E' : '#EF4444', title: hrvWow > 0 ? 'HRV Trending Up' : 'HRV Dropping', body: hrvWow > 0 ? `HRV is up ${hrvWow}ms week-over-week — your stress resilience is improving. This should reflect in your next Neurochemical layer score.` : `HRV is down ${Math.abs(hrvWow)}ms. This often precedes a dip in Neurochemical and Metabolic scores. Consider lighter movement and an earlier bedtime tonight.` });
+      }
+    }
+    // RHR insight — connect to Layer 3 (Metabolic)
+    const rhrVal = parseInt(healthMetrics.rhr_avg || '0');
+    if (rhrVal > 0 && metabolicScore != null) {
+      if (rhrVal > 75) {
+        insights.push({ icon: 'heart', color: '#F59E0B', title: 'Elevated RHR & Metabolic Load', body: `${healthMetrics.rhr_avg}bpm with a Metabolic score of ${metabolicScore}/20 suggests your body is under metabolic stress. This could be from poor sleep recovery, high caffeine, or insufficient movement.` });
+      } else if (rhrVal <= 60 && metabolicScore >= 12) {
+        insights.push({ icon: 'heart', color: '#22C55E', title: 'RHR Confirms Metabolic Efficiency', body: `${healthMetrics.rhr_avg}bpm resting heart rate aligns with your strong Metabolic score (${metabolicScore}/20). Your cardiovascular system is operating efficiently.` });
+      }
+    }
+    return insights.slice(0, 3);
+  }, [healthMetrics, scoreResult, latestHistory]);
+
+  // ── SVG Sparkline Component ──
+  const renderSparkline = (data: number[], width = 120, height = 40, color = '#22C55E', fillColor = '#22C55E') => {
+    if (data.length < 2) return null;
+    const min = Math.min(...data) - 2;
+    const max = Math.max(...data) + 2;
+    const range = Math.max(max - min, 1);
+    const pts = data.map((v, i) => {
+      const x = (i / (data.length - 1)) * width;
+      const y = height - ((v - min) / range) * height;
+      return `${x.toFixed(1)},${y.toFixed(1)}`;
+    });
+    const linePath = `M${pts.join(' L')}`;
+    const areaPath = `${linePath} L${width},${height} L0,${height} Z`;
+    return (
+      <Svg width={width} height={height} style={{ marginLeft: 'auto' }}>
+        <Path d={areaPath} fill={`${fillColor}15`} />
+        <Path d={linePath} fill="none" stroke={color} strokeWidth={2} strokeLinecap="round" strokeLinejoin="round" />
+        {data.map((v, i) => {
+          const x = (i / (data.length - 1)) * width;
+          const y = height - ((v - min) / range) * height;
+          return i === data.length - 1 ? (
+            <Circle key={i} cx={x} cy={y} r={3} fill={color} />
+          ) : null;
+        })}
+      </Svg>
+    );
+  };
+
+  // ── Layer Trend SVG (5 overlaid lines) ──
+  const renderLayerTrend = () => {
+    if (!layerTrendData) return null;
+    const W = SCREEN_WIDTH - 48; // 24px padding each side
+    const H = 100;
+    const padTop = 8, padBot = 18;
+    const plotH = H - padTop - padBot;
+    const n = layerTrendData[0].points.length;
+    if (n < 2) return null;
+    return (
+      <View style={{ marginTop: 16 }}>
+        <Svg width={W} height={H}>
+          {/* Threshold lines */}
+          <Line x1={0} y1={padTop + plotH * (1 - 14 / 20)} x2={W} y2={padTop + plotH * (1 - 14 / 20)} stroke={`${colors.textTertiary}30`} strokeDasharray={[4, 4]} strokeWidth={1} />
+          <Line x1={0} y1={padTop + plotH * (1 - 9 / 20)} x2={W} y2={padTop + plotH * (1 - 9 / 20)} stroke={`${colors.textTertiary}30`} strokeDasharray={[4, 4]} strokeWidth={1} />
+          <SvgText x={W - 4} y={padTop + plotH * (1 - 14 / 20) - 4} fill={colors.textTertiary} fontSize={8} textAnchor="end">14</SvgText>
+          <SvgText x={W - 4} y={padTop + plotH * (1 - 9 / 20) - 4} fill={colors.textTertiary} fontSize={8} textAnchor="end">9</SvgText>
+          {/* Layer lines */}
+          {layerTrendData.map(({ layer, points }) => {
+            const pts = points.map((v, i) => {
+              const x = n === 1 ? W / 2 : (i / (n - 1)) * W;
+              const y = padTop + plotH * (1 - v / 20);
+              return `${x.toFixed(1)},${y.toFixed(1)}`;
+            });
+            return (
+              <G key={layer.id}>
+                <Path d={`M${pts.join(' L')}`} fill="none" stroke={layer.color} strokeWidth={2} strokeLinecap="round" strokeLinejoin="round" opacity={0.85} />
+                {points.map((v, i) => {
+                  const x = n === 1 ? W / 2 : (i / (n - 1)) * W;
+                  const y = padTop + plotH * (1 - v / 20);
+                  return <Circle key={i} cx={x} cy={y} r={i === points.length - 1 ? 4 : 2.5} fill={layer.color} />;
+                })}
+              </G>
+            );
+          })}
+        </Svg>
+        {/* Legend */}
+        <View style={{ flexDirection: 'row', justifyContent: 'center', flexWrap: 'wrap', gap: 12, marginTop: 8 }}>
+          {LAYERS.map(l => (
+            <View key={l.id} style={{ flexDirection: 'row', alignItems: 'center', gap: 4 }}>
+              <View style={{ width: 8, height: 8, borderRadius: 4, backgroundColor: l.color }} />
+              <Text style={{ fontSize: 9, fontWeight: '600', color: colors.textSecondary }}>{clinicalDepth ? l.shortName.split(' \u2014 ')[1] : LAYER_PLAIN_SHORT[l.id - 1]}</Text>
+            </View>
+          ))}
+        </View>
+      </View>
+    );
+  };
+
+  // ── Delta helper ──
+  const deltaText = (d: number) => {
+    if (d > 0) return { text: `\u2191 +${d}`, color: '#22C55E' };
+    if (d < 0) return { text: `\u2193 ${d}`, color: '#EF4444' };
+    return { text: '\u2192 0', color: colors.textTertiary };
+  };
+
+  return (
+    <View style={{ flex: 1, backgroundColor: colors.bg }}>
+      <SafeAreaView style={{ flex: 1 }} edges={['top']}>
+        <ScrollView style={{ flex: 1 }} contentContainerStyle={{ paddingBottom: 100 }} showsVerticalScrollIndicator={false}>
+          <View style={{ paddingHorizontal: 24, paddingTop: 12, paddingBottom: 12 }}>
+            <Text style={{ fontSize: 24, fontWeight: '700', color: colors.text }}>Insights</Text>
+            <Text style={{ fontSize: 14, color: colors.textSecondary, marginTop: 4 }}>Your progress, patterns, and trends.</Text>
+          </View>
+
+          {!hasRealScore ? (
+            <View style={{ paddingHorizontal: 24, marginTop: 40, alignItems: 'center' }}>
+              <View style={{ width: 72, height: 72, borderRadius: 20, backgroundColor: `${colors.red}14`, alignItems: 'center', justifyContent: 'center', marginBottom: 16 }}>
+                <Ionicons name="bulb-outline" size={32} color={colors.red} />
+              </View>
+              <Text style={{ fontSize: 14, fontWeight: '600', color: colors.text, textAlign: 'center' }}>Take your first Metabolic Score to unlock Insights.</Text>
+              <TouchableOpacity onPress={() => onNavigate('score')} style={{ marginTop: 20, backgroundColor: colors.red, paddingVertical: 12, paddingHorizontal: 24, borderRadius: 12 }}>
+                <Text style={{ color: '#fff', fontSize: 14, fontWeight: '700' }}>Take the Test</Text>
+              </TouchableOpacity>
+            </View>
+          ) : (
+            <View style={{ paddingHorizontal: 24, gap: 16 }}>
+
+              {/* ═══════════════════════════════════════════════════════════
+                  1. HERO CARD — Your Week at a Glance
+                 ═══════════════════════════════════════════════════════════ */}
+              <TouchableOpacity activeOpacity={0.7} onPress={() => setShowThenNow(!showThenNow)} style={{ borderRadius: 20, padding: 20, backgroundColor: colors.card }}>
+                <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'flex-start' }}>
+                  <View style={{ flex: 1 }}>
+                    <Text style={{ fontSize: 11, fontWeight: '700', letterSpacing: 1, color: colors.textSecondary, textTransform: 'uppercase' }}>Your Progress</Text>
+                    <View style={{ flexDirection: 'row', alignItems: 'baseline', gap: 6, marginTop: 8 }}>
+                      <Text style={{ fontSize: 36, fontWeight: '900', color: colors.text, lineHeight: 38 }}>{totalScore}</Text>
+                      <Text style={{ fontSize: 14, color: colors.textTertiary }}>/100</Text>
+                    </View>
+                    {scoreHistory.length >= 2 && (
+                      <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6, marginTop: 4 }}>
+                        {(() => {
+                          const d = totalScore - (prevHistory?.total_score ?? totalScore);
+                          const dt = deltaText(d);
+                          return <Text style={{ fontSize: 13, fontWeight: '700', color: dt.color }}>{dt.text}</Text>;
+                        })()}
+                        <Text style={{ fontSize: 12, color: colors.textTertiary }}>since last</Text>
+                      </View>
+                    )}
+                    {scoreHistory.length === 1 && (
+                      <Text style={{ fontSize: 12, color: colors.textTertiary, marginTop: 4 }}>Baseline — retake in ~2 weeks</Text>
+                    )}
+                  </View>
+                  {sparkData.length >= 2 && renderSparkline(sparkData, 120, 40, brief.trend === 'improving' ? '#22C55E' : brief.trend === 'declining' ? '#EF4444' : colors.textTertiary, brief.trend === 'improving' ? '#22C55E' : brief.trend === 'declining' ? '#EF4444' : colors.textTertiary)}
+                </View>
+                {/* Brief line */}
+                <View style={{ marginTop: 14, paddingTop: 14, borderTopWidth: 1, borderTopColor: colors.border }}>
+                  <Text style={{ fontSize: 13, lineHeight: 19, color: colors.textSecondary }}>{brief.line}</Text>
+                </View>
+                {biggestMover && (
+                  <View style={{ marginTop: 10, flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+                    <View style={{ width: 6, height: 6, borderRadius: 3, backgroundColor: biggestMover.layer.color }} />
+                    <Text style={{ fontSize: 11, fontWeight: '600', color: colors.textSecondary }}>
+                      Biggest mover: {clinicalDepth ? biggestMover.layer.shortName.split(' \u2014 ')[1] : LAYER_PLAIN_SHORT[biggestMover.layer.id - 1]} {deltaText(biggestMover.delta).text}
+                    </Text>
+                  </View>
+                )}
+                {/* Expand hint */}
+                {layerDeltas && (
+                  <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 4, marginTop: 12 }}>
+                    <Text style={{ fontSize: 11, color: colors.red, fontWeight: '600' }}>{showThenNow ? 'Hide layer breakdown' : 'See layer breakdown'}</Text>
+                    <Ionicons name={showThenNow ? 'chevron-up' : 'chevron-down'} size={14} color={colors.red} />
+                  </View>
+                )}
+              </TouchableOpacity>
+
+              {/* ═══════════════════════════════════════════════════════════
+                  2. SCORE COMPARISON — Then vs Now (expandable)
+                 ═══════════════════════════════════════════════════════════ */}
+              {showThenNow && layerDeltas && (
+                <View style={{ borderRadius: 20, padding: 20, backgroundColor: colors.card }}>
+                  <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8, marginBottom: 4 }}>
+                    <Ionicons name="swap-horizontal" size={14} color={colors.textSecondary} />
+                    <Text style={{ fontSize: 11, fontWeight: '700', letterSpacing: 1, color: colors.textSecondary, textTransform: 'uppercase' }}>Then vs Now</Text>
+                  </View>
+                  <Text style={{ fontSize: 12, color: colors.textTertiary, marginBottom: 14 }}>{prevHistory?.date} {'\u2192'} {latestHistory?.date}</Text>
+
+                  {/* Total row */}
+                  <View style={{ flexDirection: 'row', alignItems: 'center', paddingVertical: 8, borderBottomWidth: 1, borderBottomColor: colors.border }}>
+                    <Text style={{ fontSize: 12, fontWeight: '700', color: colors.text, width: 70 }}>Total</Text>
+                    <Text style={{ flex: 1, fontSize: 13, fontWeight: '600', color: colors.textTertiary, textAlign: 'center' }}>{prevHistory?.total_score ?? 0}</Text>
+                    <Text style={{ width: 24, textAlign: 'center', fontSize: 11, color: colors.textTertiary }}>{'\u2192'}</Text>
+                    <Text style={{ flex: 1, fontSize: 15, fontWeight: '800', color: colors.text, textAlign: 'center' }}>{latestHistory?.total_score ?? 0}</Text>
+                    <View style={{ width: 50, alignItems: 'flex-end' }}>
+                      {(() => {
+                        const d = (latestHistory?.total_score ?? 0) - (prevHistory?.total_score ?? 0);
+                        const dt = deltaText(d);
+                        return <Text style={{ fontSize: 12, fontWeight: '700', color: dt.color }}>{dt.text}</Text>;
+                      })()}
+                    </View>
+                  </View>
+
+                  {/* Layer rows */}
+                  {layerDeltas.map(({ layer, cur, prev, delta }) => {
+                    const dt = deltaText(delta);
+                    const barColor = cur >= 14 ? '#22C55E' : cur >= 9 ? '#F59E0B' : '#EF4444';
+                    return (
+                      <View key={layer.id} style={{ flexDirection: 'row', alignItems: 'center', paddingVertical: 7, borderBottomWidth: 1, borderBottomColor: `${colors.border}60` }}>
+                        <View style={{ width: 70, flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+                          <LayerIcon name={layer.icon} size={12} color={layer.color} />
+                          <Text style={{ fontSize: 11, fontWeight: '600', color: colors.textSecondary }}>L{layer.id}</Text>
+                        </View>
+                        <Text style={{ flex: 1, fontSize: 12, fontWeight: '600', color: colors.textTertiary, textAlign: 'center' }}>{prev}</Text>
+                        <Text style={{ width: 24, textAlign: 'center', fontSize: 10, color: colors.textTertiary }}>{'\u2192'}</Text>
+                        <Text style={{ flex: 1, fontSize: 13, fontWeight: '800', color: barColor, textAlign: 'center' }}>{cur}</Text>
+                        <View style={{ width: 50, alignItems: 'flex-end' }}>
+                          <Text style={{ fontSize: 11, fontWeight: '700', color: dt.color }}>{dt.text}</Text>
+                        </View>
+                      </View>
+                    );
+                  })}
+                </View>
+              )}
+
+              {/* ═══════════════════════════════════════════════════════════
+                  3. WEEKLY INSIGHT MAP — 7-Day View
+                 ═══════════════════════════════════════════════════════════ */}
+              <View style={{ borderRadius: 20, padding: 20, backgroundColor: colors.card }}>
+                <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8, marginBottom: 16 }}>
+                  <Ionicons name="calendar" size={14} color={colors.textSecondary} />
+                  <Text style={{ fontSize: 11, fontWeight: '700', letterSpacing: 1, color: colors.textSecondary, textTransform: 'uppercase' }}>This Week</Text>
+                </View>
+                {/* Day columns */}
+                <View style={{ flexDirection: 'row', justifyContent: 'space-between' }}>
+                  {weekDays.map(day => (
+                    <View key={day.dateStr} style={{ alignItems: 'center', gap: 6, flex: 1 }}>
+                      <Text style={{ fontSize: 10, fontWeight: '600', color: day.dateStr === new Date().toISOString().slice(0, 10) ? colors.text : colors.textTertiary }}>{day.label}</Text>
+                      <View style={{ width: 36, height: 52, borderRadius: 12, backgroundColor: day.dateStr === new Date().toISOString().slice(0, 10) ? `${colors.red}14` : colors.bg, alignItems: 'center', justifyContent: 'center', gap: 3, borderWidth: day.dateStr === new Date().toISOString().slice(0, 10) ? 1 : 0, borderColor: `${colors.red}40` }}>
+                        {day.hasAssessment && day.assessmentScore != null ? (
+                          <View style={{ backgroundColor: `${colors.red}20`, paddingHorizontal: 4, paddingVertical: 1, borderRadius: 6 }}>
+                            <Text style={{ fontSize: 11, fontWeight: '800', color: colors.red }}>{day.assessmentScore}</Text>
+                          </View>
+                        ) : null}
+                        {day.hasAction && !day.hasAssessment && (
+                          <Ionicons name="flame" size={14} color="#F59E0B" />
+                        )}
+                        {day.hasCraving && !day.hasAction && !day.hasAssessment && (
+                          <View style={{ width: 6, height: 6, borderRadius: 3, backgroundColor: '#00D9A3' }} />
+                        )}
+                        {!day.hasAction && !day.hasCraving && !day.hasAssessment && (
+                          <View style={{ width: 6, height: 6, borderRadius: 3, backgroundColor: `${colors.textTertiary}30` }} />
+                        )}
+                      </View>
+                      <Text style={{ fontSize: 9, color: colors.textTertiary }}>{day.short}</Text>
+                    </View>
+                  ))}
+                </View>
+                {/* Legend */}
+                <View style={{ flexDirection: 'row', justifyContent: 'center', gap: 16, marginTop: 14, paddingTop: 12, borderTopWidth: 1, borderTopColor: colors.border }}>
+                  <View style={{ flexDirection: 'row', alignItems: 'center', gap: 4 }}>
+                    <Ionicons name="flame" size={10} color="#F59E0B" />
+                    <Text style={{ fontSize: 10, color: colors.textTertiary }}>Habit done</Text>
+                  </View>
+                  <View style={{ flexDirection: 'row', alignItems: 'center', gap: 4 }}>
+                    <View style={{ width: 6, height: 6, borderRadius: 3, backgroundColor: '#00D9A3' }} />
+                    <Text style={{ fontSize: 10, color: colors.textTertiary }}>Craving</Text>
+                  </View>
+                  <View style={{ flexDirection: 'row', alignItems: 'center', gap: 4 }}>
+                    <View style={{ width: 14, height: 14, borderRadius: 5, backgroundColor: `${colors.red}20`, alignItems: 'center', justifyContent: 'center' }}>
+                      <Text style={{ fontSize: 7, fontWeight: '800', color: colors.red }}>N</Text>
+                    </View>
+                    <Text style={{ fontSize: 10, color: colors.textTertiary }}>Score</Text>
+                  </View>
+                </View>
+                {/* Meaningful weekly summary */}
+                {(() => {
+                  const habitsDone = weekDays.filter(d => d.hasAction).length;
+                  const cravingsLogged = weekDays.filter(d => d.hasCraving).length;
+                  const assessmentsTaken = weekDays.filter(d => d.hasAssessment).length;
+                  const parts: string[] = [];
+                  if (habitsDone > 0) parts.push(`${habitsDone}/7 days with habits completed`);
+                  if (cravingsLogged > 0) parts.push(`${cravingsLogged} day${cravingsLogged !== 1 ? 's' : ''} with cravings logged`);
+                  if (assessmentsTaken > 0) parts.push(`${assessmentsTaken} assessment${assessmentsTaken !== 1 ? 's' : ''} taken`);
+                  if (parts.length === 0) parts.push('No activity yet this week — start with a habit or log a craving');
+                  // Connect to meaning
+                  let meaning = '';
+                  if (habitsDone >= 5) meaning = 'Your consistency is building real metabolic momentum. Keep this rhythm.';
+                  else if (habitsDone >= 3) meaning = 'Solid start. Hitting 5+ days/week is where the compounding effect kicks in.';
+                  else if (habitsDone > 0 && habitsDone < 3) meaning = 'Every habit day counts, but consistency is the multiplier. Can you add one more day this week?';
+                  if (cravingsLogged >= 5) meaning += (meaning ? ' ' : '') + 'Your craving log is getting rich — patterns will emerge after 7 days.';
+                  return (
+                    <View style={{ marginTop: 14, paddingTop: 12, borderTopWidth: 1, borderTopColor: colors.border }}>
+                      <Text style={{ fontSize: 13, fontWeight: '600', color: colors.text, lineHeight: 19 }}>{parts.join(' · ')}</Text>
+                      {meaning ? <Text style={{ fontSize: 12, color: colors.textSecondary, lineHeight: 18, marginTop: 6 }}>{meaning}</Text> : null}
+                    </View>
+                  );
+                })()}
+              </View>
+
+              {/* ═══════════════════════════════════════════════════════════
+                  4. LAYER TRENDS — COMPACT INSIGHTS
+                 ═══════════════════════════════════════════════════════════ */}
+              {layerTrendData ? (
+                <View style={{ borderRadius: 20, padding: 16, backgroundColor: colors.card }}>
+                  <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8, marginBottom: 12 }}>
+                    <Ionicons name="trending-up" size={14} color={colors.textSecondary} />
+                    <Text style={{ fontSize: 11, fontWeight: '700', letterSpacing: 1, color: colors.textSecondary, textTransform: 'uppercase' }}>Layer Trends</Text>
+                  </View>
+                  {(() => {
+                    const summaries = layerTrendData.map(({ layer, points }) => {
+                      if (points.length < 2) return null;
+                      const recent = points[points.length - 1];
+                      const earlier = points[0];
+                      const trend = recent - earlier;
+                      return { layer, trend, recent, earlier };
+                    }).filter(Boolean).sort((a: any, b: any) => (b as any).trend - (a as any).trend);
+                    const mostImproved = summaries.find((s: any) => s.trend > 0);
+                    const mostDeclined = [...summaries].reverse().find((s: any) => (s as any).trend < 0);
+                    const mostConsistent = [...summaries].sort((a: any, b: any) => Math.abs((b as any).recent - (b as any).earlier) - Math.abs((a as any).recent - (a as any).earlier)).find((s: any) => Math.abs((s as any).recent - (s as any).earlier) <= 1);
+                    // Build contextual meaning per layer
+                    const contextFor = (layerId: number, trend: number) => {
+                      if (layerId === 1) { // Circadian
+                        if (trend > 0) return 'Sleep timing and circadian rhythm are stabilizing — this supports melatonin cycling and metabolic recovery.';
+                        if (trend < 0) return 'Sleep regularity is slipping. Your circadian clock drives cortisol timing, appetite hormones, and fat metabolism.';
+                        return 'Sleep/wake consistency is steady. Maintaining fixed bedtimes reinforces your circadian rhythm.';
+                      }
+                      if (layerId === 2) return trend > 0 ? 'Stress resilience is building — your nervous system is recovering better between stressors.' : trend < 0 ? 'Neurochemical balance needs attention. Consider breathwork, reducing caffeine, or earlier bedtimes.' : 'Stress response is stable. Consistent recovery practices will maintain this.';
+                      if (layerId === 3) return trend > 0 ? 'Metabolic efficiency is improving — your body is processing fuel and managing blood sugar better.' : trend < 0 ? 'Metabolic load may be increasing. Focus on sleep quality and meal timing to support insulin sensitivity.' : 'Metabolic function is holding steady. This is the foundation your other layers build on.';
+                      if (layerId === 4) return trend > 0 ? 'Gut-brain signaling is strengthening — your microbiome is supporting better mood and energy.' : trend < 0 ? 'Gut-brain axis is under strain. Cravings and energy dips often trace back to here.' : 'Gut-brain connection is consistent. Your dietary patterns are supporting neural health.';
+                      if (layerId === 5) return trend > 0 ? 'Your sense of identity and self-awareness around health is deepening — this drives long-term change.' : trend < 0 ? 'Identity layer dipped. Reconnect with your "why" — the strongest metabolic interventions start here.' : 'Identity and purpose are stable. This internal compass keeps all other layers aligned.';
+                      return '';
+                    };
+                    // Build a single readable narrative using JSX
+                    const narrativeParts: JSX.Element[] = [];
+                    if (mostImproved) narrativeParts.push(<Text key="imp"><Text style={{ fontWeight: '800', color: colors.text }}>{clinicalDepth ? mostImproved.layer.shortName.split(' \u2014 ')[1] : LAYER_PLAIN_SHORT[mostImproved.layer.id - 1]}</Text> <Text style={{ fontWeight: '800', color: '#22C55E' }}>improving (+{mostImproved.trend})</Text></Text>);
+                    if (mostConsistent && (!mostImproved || mostConsistent.layer.id !== mostImproved?.layer.id)) narrativeParts.push(<Text key="con"><Text style={{ fontWeight: '800', color: colors.text }}>{clinicalDepth ? mostConsistent.layer.shortName.split(' \u2014 ')[1] : LAYER_PLAIN_SHORT[mostConsistent.layer.id - 1]}</Text> is <Text style={{ fontWeight: '800', color: colors.text }}>stable</Text></Text>);
+                    if (mostDeclined) narrativeParts.push(<Text key="dec"><Text style={{ fontWeight: '800', color: colors.text }}>{clinicalDepth ? mostDeclined.layer.shortName.split(' \u2014 ')[1] : LAYER_PLAIN_SHORT[mostDeclined.layer.id - 1]}</Text> <Text style={{ fontWeight: '800', color: '#EF4444' }}>declining ({mostDeclined.trend})</Text></Text>);
+                    // Pick the most actionable context line
+                    let contextLine = '';
+                    if (mostImproved) contextLine = contextFor(mostImproved.layer.id, mostImproved.trend);
+                    else if (mostDeclined) contextLine = contextFor(mostDeclined.layer.id, mostDeclined.trend);
+                    else if (mostConsistent) contextLine = contextFor(mostConsistent.layer.id, 0);
+                    return (
+                      <>
+                        {/* Big headline */}
+                        <Text style={{ fontSize: 16, fontWeight: '800', color: colors.text, lineHeight: 24 }}>{narrativeParts.reduce((acc: JSX.Element[], part, i) => { if (i > 0) acc.push(<Text key={'sep' + i}> · </Text>); acc.push(part); return acc; }, [] as JSX.Element[])}</Text>
+                        {/* Context line — connects to circadian/real meaning */}
+                        {contextLine ? (
+                          <Text style={{ fontSize: 13, color: colors.textSecondary, lineHeight: 20, marginTop: 8 }}>{contextLine}</Text>
+                        ) : null}
+                        {/* Quick layer dots with scores */}
+                        <View style={{ flexDirection: 'row', gap: 12, marginTop: 14, paddingTop: 12, borderTopWidth: 1, borderTopColor: colors.border }}>
+                          {summaries.map((s: any) => (
+                            <View key={s.layer.id} style={{ flex: 1, alignItems: 'center', gap: 4 }}>
+                              <View style={{ width: 10, height: 10, borderRadius: 5, backgroundColor: s.layer.color }} />
+                              <Text style={{ fontSize: 15, fontWeight: "900", color: colors.text }}>{s.recent}</Text>
+                              <Text style={{ fontSize: 9, color: colors.textTertiary }}>{clinicalDepth ? s.layer.shortName.split(' \u2014 ')[1] : LAYER_PLAIN_SHORT[s.layer.id - 1]}</Text>
+                            </View>
+                          ))}
+                        </View>
+                      </>
+                    );
+                  })()}
+                </View>
+              ) : scoreHistory.length >= 2 ? (
+                <TouchableOpacity activeOpacity={0.95} onPress={() => onNavigate('score-history')} style={{ borderRadius: 20, padding: 20, backgroundColor: colors.card, borderWidth: 1, borderColor: colors.border, borderStyle: 'dashed' }}>
+                  <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
+                    <Ionicons name="trending-up" size={14} color={colors.textTertiary} />
+                    <Text style={{ fontSize: 11, fontWeight: '700', letterSpacing: 1, color: colors.textTertiary, textTransform: 'uppercase' }}>Layer Trends</Text>
+                  </View>
+                  <Text style={{ fontSize: 13, color: colors.textSecondary, marginTop: 10, lineHeight: 19 }}>Take one more assessment to unlock per-layer trends and see how each layer is evolving.</Text>
+                </TouchableOpacity>
+              ) : null}
+
+              {/* ═══════════════════════════════════════════════════════════
+                  5. WHAT TO KEEP / WHAT TO WATCH
+                 ═══════════════════════════════════════════════════════════ */}
+              {keepWatch && (keepWatch.keep.length > 0 || keepWatch.watch.length > 0) && (
+                <View style={{ borderRadius: 20, padding: 20, backgroundColor: colors.card }}>
+                  <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8, marginBottom: 14 }}>
+                    <Ionicons name="pulse" size={14} color={colors.textSecondary} />
+                    <Text style={{ fontSize: 11, fontWeight: '700', letterSpacing: 1, color: colors.textSecondary, textTransform: 'uppercase' }}>Signals</Text>
+                  </View>
+
+                  {/* Keep section */}
+                  {keepWatch.keep.length > 0 && (
+                    <View style={{ marginBottom: keepWatch.watch.length > 0 ? 14 : 0 }}>
+                      <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6, marginBottom: 8 }}>
+                        <Ionicons name="checkmark-circle" size={14} color="#22C55E" />
+                        <Text style={{ fontSize: 12, fontWeight: '700', color: '#22C55E' }}>Keep doing</Text>
+                      </View>
+                      {keepWatch.keep.slice(0, 3).map(({ layer, delta }) => (
+                        <View key={layer.id} style={{ flexDirection: 'row', alignItems: 'center', gap: 8, paddingVertical: 4 }}>
+                          <View style={{ width: 8, height: 8, borderRadius: 4, backgroundColor: layer.color }} />
+                          <Text style={{ fontSize: 12, color: colors.textSecondary, flex: 1 }}>{clinicalDepth ? layer.shortName.split(' \u2014 ')[1] : LAYER_PLAIN_SHORT[layer.id - 1]} jumped {delta} pts — your habit streak is paying off</Text>
+                        </View>
+                      ))}
+                    </View>
+                  )}
+
+                  {/* Watch section */}
+                  {keepWatch.watch.length > 0 && (
+                    <View>
+                      <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6, marginBottom: 8 }}>
+                        <Ionicons name="alert-circle" size={14} color="#F59E0B" />
+                        <Text style={{ fontSize: 12, fontWeight: '700', color: '#F59E0B' }}>Watch closely</Text>
+                      </View>
+                      {keepWatch.watch.slice(0, 3).map(({ layer, delta }) => (
+                        <View key={layer.id} style={{ flexDirection: 'row', alignItems: 'center', gap: 8, paddingVertical: 4 }}>
+                          <View style={{ width: 8, height: 8, borderRadius: 4, backgroundColor: layer.color }} />
+                          <Text style={{ fontSize: 12, color: colors.textSecondary, flex: 1 }}>{clinicalDepth ? layer.shortName.split(' \u2014 ')[1] : LAYER_PLAIN_SHORT[layer.id - 1]} dipped {Math.abs(delta)} pt{Math.abs(delta) !== 1 ? 's' : ''} — may need attention this week</Text>
+                        </View>
+                      ))}
+                    </View>
+                  )}
+                </View>
+              )}
+
+              {/* ═══════════════════════════════════════════════════════════
+                  6. HEALTH METRICS CARD
+                 ═══════════════════════════════════════════════════════════ */}
+              {healthConnected && healthMetrics ? (
+                <TouchableOpacity activeOpacity={0.7} onPress={() => onNavigate('health-connect')} style={{ borderRadius: 20, padding: 20, backgroundColor: colors.card }}>
+                  <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 14 }}>
+                    <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
+                      <Ionicons name="heart" size={14} color="#22C55E" />
+                      <Text style={{ fontSize: 11, fontWeight: '700', letterSpacing: 1, color: colors.textSecondary, textTransform: 'uppercase' }}>Wearable Data</Text>
+                    </View>
+                    <Ionicons name="chevron-forward" size={16} color={colors.textTertiary} />
+                  </View>
+                  {/* Data sneak peek — top 3 metrics only */}
+                  <View style={{ flexDirection: 'row', gap: 10 }}>
+                    {[
+                      { label: 'Sleep', value: healthMetrics.total_sleep_avg, unit: 'h', icon: 'moon', color: '#7C5CFF' },
+                      { label: 'HRV', value: healthMetrics.hrv_avg, unit: 'ms', icon: 'heart-circle', color: '#22C55E' },
+                      { label: 'RHR', value: healthMetrics.rhr_avg, unit: 'bpm', icon: 'heart', color: '#D42B2B' },
+                    ].map(m => (
+                      <View key={m.label} style={{ flex: 1, borderRadius: 14, padding: 12, backgroundColor: colors.bg, alignItems: 'center' }}>
+                        <Ionicons name={m.icon as any} size={16} color={m.color} />
+                        {m.value ? (
+                          <Text style={{ fontSize: 18, fontWeight: '800', color: colors.text, marginTop: 6 }}>{m.value}{m.unit}</Text>
+                        ) : (
+                          <Text style={{ fontSize: 14, fontWeight: '600', color: colors.textTertiary, marginTop: 6 }}>--</Text>
+                        )}
+                        <Text style={{ fontSize: 9, color: colors.textTertiary, marginTop: 2 }}>{m.label}</Text>
+                      </View>
+                    ))}
+                  </View>
+                  <Text style={{ fontSize: 11, color: colors.textTertiary, textAlign: 'center', marginTop: 12 }}>Tap for full health data, trends, and sleep analysis</Text>
+                </TouchableOpacity>
+              ) : (
+                <TouchableOpacity activeOpacity={0.95} onPress={() => onNavigate('health-connect')} style={{ borderRadius: 20, padding: 20, backgroundColor: colors.card, borderWidth: 1, borderColor: colors.border, borderStyle: 'dashed' }}>
+                  <View style={{ flexDirection: 'row', alignItems: 'center', gap: 12 }}>
+                    <View style={{ width: 44, height: 44, borderRadius: 14, backgroundColor: `${colors.red}14`, alignItems: 'center', justifyContent: 'center' }}>
+                      <Ionicons name="watch" size={22} color={colors.red} />
+                    </View>
+                    <View style={{ flex: 1 }}>
+                      <Text style={{ fontSize: 14, fontWeight: '700', color: colors.text }}>Connect Your Wearable</Text>
+                      <Text style={{ fontSize: 12, color: colors.textSecondary, marginTop: 2, lineHeight: 17 }}>Sync HRV, sleep, and heart rate data for deeper metabolic insights.</Text>
+                    </View>
+                    <Ionicons name="chevron-forward" size={18} color={colors.textTertiary} />
+                  </View>
+                </TouchableOpacity>
+              )}
+
+              {/* ═══════════════════════════════════════════════════════════
+                  6B. WEARABLE INSIGHT CARDS
+                 ═══════════════════════════════════════════════════════════ */}
+              {wearableInsights.length > 0 && (
+                <View style={{ gap: 10 }}>
+                  {wearableInsights.map((insight, i) => (
+                    <View key={i} style={{ borderRadius: 16, padding: 16, backgroundColor: colors.card, borderLeftWidth: 3, borderLeftColor: insight.color }}>
+                      <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8, marginBottom: 6 }}>
+                        <Ionicons name={insight.icon as any} size={16} color={insight.color} />
+                        <Text style={{ fontSize: 13, fontWeight: '700', color: colors.text }}>{insight.title}</Text>
+                      </View>
+                      <Text style={{ fontSize: 12, color: colors.textSecondary, lineHeight: 18 }}>{insight.body}</Text>
+                    </View>
+                  ))}
+                </View>
+              )}
+
+              {/* ═══════════════════════════════════════════════════════════
+                  6C. WEEKLY HEALTH SUMMARY
+                 ═══════════════════════════════════════════════════════════ */}
+              {healthConnected && healthMetrics && (() => {
+                const sleepAvg = parseFloat(healthMetrics.total_sleep_avg || '0');
+                const hrvAvg = parseInt(healthMetrics.hrv_avg || '0');
+                const rhrAvg = parseInt(healthMetrics.rhr_avg || '0');
+                // Build a meaningful narrative
+                const parts: string[] = [];
+                if (sleepAvg > 0) {
+                  if (sleepAvg >= 7 && sleepAvg <= 9) parts.push(`Your ${sleepAvg}h average sleep is in the optimal window for circadian support.`);
+                  else if (sleepAvg < 7) parts.push(`At ${sleepAvg}h average, your sleep is below the 7h threshold needed for full metabolic recovery.`);
+                  else parts.push(`Averaging ${sleepAvg}h of sleep may indicate your body needs more recovery, not more time in bed.`);
+                }
+                if (hrvAvg > 0) {
+                  if (hrvAvg < 30) parts.push(`HRV at ${hrvAvg}ms signals chronic stress load — your nervous system is in overdrive.`);
+                  else if (hrvAvg >= 50) parts.push(`${hrvAvg}ms HRV shows your body is recovering well between stressors.`);
+                  else parts.push(`${hrvAvg}ms HRV is moderate — room to build more resilience.`);
+                }
+                if (rhrAvg > 75) parts.push(`RHR of ${rhrAvg}bpm is elevated and may be limiting your metabolic efficiency.`);
+                else if (rhrAvg > 0 && rhrAvg <= 60) parts.push(`${rhrAvg}bpm resting heart rate reflects strong cardiovascular fitness.`);
+                // Cross-metric insight
+                if (sleepAvg > 0 && hrvAvg > 0 && sleepAvg < 7 && hrvAvg < 40) {
+                  parts.push(`The combination of low sleep and low HRV suggests your body isn't getting the recovery window it needs. Prioritizing sleep will naturally lift HRV.`);
+                }
+                if (sleepAvg >= 7 && sleepAvg <= 9 && hrvAvg >= 40) {
+                  parts.push(`Your sleep and HRV are working together — this is the recovery foundation that drives metabolic improvement.`);
+                }
+                return parts.length > 0 ? (
+                  <View key="whs" style={{ borderRadius: 20, padding: 20, backgroundColor: colors.card }}>
+                    <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8, marginBottom: 14 }}>
+                      <Ionicons name="calendar" size={16} color="#7C5CFF" />
+                      <Text style={{ fontSize: 11, fontWeight: '700', letterSpacing: 1, color: colors.textSecondary, textTransform: 'uppercase' }}>Weekly Health Summary</Text>
+                    </View>
+                    <Text style={{ fontSize: 14, color: colors.text, lineHeight: 22, fontWeight: '600' }}>{parts[0]}</Text>
+                    {parts.length > 1 && <Text style={{ fontSize: 13, color: colors.textSecondary, lineHeight: 20, marginTop: 8 }}>{parts.slice(1).join(' ')}</Text>}
+                    <View style={{ flexDirection: 'row', gap: 12, marginTop: 14, paddingVertical: 10, paddingHorizontal: 14, borderRadius: 12, backgroundColor: colors.bg }}>
+                      <View style={{ flex: 1, alignItems: 'center' }}>
+                        <Text style={{ fontSize: 18, fontWeight: '900', color: colors.text }}>{healthMetrics.total_sleep_avg || '--'}h</Text>
+                        <Text style={{ fontSize: 10, color: colors.textTertiary, marginTop: 2 }}>Sleep avg</Text>
+                      </View>
+                      <View style={{ width: 1, backgroundColor: colors.border }} />
+                      <View style={{ flex: 1, alignItems: 'center' }}>
+                        <Text style={{ fontSize: 18, fontWeight: '900', color: colors.text }}>{healthMetrics.hrv_avg || '--'}</Text>
+                        <Text style={{ fontSize: 10, color: colors.textTertiary, marginTop: 2 }}>HRV avg</Text>
+                      </View>
+                      <View style={{ width: 1, backgroundColor: colors.border }} />
+                      <View style={{ flex: 1, alignItems: 'center' }}>
+                        <Text style={{ fontSize: 18, fontWeight: '900', color: colors.text }}>{healthMetrics.rhr_avg || '--'}</Text>
+                        <Text style={{ fontSize: 10, color: colors.textTertiary, marginTop: 2 }}>RHR avg</Text>
+                      </View>
+                    </View>
+                  </View>
+                ) : null;
+              })()}
+
+              {/* ═══════════════════════════════════════════════════════════
+                  7. RECOVERY POTENTIAL (was Points Available)
+                 ═══════════════════════════════════════════════════════════ */}
+              <View style={{ borderRadius: 20, padding: 20, backgroundColor: colors.card, borderWidth: 1, borderColor: '#22C55E30' }}>
+                <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8, marginBottom: 12 }}>
+                  <Ionicons name="trending-up" size={16} color="#22C55E" />
+                  <Text style={{ fontSize: 10, fontWeight: '700', letterSpacing: 1, color: '#22C55E', textTransform: 'uppercase' }}>Recovery Potential</Text>
+                </View>
+                <View style={{ flexDirection: 'row', alignItems: 'baseline', gap: 8, marginBottom: 8 }}>
+                  <Text style={{ fontSize: 22, fontWeight: '900', color: '#22C55E' }}>+{pointsAvailable}</Text>
+                  <Text style={{ fontSize: 13, fontWeight: '600', color: colors.text }}>points may be available over {pointsWeeks} weeks</Text>
+                </View>
+                <Text style={{ fontSize: 12, lineHeight: 18, color: colors.textSecondary }}>Lowering your resistance may unlock <Text style={{ fontWeight: '600', color: '#22C55E' }}>+{pointsAvailable} points</Text> of recovery capacity over roughly <Text style={{ fontWeight: '600', color: colors.text }}>{pointsWeeks} weeks</Text>, with the right intervention sequence.</Text>
+              </View>
+
+              {/* ═══════════════════════════════════════════════════════════
+                  QUICK LINKS
+                 ═══════════════════════════════════════════════════════════ */}
+              <View style={{ borderRadius: 20, backgroundColor: colors.card, overflow: 'hidden' }}>
+                <TouchableOpacity activeOpacity={0.95} onPress={() => onNavigate('layers')} style={{ flexDirection: 'row', alignItems: 'center', gap: 12, padding: 16, borderBottomWidth: 1, borderBottomColor: colors.border }}>
+                  <View style={{ width: 36, height: 36, borderRadius: 10, backgroundColor: '#7C5CFF1A', alignItems: 'center', justifyContent: 'center' }}>
+                    <Ionicons name="layers" size={18} color="#7C5CFF" />
+                  </View>
+                  <View style={{ flex: 1 }}>
+                    <Text style={{ fontSize: 13, fontWeight: '700', color: colors.text }}>5 Layers Breakdown</Text>
+                    <Text style={{ fontSize: 11, color: colors.textTertiary, marginTop: 1 }}>{dominantLayerDisplayName ? `Dominant: ${dominantLayerDisplayName}` : 'View your 5 metabolic layers'}</Text>
+                  </View>
+                  <Ionicons name="chevron-forward" size={16} color={colors.textTertiary} />
+                </TouchableOpacity>
+                <TouchableOpacity activeOpacity={0.95} onPress={() => onNavigate('streak-calendar')} style={{ flexDirection: 'row', alignItems: 'center', gap: 12, padding: 16, borderBottomWidth: 1, borderBottomColor: colors.border }}>
+                  <View style={{ width: 36, height: 36, borderRadius: 10, backgroundColor: '#F59E0B1A', alignItems: 'center', justifyContent: 'center' }}>
+                    <Ionicons name="flame" size={18} color="#F59E0B" />
+                  </View>
+                  <View style={{ flex: 1 }}>
+                    <Text style={{ fontSize: 13, fontWeight: '700', color: colors.text }}>Habit Streak</Text>
+                    <Text style={{ fontSize: 11, color: colors.textTertiary, marginTop: 1 }}>{streak} day streak</Text>
+                  </View>
+                  <Ionicons name="chevron-forward" size={16} color={colors.textTertiary} />
+                </TouchableOpacity>
+                <TouchableOpacity activeOpacity={0.95} onPress={() => onNavigate('score-history')} style={{ flexDirection: 'row', alignItems: 'center', gap: 12, padding: 16 }}>
+                  <View style={{ width: 36, height: 36, borderRadius: 10, backgroundColor: `${colors.red}1A`, alignItems: 'center', justifyContent: 'center' }}>
+                    <Ionicons name="time" size={18} color={colors.red} />
+                  </View>
+                  <View style={{ flex: 1 }}>
+                    <Text style={{ fontSize: 13, fontWeight: '700', color: colors.text }}>Score History</Text>
+                    <Text style={{ fontSize: 11, color: colors.textTertiary, marginTop: 1 }}>{scoreHistory.length} assessment{scoreHistory.length !== 1 ? 's' : ''} recorded</Text>
+                  </View>
+                  <Ionicons name="chevron-forward" size={16} color={colors.textTertiary} />
+                </TouchableOpacity>
+              </View>
+
+            </View>
+          )}
+        </ScrollView>
+        <BottomNav active="insights" onNavigate={onNavigate} hasScore={hasScore} />
+      </SafeAreaView>
+    </View>
+  );
+}
+
+// ============================================================
 // LAYERS HUB SCREEN
 // ============================================================
 
@@ -3577,7 +4652,10 @@ function LayersHubScreen({ onNavigate, onSelectLayer, hasScore, scoreResult }: {
             })}
           </View>
         </ScrollView>
-        <BottomNav active="layers" onNavigate={onNavigate} hasScore={hasScore} />
+        {/* active="insights" (not "layers") — this screen is now reached via the Insights
+            tab's "5 Layers" card, not a direct bottom-nav destination, so the Insights tab
+            should stay highlighted while viewing it. */}
+        <BottomNav active="insights" onNavigate={onNavigate} hasScore={hasScore} />
       </SafeAreaView>
     </View>
   );
@@ -7550,92 +8628,1565 @@ function ReportSection({ title, colors, children }: { title: string; colors: The
 // HEALTH CONNECT SCREEN — Coming Soon
 // ============================================================
 
+// ============================================================
+// HEALTH DATA SYNC — Apple HealthKit
+// ============================================================
+// Reads HRV, Resting HR, Sleep stages, and Respiratory Rate from Apple Health.
+// Whoop, Apple Watch, Oura Ring, and any HealthKit-compatible wearable all feed
+// into the same data pool — we're device-agnostic.
+
+const HEALTH_DATA_KEY = 'ms_health_data';
+const HEALTH_SYNC_KEY = 'ms_health_sync_time';
+
+// react-native-health's getSleepSamples always returns `value` as one of these strings
+// (RCTAppleHealthKit+Queries.m maps HealthKit's raw numeric HKCategoryValueSleepAnalysis
+// enum to a string before it ever reaches JS) — never the raw numeric enum. "ASLEEP" is
+// HealthKit's legacy/generic category, used by sources that don't report granular sleep
+// stages (confirmed: Whoop writes only INBED/ASLEEP, no CORE/DEEP/REM).
+const SLEEP_ASLEEP = 'ASLEEP';
+const SLEEP_CORE = 'CORE';
+const SLEEP_DEEP = 'DEEP';
+const SLEEP_REM = 'REM';
+
+// Per-day health metrics stored in AsyncStorage.
+type DailyHealthMetric = {
+  hrv: number | null;           // ms (RMSSD)
+  rhr: number | null;           // bpm
+  deep_min: number;             // minutes
+  rem_min: number;              // minutes
+  core_min: number;             // minutes
+  total_min: number;            // minutes asleep
+  resp_rate: number | null;     // breaths/min
+  sleep_start: string | null;   // ISO string — earliest sleep sample startDate for the night
+  sleep_end: string | null;     // ISO string — latest sleep sample endDate for the night
+  time_in_bed_min: number;      // total minutes between first start and last end (including awake)
+  sleep_efficiency: number;     // 0-100 percentage (total_min / time_in_bed_min)
+  // Sessions on this calendar day OTHER than the main (longest real-minutes) session —
+  // e.g. a nap alongside the main overnight session. FIXED 2026-08-08: total_min used to
+  // sum every session assigned to a day, so a nap + a full night combined into one
+  // inflated "night" (confirmed via device data — Aug 4 and Jul 19 each genuinely
+  // contained 2 separate real sessions, not overlap/duplicate artifacts). Headline stats
+  // now come from the main session only; these are preserved (not discarded) rather than
+  // deleted, but deliberately not surfaced in any UI yet — that's a separate, not-yet-made
+  // product decision on how/whether naps should ever be shown.
+  secondary_sleep_sessions: { total_min: number; sleep_start: string; sleep_end: string }[];
+};
+
+// Aggregated health data stored in AsyncStorage (ms_health_data).
+type StoredHealthData = {
+  hrv_avg: number;              // 7-day avg ms
+  rhr_avg: number;              // 7-day avg bpm
+  deep_sleep_avg: number;       // 7-day avg hours
+  rem_sleep_avg: number;        // 7-day avg hours
+  core_sleep_avg: number;       // 7-day avg hours
+  total_sleep_avg: number;      // 7-day avg hours
+  resp_rate_avg: number;        // 7-day avg breaths/min
+  // Week-over-week deltas (null if not enough data)
+  hrv_wow: number | null;
+  rhr_wow: number | null;
+  total_sleep_wow: number | null;
+  // 30-day sleep trend card (added 2026-08-08). Raw-minute precision (not rounded to
+  // 0.1h like total_sleep_avg above) so the UI can format "Xh Ym" directly.
+  // total_sleep_wow_30d is null whenever the prior 30-day period doesn't have enough
+  // real data to compare against yet (see wow30 below) — the card hides its comparison
+  // line in that case rather than showing a delta computed from 2-3 real nights.
+  total_sleep_avg_30d_min: number;
+  total_sleep_wow_30d_min: number | null;
+  // Per-day breakdown
+  daily: Record<string, DailyHealthMetric>;
+};
+
+// Raw samples from react-native-health: { value, startDate, endDate }
+type HealthSample = { value: number; startDate: string; endDate: string };
+// Sleep samples specifically: `value` is a category string, not a quantity — see
+// SLEEP_ASLEEP/SLEEP_CORE/etc. above for why. sourceName/id are also real fields the
+// native module returns (RCTAppleHealthKit+Queries.m includes both in every sample) —
+// added here for the overlap-diagnostic logging in syncHealthData, unused elsewhere.
+type SleepSample = { value: string; startDate: string; endDate: string; sourceName?: string; id?: string };
+
+// Day-bucketing key, deliberately LOCAL time not UTC. FIXED 2026-08-08: processHealthSamples
+// previously used `d.toISOString().slice(0, 10)`, which extracts the UTC calendar date from
+// a device-local instant — in IST (UTC+5:30), any sample/instant before 5:30 AM local time
+// converts to the *previous* UTC day, silently filing it under the wrong day's bucket.
+// Confirmed via logSingleNightRawSamples diagnostic evidence: Aug 7 sleep samples from
+// 04:31-05:45 AM IST were all resolving to utcDateKey=2026-08-06 instead of 2026-08-07,
+// which was the direct cause of sleep_start/total_min reading wrong for that night vs.
+// Whoop/Apple Health. Hoisted to module scope 2026-08-08 (was function-local to
+// processHealthSamples) so HealthConnectScreen's getYesterdayKey/fallbackKey can reuse the
+// exact same implementation instead of drifting — that function had the identical UTC bug,
+// confirmed when the "Last Night" card disappeared right at local midnight (lastNightKey
+// resolved to a day two days too early, landing on a real data gap).
+const localDateKey = (d: Date): string =>
+  `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+
+function processHealthSamples(
+  hrvSamples: HealthSample[], rhrSamples: HealthSample[],
+  sleepSamples: SleepSample[], respSamples: HealthSample[],
+): StoredHealthData {
+  // Initialize 60-day bucket (extended 2026-08-08 from 30, so the 30-day sleep trend
+  // card's prior-30-day comparison has a full prior period to average — days 0-29 are
+  // the "current" 30-day window, days 30-59 are "prior").
+  const daily: Record<string, DailyHealthMetric> = {};
+  for (let i = 0; i < 60; i++) {
+    const d = new Date(Date.now() - i * 86400000);
+    const key = localDateKey(d);
+    daily[key] = { hrv: null, rhr: null, deep_min: 0, rem_min: 0, core_min: 0, total_min: 0, resp_rate: null, sleep_start: null, sleep_end: null, time_in_bed_min: 0, sleep_efficiency: 0, secondary_sleep_sessions: [] };
+  }
+
+  // HRV: prefer overnight/morning reading (before 2 PM) per day
+  for (const s of hrvSamples) {
+    const d = new Date(s.startDate);
+    const key = localDateKey(d);
+    if (!daily[key]) continue;
+    if (d.getHours() < 14 || daily[key].hrv === null) {
+      daily[key].hrv = Math.round(s.value * 10) / 10;
+    }
+  }
+
+  // RHR: take minimum reading per day (resting = lowest)
+  for (const s of rhrSamples) {
+    const d = new Date(s.startDate);
+    const key = localDateKey(d);
+    if (!daily[key]) continue;
+    if (daily[key].rhr === null || s.value < daily[key].rhr!) {
+      daily[key].rhr = Math.round(s.value);
+    }
+  }
+
+  // Sleep: aggregate by stage per day + extract sleep schedule (start/end/efficiency)
+  //
+  // FIXED 2026-08-08 (overlap): previously summed each sample's duration independently,
+  // which double-counted overlapping/duplicate segments (confirmed via
+  // logSleepOverlapDiagnostic — e.g. one real day showed a 27.5h naive sum vs. 16.6h real
+  // elapsed time, a physically impossible number). Whoop can write multiple overlapping
+  // "ASLEEP" segments per night (sync retries, reconnects), so raw intervals are merged
+  // before computing any duration — both per-stage and across all stages combined for
+  // total_min (so overlaps between different stages/sources also can't double-count).
+  //
+  // FIXED 2026-08-08 (session split across midnight): previously bucketed each raw sample
+  // to its own local calendar day BEFORE any merging, so one real continuous sleep session
+  // whose underlying HealthKit samples happened to split right at local midnight got
+  // counted as TWO separate nights, each under-reporting total_min. Confirmed via
+  // sleepSchedule's per-night diagnostic: 3 of 22 real nights had a session end and the
+  // next session's start ~30 seconds apart, straddling midnight (e.g.
+  // 2026-07-22T00:22:01 -> 2026-07-22T00:22:31). Every genuine (non-split) gap in that
+  // same dataset was 19+ hours (normal daytime-awake gap) — ~75x larger than
+  // SESSION_GAP_MS below, so bridging small gaps has wide safety margin against ever
+  // merging two truly separate sleep periods (e.g. a nap).
+  //
+  // Sessions are now built globally first — merging across day boundaries whenever the
+  // gap between one interval's end and the next's start is <= SESSION_GAP_MS — THEN each
+  // whole session is assigned to a single day: the local calendar day of the session's
+  // start (bedtime's date, confirmed convention — "last night" is named by when you went
+  // to bed, not when you woke up).
+  //
+  // FIXED 2026-08-08 (unbounded session length): the gap-bridging loop originally had no
+  // cap on cumulative session span — it only checked the gap to the *next* interval
+  // against the running max-end, so a chain of individually-small gaps could grow
+  // unboundedly. Confirmed via real device data: Night #5 (2026-07-19) reached a ~27h
+  // span, Night #18 (2026-08-04) ~29h — both physically impossible for one sleep session.
+  // MAX_SESSION_SPAN_MS now gates the merge itself: an interval only joins the current
+  // session if doing so keeps the session's overall span (session start to the new
+  // max-end) within the ceiling. If it wouldn't, that interval starts a new session
+  // instead — no data is discarded or truncated, the chain just correctly splits back
+  // into separate sessions at the point where continuing would be implausible.
+  const SESSION_GAP_MS = 15 * 60 * 1000;
+  const MAX_SESSION_SPAN_MS = 16 * 60 * 60 * 1000;
+
+  type SleepInterval = { start: number; end: number; stage: string; startISO: string; endISO: string };
+  const rawIntervals: SleepInterval[] = [];
+  for (const s of sleepSamples) {
+    const start = new Date(s.startDate);
+    const end = new Date(s.endDate);
+    const durMin = Math.round((end.getTime() - start.getTime()) / 60000);
+    if (durMin < 0 || durMin > 1440) continue; // sanity
+
+    const isSleepStage = s.value === SLEEP_ASLEEP || s.value === SLEEP_CORE || s.value === SLEEP_DEEP || s.value === SLEEP_REM;
+    if (!isSleepStage) continue; // 'INBED' and 'AWAKE' — don't count as sleep
+
+    rawIntervals.push({ start: start.getTime(), end: end.getTime(), stage: s.value, startISO: s.startDate, endISO: s.endDate });
+  }
+  rawIntervals.sort((a, b) => a.start - b.start);
+
+  // Group raw intervals into sessions, bridging gaps <= SESSION_GAP_MS, capped at
+  // MAX_SESSION_SPAN_MS total span (see FIXED note above).
+  const sessions: SleepInterval[][] = [];
+  for (const iv of rawIntervals) {
+    const current = sessions[sessions.length - 1];
+    if (current) {
+      const sessionStart = current[0].start; // safe: current is built in start-ascending order
+      const sessionEnd = Math.max(...current.map(x => x.end));
+      const prospectiveEnd = Math.max(sessionEnd, iv.end);
+      const withinGap = iv.start <= sessionEnd + SESSION_GAP_MS;
+      const withinSpanCeiling = prospectiveEnd - sessionStart <= MAX_SESSION_SPAN_MS;
+      if (withinGap && withinSpanCeiling) {
+        current.push(iv);
+        continue;
+      }
+    }
+    sessions.push([iv]);
+  }
+
+  // DIAGNOSTIC, kept permanently as a sanity watch (added 2026-08-08, originally
+  // temporary while investigating physically implausible session spans found via real
+  // device data — Night #5: 927min/~27h span, Night #18: 862min/~29h span). Now that
+  // MAX_SESSION_SPAN_MS caps session length at merge time, this should never fire on new
+  // syncs — kept in place to catch any future edge case in the capping logic itself.
+  //
+  // FIXED 2026-08-08 (diagnostic bug, separate from the real fix above): this originally
+  // computed span as `sorted[sorted.length - 1].end - sorted[0].start`, silently assuming
+  // the interval that starts last also ends last — untrue whenever intervals overlap or
+  // interleave (e.g. a CORE interval starting before a DEEP interval but ending after it).
+  // That's why it never fired even on Night #5/#18's genuinely 27h/29h spans: it was
+  // measuring a smaller, wrong span. Fixed to use the same proper-max approach the real
+  // aggregation code already uses elsewhere (Math.max over ALL interval ends, not just
+  // the start-order-last one).
+  const MAX_PLAUSIBLE_SESSION_SPAN_MS = 12 * 60 * 60 * 1000; // 12h — below MAX_SESSION_SPAN_MS, so this fires before the hard ceiling would ever need to kick in
+  for (const session of sessions) {
+    const sorted = [...session].sort((a, b) => a.start - b.start);
+    const maxEndInterval = sorted.reduce((a, b) => (a.end > b.end ? a : b));
+    const spanMs = maxEndInterval.end - sorted[0].start;
+    if (spanMs > MAX_PLAUSIBLE_SESSION_SPAN_MS) {
+      console.log(
+        `[processHealthSamples] Long-session diagnostic — session spans ${(spanMs / 3600000).toFixed(1)}h ` +
+        `(${sorted[0].startISO} -> ${maxEndInterval.endISO}), ${sorted.length} raw intervals:`
+      );
+      let prevEnd: number | null = null;
+      sorted.forEach((iv, i) => {
+        const gapMin = prevEnd != null ? Math.round((iv.start - prevEnd) / 60000) : 0;
+        const durMin = Math.round((iv.end - iv.start) / 60000);
+        console.log(
+          `[processHealthSamples]   #${i} stage=${iv.stage} start=${iv.startISO} end=${iv.endISO} ` +
+          `dur=${durMin}min gapBefore=${gapMin}min`
+        );
+        prevEnd = iv.end;
+      });
+    }
+  }
+
+  // Merges overlapping [start, end] ms intervals and returns total non-overlapping
+  // elapsed minutes. Same logic already proven in logSleepOverlapDiagnostic below —
+  // kept as one shared implementation so the diagnostic and the real aggregation can
+  // never silently drift apart from each other.
+  const mergeIntervalsToMinutes = (intervals: [number, number][]): number => {
+    if (!intervals.length) return 0;
+    const sorted = [...intervals].sort((a, b) => a[0] - b[0]);
+    let totalMs = 0;
+    let curStart = sorted[0][0], curEnd = sorted[0][1];
+    for (let i = 1; i < sorted.length; i++) {
+      const [s2, e2] = sorted[i];
+      if (s2 <= curEnd) { curEnd = Math.max(curEnd, e2); }
+      else { totalMs += curEnd - curStart; curStart = s2; curEnd = e2; }
+    }
+    totalMs += curEnd - curStart;
+    return Math.round(totalMs / 60000);
+  };
+
+  // Assign each whole session to one day (the local calendar day of its start/bedtime),
+  // then aggregate per-day from whichever session(s) landed on that day — a day can
+  // receive more than one session (e.g. a nap plus a real night), same as before.
+  const sessionsByDay: Record<string, SleepInterval[][]> = {};
+  for (const session of sessions) {
+    const sessionStartMs = Math.min(...session.map(x => x.start));
+    const key = localDateKey(new Date(sessionStartMs));
+    if (!daily[key]) continue;
+    if (!sessionsByDay[key]) sessionsByDay[key] = [];
+    sessionsByDay[key].push(session);
+  }
+
+  const toPairs = (ivs: SleepInterval[]): [number, number][] => ivs.map(iv => [iv.start, iv.end]);
+
+  // FIXED 2026-08-08 (nap vs. main-sleep conflation): a day's sessions used to be flattened
+  // together and merged as one, so a nap + a full overnight session combined into one
+  // inflated "night" (confirmed via device data — Aug 4 and Jul 19 each genuinely contained
+  // 2 separate real sessions, not overlap/duplicate artifacts; per-session merge logic
+  // itself was already correct). Product decision (2026-08-08): headline stats always come
+  // from the day's single longest-by-real-minutes session ("main sleep"); every other
+  // session that day is preserved on secondary_sleep_sessions rather than discarded, so no
+  // data is lost — deliberately not surfaced in any UI yet, that's a separate future call.
+  for (const key of Object.keys(daily)) {
+    const daySessions = sessionsByDay[key] || [];
+    if (daySessions.length === 0) continue;
+
+    const ranked = daySessions
+      .map(session => ({ session, totalMin: mergeIntervalsToMinutes(toPairs(session)) }))
+      .sort((a, b) => b.totalMin - a.totalMin);
+    const [main, ...secondary] = ranked;
+    const mainIntervals = main.session;
+
+    daily[key].deep_min = mergeIntervalsToMinutes(toPairs(mainIntervals.filter(iv => iv.stage === SLEEP_DEEP)));
+    daily[key].rem_min = mergeIntervalsToMinutes(toPairs(mainIntervals.filter(iv => iv.stage === SLEEP_REM)));
+    // CORE and the generic ASLEEP category (Whoop's only category — confirmed: it never
+    // writes stage-granular CORE/DEEP/REM) both bucket into the same "core/light" field.
+    daily[key].core_min = mergeIntervalsToMinutes(toPairs(mainIntervals.filter(iv => iv.stage === SLEEP_CORE || iv.stage === SLEEP_ASLEEP)));
+    // Total = merged across ALL stages together (of the main session only), not
+    // deep+rem+core summed — this way even an overlap *between* different stages (e.g. two
+    // disagreeing sources) can't double-count.
+    daily[key].total_min = main.totalMin;
+
+    const earliest = mainIntervals.reduce((a, b) => (a.start < b.start ? a : b));
+    const latest = mainIntervals.reduce((a, b) => (a.end > b.end ? a : b));
+    daily[key].sleep_start = earliest.startISO;
+    daily[key].sleep_end = latest.endISO;
+
+    daily[key].secondary_sleep_sessions = secondary.map(({ session, totalMin }) => {
+      const sEarliest = session.reduce((a, b) => (a.start < b.start ? a : b));
+      const sLatest = session.reduce((a, b) => (a.end > b.end ? a : b));
+      return { total_min: totalMin, sleep_start: sEarliest.startISO, sleep_end: sLatest.endISO };
+    });
+  }
+
+  // Calculate time_in_bed_min and sleep_efficiency for each day. Day assignment (which
+  // calendar day a session belongs to) already happened above via the session-building
+  // step, so sleep_start/sleep_end here are already correctly attributed to the bedtime's
+  // day — nothing further to re-assign at this point.
+  for (const key of Object.keys(daily)) {
+    const d = daily[key];
+    if (d.sleep_start && d.sleep_end) {
+      const startMs = new Date(d.sleep_start).getTime();
+      const endMs = new Date(d.sleep_end).getTime();
+      d.time_in_bed_min = Math.round((endMs - startMs) / 60000);
+      d.sleep_efficiency = d.time_in_bed_min > 0 ? Math.round((d.total_min / d.time_in_bed_min) * 100) : 0;
+    }
+  }
+
+  // Respiratory Rate: average per day
+  const respByDay: Record<string, number[]> = {};
+  for (const s of respSamples) {
+    const key = localDateKey(new Date(s.startDate));
+    if (!daily[key]) continue;
+    if (!respByDay[key]) respByDay[key] = [];
+    respByDay[key].push(s.value);
+  }
+  for (const [key, vals] of Object.entries(respByDay)) {
+    if (daily[key]) daily[key].resp_rate = Math.round((vals.reduce((a, b) => a + b, 0) / vals.length) * 10) / 10;
+  }
+
+  // 7-day averages
+  const last7 = Object.entries(daily)
+    .filter(([k]) => Math.round((Date.now() - new Date(k + 'T00:00:00').getTime()) / 86400000) < 7)
+    .map(([, v]) => v);
+
+  const avg = (arr: (number | null)[]): number => {
+    const valid = arr.filter((v): v is number => v != null);
+    return valid.length ? Math.round((valid.reduce((a, b) => a + b, 0) / valid.length) * 10) / 10 : 0;
+  };
+  const avgMinToHrs = (arr: number[]): number =>
+    arr.length ? Math.round((arr.reduce((a, b) => a + b, 0) / arr.length / 60) * 10) / 10 : 0;
+
+  // FIXED 2026-08-08: deep_sleep_avg/rem_sleep_avg/core_sleep_avg/total_sleep_avg were
+  // averaging across every day in last7 INCLUDING 0-value gap days (same root cause as
+  // the 30-day fix above — total_min/deep_min/rem_min/core_min all default to 0, not
+  // null, so gap days were silently counted as "zero sleep" instead of excluded like
+  // hrv_avg/rhr_avg already correctly do). real7 = only days with an actual synced
+  // session (total_min > 0, the same day-level test used everywhere else in this file to
+  // mean "a real night," e.g. sleepSchedule/realDaysCount) — a stage individually reading
+  // 0 on a real night (e.g. no measurable deep sleep that night) still correctly counts,
+  // since the filter is on the day having a session at all, not on each field.
+  const real7 = last7.filter(d => d.total_min > 0);
+
+  const hrv_avg = avg(last7.map(d => d.hrv));
+  const rhr_avg = avg(last7.map(d => d.rhr));
+  const deep_sleep_avg = avgMinToHrs(real7.map(d => d.deep_min));
+  const rem_sleep_avg = avgMinToHrs(real7.map(d => d.rem_min));
+  const core_sleep_avg = avgMinToHrs(real7.map(d => d.core_min));
+  const total_sleep_avg = avgMinToHrs(real7.map(d => d.total_min));
+  const resp_rate_avg = avg(last7.map(d => d.resp_rate));
+
+  // Week-over-week deltas
+  const getDays = (lo: number, hi: number) => Object.entries(daily)
+    .filter(([k]) => { const d = Math.round((Date.now() - new Date(k + 'T00:00:00').getTime()) / 86400000); return d >= lo && d < hi; })
+    .map(([, v]) => v);
+  const thisW = getDays(0, 7), prevW = getDays(7, 14);
+  const wow = (c: (number | null)[], p: (number | null)[]): number | null => {
+    const cv = avg(c), pv = avg(p);
+    return pv > 0 ? Math.round((cv - pv) * 10) / 10 : null;
+  };
+  // Same real-day filter as real7 above, applied to the WoW windows for total_sleep_wow.
+  const thisWReal = thisW.filter(d => d.total_min > 0), prevWReal = prevW.filter(d => d.total_min > 0);
+
+  // 30-day sleep trend card (added 2026-08-08).
+  //
+  // FIXED 2026-08-08: originally averaged total_min across every day in the window
+  // INCLUDING 0-value gap days (Whoop not worn, sync gaps) — dragging the average down
+  // by counting "no data" as "zero sleep." Confirmed via diagnostic evidence (below) and
+  // by contrast with hrv_avg/rhr_avg, which already correctly exclude no-data days (they
+  // default to null and get filtered by avg()'s `!= null` check) — total_min defaults to
+  // 0, not null, so it was never getting that same filtering. Real gap days already
+  // confirmed present in this account's history from earlier tonight's log (Jul 25,
+  // Aug 3, Aug 6 all fully absent). Now excludes zero/no-real-data days from both the
+  // average and its denominator, matching the HRV/RHR convention — real nights only.
+  const curr30 = getDays(0, 30), prior30 = getDays(30, 60);
+  const realDaysCount = (days: DailyHealthMetric[]) => days.filter(d => d.total_min > 0).length;
+  const avg30Min = (days: DailyHealthMetric[]): number => {
+    const real = days.filter(d => d.total_min > 0);
+    return real.length ? real.reduce((a, d) => a + d.total_min, 0) / real.length : 0;
+  };
+  // TEMPORARY DIAGNOSTIC (added 2026-08-08) — logs real-vs-gap day counts for both
+  // windows so the fix above can be checked against real device data, not just source
+  // reasoning. Remove once confirmed on-device.
+  console.log(
+    `[processHealthSamples] 30-day avg diagnostic — curr30: ${realDaysCount(curr30)}/${curr30.length} ` +
+    `days with real sleep data (avg ${Math.round(avg30Min(curr30))}min), prior30: ${realDaysCount(prior30)}/${prior30.length} ` +
+    `days with real sleep data (avg ${Math.round(avg30Min(prior30))}min)`
+  );
+  const total_sleep_avg_30d_min = avg30Min(curr30);
+  // Requires real (non-gap) data on both sides before showing a comparison — a delta
+  // computed against 2-3 real nights in a 30-day window would be misleading, not just
+  // imprecise. Expected to return null until ~30+ days of real sync history exist.
+  const MIN_REAL_DAYS_FOR_30D_COMPARISON = 10;
+  const hasEnoughHistory =
+    realDaysCount(curr30) >= MIN_REAL_DAYS_FOR_30D_COMPARISON &&
+    realDaysCount(prior30) >= MIN_REAL_DAYS_FOR_30D_COMPARISON;
+  const total_sleep_wow_30d_min = hasEnoughHistory
+    ? Math.round(avg30Min(curr30) - avg30Min(prior30))
+    : null;
+
+  return {
+    hrv_avg, rhr_avg, deep_sleep_avg, rem_sleep_avg, core_sleep_avg,
+    total_sleep_avg, resp_rate_avg,
+    hrv_wow: wow(thisW.map(d => d.hrv), prevW.map(d => d.hrv)),
+    rhr_wow: wow(thisW.map(d => d.rhr), prevW.map(d => d.rhr)),
+    // FIXED 2026-08-08 (units): was diffing raw total_min (minutes) while displayed with
+    // an 'h' suffix (App.tsx wowBadge call site) with no conversion — total_sleep_avg
+    // converts via avgMinToHrs but this didn't, so a real ~-130min delta rendered as
+    // "-130.2h", an impossible-looking number that was actually just mislabeled minutes.
+    // FIXED 2026-08-08 (gap days): also switched thisW/prevW to thisWReal/prevWReal —
+    // same real-day-only fix as total_sleep_avg/avg30Min above, so gap days can't drag
+    // this delta in either direction either.
+    total_sleep_wow: wow(thisWReal.map(d => d.total_min / 60), prevWReal.map(d => d.total_min / 60)),
+    total_sleep_avg_30d_min,
+    total_sleep_wow_30d_min,
+    daily,
+  };
+}
+
+// Diagnostic only — does not change what gets stored/displayed. Groups raw sleep
+// samples by calendar day and compares the naive summed duration (what
+// processHealthSamples currently computes into total_min) against the real elapsed
+// time after merging overlapping intervals. A day where naive sum is much larger than
+// the merged duration is direct proof of overlapping/duplicate samples (e.g. more than
+// one source writing sleep for the same night, or the same session re-synced more than
+// once) — the suspected cause of total_sleep_avg reading far higher than physically
+// possible while core_sleep_avg (computed from the same samples) looked correct.
+function logSleepOverlapDiagnostic(samples: SleepSample[]) {
+  const byDay: Record<string, { count: number; sources: Set<string>; naiveSumMin: number; intervals: [number, number][] }> = {};
+  for (const s of samples) {
+    const key = new Date(s.startDate).toISOString().slice(0, 10);
+    if (!byDay[key]) byDay[key] = { count: 0, sources: new Set(), naiveSumMin: 0, intervals: [] };
+    const startMs = new Date(s.startDate).getTime();
+    const endMs = new Date(s.endDate).getTime();
+    const durMin = Math.round((endMs - startMs) / 60000);
+    byDay[key].count++;
+    byDay[key].sources.add(s.sourceName || 'unknown');
+    byDay[key].naiveSumMin += durMin;
+    byDay[key].intervals.push([startMs, endMs]);
+  }
+  const last7Keys = Object.keys(byDay).sort().slice(-7);
+  console.log(`[syncHealthData] Sleep overlap diagnostic — ${samples.length} total samples across ${Object.keys(byDay).length} days, showing last 7:`);
+  for (const key of last7Keys) {
+    const day = byDay[key];
+    const sorted = [...day.intervals].sort((a, b) => a[0] - b[0]);
+    let mergedMin = 0;
+    let curStart = sorted[0][0], curEnd = sorted[0][1];
+    for (let i = 1; i < sorted.length; i++) {
+      const [s2, e2] = sorted[i];
+      if (s2 <= curEnd) { curEnd = Math.max(curEnd, e2); }
+      else { mergedMin += Math.round((curEnd - curStart) / 60000); curStart = s2; curEnd = e2; }
+    }
+    mergedMin += Math.round((curEnd - curStart) / 60000);
+    const suspect = day.naiveSumMin > mergedMin * 1.2 ? '  <-- OVERLAP/DUPLICATE SUSPECTED' : '';
+    console.log(`[syncHealthData] Sleep ${key}: ${day.count} samples, sources=[${Array.from(day.sources).join(', ')}], naive sum=${day.naiveSumMin}min (${(day.naiveSumMin / 60).toFixed(1)}h), merged real elapsed=${mergedMin}min (${(mergedMin / 60).toFixed(1)}h)${suspect}`);
+  }
+}
+
+// TEMPORARY DIAGNOSTIC (added 2026-08-08, investigating Aug 7 sleep_start discrepancy
+// vs. Whoop/Apple Health — our app showed 5:49 AM start / 6h0m total, Whoop and Apple
+// both showed ~4:31-4:35 AM / ~7h. Wake time matched exactly across all three, so the
+// gap is isolated to how the start of the session is determined. Logs every raw sleep
+// sample HealthKit returns in a wide window around Aug 7 IST (not just samples whose
+// UTC-date key already says "2026-08-07") so we can see directly whether an early
+// segment exists in the raw data and, if so, which day's bucket it's currently keyed
+// to — including testing the hypothesis that a sample starting before 5:30 AM IST
+// converts to the *previous* UTC calendar day via `.toISOString().slice(0, 10)`,
+// which would file it under Aug 6 instead of Aug 7. Not yet confirmed — remove once
+// root cause is established and any resulting fix is verified on-device.
+const AUG7_DIAG_WINDOW_START = new Date('2026-08-06T18:00:00.000Z').getTime();
+const AUG7_DIAG_WINDOW_END = new Date('2026-08-08T00:00:00.000Z').getTime();
+
+function logSingleNightRawSamples(samples: SleepSample[]) {
+  const inWindow = samples.filter((s) => {
+    const startMs = new Date(s.startDate).getTime();
+    const endMs = new Date(s.endDate).getTime();
+    return endMs > AUG7_DIAG_WINDOW_START && startMs < AUG7_DIAG_WINDOW_END;
+  });
+  const sorted = [...inWindow].sort(
+    (a, b) => new Date(a.startDate).getTime() - new Date(b.startDate).getTime()
+  );
+  console.log(
+    `[syncHealthData] Aug 7 raw samples — ${sorted.length} samples in window ` +
+    `(${new Date(AUG7_DIAG_WINDOW_START).toISOString()} to ${new Date(AUG7_DIAG_WINDOW_END).toISOString()}):`
+  );
+  sorted.forEach((s, i) => {
+    const startMs = new Date(s.startDate).getTime();
+    const endMs = new Date(s.endDate).getTime();
+    const durMin = Math.round((endMs - startMs) / 60000);
+    const utcDateKey = new Date(s.startDate).toISOString().slice(0, 10);
+    console.log(
+      `[syncHealthData] Aug 7 sample #${i}: value=${s.value}, start=${s.startDate}, ` +
+      `end=${s.endDate}, duration=${durMin}min, utcDateKey=${utcDateKey}, ` +
+      `source=${s.sourceName || 'unknown'}, id=${s.id || 'n/a'}`
+    );
+  });
+}
+
+/**
+ * Sync health data from Apple HealthKit. Returns processed data or null on failure.
+ * Requires native EAS build - returns null gracefully in Expo Go.
+ */
+async function syncHealthData(): Promise<StoredHealthData | null> {
+  if (!AppleHealthKit) {
+    console.warn('[syncHealthData] react-native-health not available (Expo Go?)');
+    return null;
+  }
+  if (Platform.OS !== 'ios') {
+    console.warn('[syncHealthData] Android Health Connect not yet supported');
+    return null;
+  }
+
+  return new Promise((resolve) => {
+    const P = AppleHealthKit.Constants.Permissions;
+    const perms: any = { permissions: { read: [P.HeartRateVariability, P.RestingHeartRate, P.SleepAnalysis], write: [] } };
+    // RespiratoryRate permission - may not exist in older react-native-health versions
+    if (P.RespiratoryRate) perms.permissions.read.push(P.RespiratoryRate);
+
+    AppleHealthKit.initHealthKit(perms, (initErr: string) => {
+      if (initErr) {
+        console.warn('[syncHealthData] initHealthKit failed:', initErr);
+        resolve(null);
+        return;
+      }
+
+      const now = new Date();
+      // Window intentionally >=60 days (extended 2026-08-08 from 30, to support the 30-day
+      // sleep trend card's prior-30-day comparison — needs a full 60 days of raw samples so
+      // processHealthSamples can bucket both the current and prior 30-day periods). Not
+      // trimmed to what the UI currently displays for HRV/RHR (7-day summary averages)
+      // either — HRV specifically needs a longer rolling baseline to be statistically
+      // meaningful (Whoop/Oura-style 30-day+ baselines), not a noisy 7-day window. The
+      // fuller range is retained in `daily` for future baseline work (Allostatic Load) too.
+      const start = new Date(now.getTime() - 60 * 86400000);
+      const opts = { startDate: start.toISOString(), endDate: now.toISOString() };
+      console.log('[syncHealthData] query window:', opts.startDate, '->', opts.endDate);
+
+      let hrvArr: HealthSample[] = [], rhrArr: HealthSample[] = [], sleepArr: SleepSample[] = [], respArr: HealthSample[] = [];
+      let done = 0;
+      const totalQueries = P.RespiratoryRate ? 4 : 3;
+      const checkDone = () => { if (++done >= totalQueries) finish(); };
+
+      const finish = () => {
+        const data = processHealthSamples(hrvArr, rhrArr, sleepArr, respArr);
+        AsyncStorage.setItem(HEALTH_DATA_KEY, JSON.stringify(data)).catch(() => {});
+        AsyncStorage.setItem(HEALTH_SYNC_KEY, new Date().toISOString()).catch(() => {});
+        resolve(data);
+      };
+
+      // Logs exactly what each individual HealthKit query returned — error, empty
+      // array, or real samples — so a "--" in the UI can be traced to a specific cause
+      // (permission not actually granted, no source ever wrote this data type, or a
+      // processing bug) instead of guessing. HealthKit deliberately never exposes real
+      // read-authorization status to apps (privacy-by-design), so the only way to tell
+      // "permission denied" apart from "no data exists" is by observing query results
+      // like this.
+      const logQueryResult = (name: string, err: string, res: HealthSample[] | SleepSample[]) => {
+        if (err) {
+          console.log(`[syncHealthData] ${name} — ERROR:`, err);
+        } else if (!Array.isArray(res)) {
+          console.log(`[syncHealthData] ${name} — unexpected non-array result:`, typeof res, res);
+        } else if (res.length === 0) {
+          console.log(`[syncHealthData] ${name} — empty array (0 samples) in this window`);
+        } else {
+          console.log(`[syncHealthData] ${name} — ${res.length} samples. First:`, JSON.stringify(res[0]), 'Last:', JSON.stringify(res[res.length - 1]));
+        }
+      };
+
+      AppleHealthKit.getHeartRateVariabilitySamples(opts, (err: string, res: HealthSample[]) => {
+        logQueryResult('HRV (getHeartRateVariabilitySamples)', err, res);
+        if (!err && Array.isArray(res)) hrvArr = res; checkDone();
+      });
+      AppleHealthKit.getRestingHeartRateSamples(opts, (err: string, res: HealthSample[]) => {
+        logQueryResult('RHR (getRestingHeartRateSamples)', err, res);
+        if (!err && Array.isArray(res)) rhrArr = res; checkDone();
+      });
+      AppleHealthKit.getSleepSamples(opts, (err: string, res: SleepSample[]) => {
+        logQueryResult('Sleep (getSleepSamples)', err, res);
+        if (!err && Array.isArray(res) && res.length > 0) logSleepOverlapDiagnostic(res);
+        if (!err && Array.isArray(res) && res.length > 0) logSingleNightRawSamples(res);
+        if (!err && Array.isArray(res)) sleepArr = res; checkDone();
+      });
+      if (P.RespiratoryRate && typeof AppleHealthKit.getRespiratoryRateSamples === 'function') {
+        AppleHealthKit.getRespiratoryRateSamples(opts, (err: string, res: HealthSample[]) => {
+          logQueryResult('Respiratory Rate (getRespiratoryRateSamples)', err, res);
+          if (!err && Array.isArray(res)) respArr = res; checkDone();
+        });
+      } else {
+        checkDone();
+      }
+    });
+  });
+}
+
+// ============================================================
+// HEALTH CONNECT SCREEN
+// ============================================================
+
 function HealthConnectScreen({ onNavigate }: { onNavigate: (s: ScreenId) => void }) {
   const { colors } = useTheme();
+  const { clinicalDepth } = useClinicalDepth();
+  const { scoreHistory } = useAppData();
+  const latestHistory = scoreHistory[0];
+  const [connected, setConnected] = useState(false);
+  const [syncing, setSyncing] = useState(false);
+  const [healthData, setHealthData] = useState<StoredHealthData | null>(null);
+  const [lastSyncTime, setLastSyncTime] = useState('');
+  const [error, setError] = useState<string | null>(null);
+  const [activeMetric, setActiveMetric] = useState<'sleep' | 'hrv' | 'rhr'>('sleep');
 
-  // Floating/bouncing icons
-  const metrics = [
-    { icon: 'moon', label: 'Deep Sleep', color: '#7C5CFF' },
-    { icon: 'heart-circle', label: 'HRV', color: '#22C55E' },
-    { icon: 'eye', label: 'REM', color: '#4DA8FF' },
-    { icon: 'speedometer', label: 'VO₂ Max', color: '#F59E0B' },
-    { icon: 'heart', label: 'Resting HR', color: '#D42B2B' },
+  useEffect(() => {
+    AsyncStorage.getItem(HEALTH_SYNC_KEY).then(v => { if (v) { setConnected(true); setLastSyncTime(v); } }).catch(() => {});
+    AsyncStorage.getItem(HEALTH_DATA_KEY).then(v => { if (v) { try { setHealthData(JSON.parse(v)); } catch {} } }).catch(() => {});
+  }, []);
+
+  const doSync = useCallback(async () => {
+    console.log('[HealthConnect] doSync called, AppleHealthKit:', !!AppleHealthKit, 'Platform:', Platform.OS);
+    if (!AppleHealthKit) { setError('Health sync requires a native EAS build (not Expo Go). If you\'re on a dev build, try rebuilding with eas build.'); return; }
+    if (Platform.OS !== 'ios') { setError('Android Health Connect support is coming soon.'); return; }
+    setSyncing(true);
+    setError(null);
+    try {
+      const data = await syncHealthData();
+      console.log('[HealthConnect] syncHealthData returned:', data ? 'data with ' + Object.keys(data.daily).length + ' days' : 'null');
+      if (data) {
+        setHealthData(data);
+        setConnected(true);
+        setLastSyncTime(new Date().toISOString());
+      } else {
+        setError('Could not read data. Check that Apple Health permissions are granted in Settings > Health > Metabolic Score.');
+      }
+    } catch (e) {
+      console.error('[HealthConnect] sync error:', e);
+      setError('Sync failed: ' + (e instanceof Error ? e.message : 'Unknown error'));
+    }
+    setSyncing(false);
+  }, []);
+
+  // Auto-sync if data is stale (> 4 hours)
+  useEffect(() => {
+    if (!connected || !lastSyncTime || syncing) return;
+    const hoursSince = (Date.now() - new Date(lastSyncTime).getTime()) / 3600000;
+    if (hoursSince > 4) doSync();
+  }, [connected, lastSyncTime, doSync]);
+
+  const doDisconnect = async () => {
+    await AsyncStorage.removeItem(HEALTH_DATA_KEY);
+    await AsyncStorage.removeItem(HEALTH_SYNC_KEY);
+    setActiveMetric('sleep');
+    setConnected(false);
+    setHealthData(null);
+    setLastSyncTime('');
+  };
+
+  // ── Helpers ──────────────────────────────────────────────
+  const fmtTimeAgo = (iso: string) => {
+    const mins = Math.round((Date.now() - new Date(iso).getTime()) / 60000);
+    if (mins < 1) return 'Just now';
+    if (mins < 60) return `${mins}m ago`;
+    const hrs = Math.floor(mins / 60);
+    if (hrs < 24) return `${hrs}h ago`;
+    return `${Math.floor(hrs / 24)}d ago`;
+  };
+
+  const fmtTime = (iso: string | null) => {
+    if (!iso) return '--:--';
+    try {
+      const d = new Date(iso);
+      if (isNaN(d.getTime())) return '--:--';
+      const h = d.getHours();
+      const m = d.getMinutes();
+      const ampm = h >= 12 ? 'PM' : 'AM';
+      const h12 = h === 0 ? 12 : h > 12 ? h - 12 : h;
+      return `${h12}:${m.toString().padStart(2, '0')} ${ampm}`;
+    } catch { return '--:--'; }
+  };
+
+  // Find "last night's" data. FIXED 2026-08-08: previously branched on time-of-day and
+  // used `.toISOString().slice(0, 10)` (UTC-based key) — a leftover heuristic from when
+  // raw samples were bucketed to their own day before merging, plus the same UTC/local
+  // day-boundary bug fixed in processHealthSamples. Confirmed as the cause when the "Last
+  // Night" card disappeared right at local midnight: before noon, the UTC key landed one
+  // full day earlier than intended, hitting a real data gap. Now that sessions are always
+  // assigned to their bedtime's local day (processHealthSamples), "last night" is simply
+  // always yesterday's local date — today's bucket has no session until tonight's bedtime,
+  // so no time-of-day branching is needed.
+  const lastNightKey = localDateKey(new Date(Date.now() - 86400000));
+  const lastNight = healthData?.daily?.[lastNightKey] ?? null;
+  // Also check the day before yesterday as fallback
+  const fallbackKey = localDateKey(new Date(Date.now() - 2 * 86400000));
+  const fallback = healthData?.daily?.[fallbackKey] ?? null;
+  const lastNightData = (lastNight && lastNight.total_min > 0) ? lastNight : (fallback && fallback.total_min > 0 ? fallback : null);
+
+  // ── 30-day trend data ────────────────────────────────────
+  const trendDays = useMemo(() => {
+    if (!healthData) return [];
+    const days: { key: string; label: string; dayOfWeek: string; value: number | null; avg7: number | null }[] = [];
+    const values: (number | null)[] = [];
+    for (let i = 29; i >= 0; i--) {
+      // FIXED 2026-08-08: was `.toISOString().slice(0, 10)` (UTC-based key) — same
+      // day-boundary bug already fixed in processHealthSamples/getYesterdayKey, but
+      // still live here until now, since healthData.daily's own keys are local-date-based.
+      const d = new Date(Date.now() - i * 86400000);
+      const key = localDateKey(d);
+      const dm = healthData.daily[key];
+      let val: number | null = null;
+      if (activeMetric === 'sleep') val = dm?.total_min ? Math.round(dm.total_min / 60 * 10) / 10 : null;
+      else if (activeMetric === 'hrv') val = dm?.hrv ?? null;
+      else val = dm?.rhr ?? null;
+      values.push(val);
+      const label = d.getDate().toString();
+      const dayNames = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+      const dayOfWeek = dayNames[d.getDay()];
+      days.push({ key, label, dayOfWeek, value: val, avg7: null });
+    }
+    // Fill 7-day rolling averages
+    for (let i = 0; i < days.length; i++) {
+      const win = values.slice(Math.max(0, i - 6), i + 1);
+      const valid = win.filter((v): v is number => v != null);
+      if (valid.length >= 3) {
+        days[i].avg7 = Math.round((valid.reduce((a, b) => a + b, 0) / valid.length) * 10) / 10;
+      }
+    }
+    return days;
+  }, [healthData, activeMetric]);
+
+  // ── Sleep schedule stats (from days with sleep_start/sleep_end) ──
+  // Moved above sleepSchedule (was previously declared below it, after the useMemo
+  // that calls it — worked fine while sleep data was always empty since this code path
+  // never actually ran, but broke the moment real sleep_start/sleep_end data arrived
+  // and the useMemo's factory function tried to call it before its own declaration
+  // line had executed. Pure reordering fix, no logic change.
+  const fmtMinutesToTime = (min: number) => {
+    const h = Math.floor(min / 60) % 24;
+    const m = min % 60;
+    const ampm = h >= 12 ? 'PM' : 'AM';
+    const h12 = h === 0 ? 12 : h > 12 ? h - 12 : h;
+    return `${h12}:${m.toString().padStart(2, '0')} ${ampm}`;
+  };
+
+  // Duration (not time-of-day) formatting for the 30-day trend card's headline/comparison
+  // — "Xh Ym", e.g. 402 -> "6h 42m". Distinct from fmtMinutesToTime above, which formats a
+  // clock time, not a span of minutes.
+  const fmtDurationHM = (totalMin: number) => {
+    const sign = totalMin < 0 ? '-' : '';
+    const abs = Math.round(Math.abs(totalMin));
+    const h = Math.floor(abs / 60);
+    const m = abs % 60;
+    return `${sign}${h}h ${m}m`;
+  };
+
+  const sleepSchedule = useMemo(() => {
+    if (!healthData) return null;
+    let bedtimes: number[] = [];
+    let waketimes: number[] = [];
+    // TEMPORARY DIAGNOSTIC (added 2026-08-08, investigating avg bedtime discrepancy vs.
+    // Apple Health — app showed 4:20 AM, Apple's own 30-day average showed 2:49 AM, a
+    // ~91min gap too large to be noise given last night's single-night value now matches
+    // exactly post-timezone-fix. Collects per-night key/raw sleep_start/sleep_end/computed
+    // bedMin/wakeMin alongside the real bedtimes/waketimes arrays so we can see the actual
+    // distribution before averaging — not yet known whether this is a few outlier nights
+    // or a systematic issue (e.g. the averaging below not handling bedtimes that straddle
+    // midnight — no wraparound/circular-mean adjustment currently happens despite the
+    // comment a few lines down implying it does). Remove once root cause is confirmed and
+    // any resulting fix is verified on-device.
+    const nightRecords: { key: string; sleep_start: string; sleep_end: string; bedMin: number; wakeMin: number; total_min: number }[] = [];
+    for (const key of Object.keys(healthData.daily)) {
+      const d = healthData.daily[key];
+      if (d.sleep_start && d.sleep_end && d.total_min > 60) {
+        const start = new Date(d.sleep_start);
+        const end = new Date(d.sleep_end);
+        // Convert to minutes from midnight for averaging
+        const bedMin = start.getHours() * 60 + start.getMinutes();
+        const wakeMin = end.getHours() * 60 + end.getMinutes();
+        bedtimes.push(bedMin);
+        waketimes.push(wakeMin);
+        nightRecords.push({ key, sleep_start: d.sleep_start, sleep_end: d.sleep_end, bedMin, wakeMin, total_min: d.total_min });
+      }
+    }
+    if (nightRecords.length > 0) {
+      const sorted = [...nightRecords].sort((a, b) => a.key.localeCompare(b.key));
+      console.log(`[HealthConnectScreen] Sleep schedule diagnostic — ${sorted.length} nights included:`);
+      sorted.forEach((r, i) => {
+        console.log(
+          `[HealthConnectScreen] Night #${i} ${r.key}: sleep_start=${r.sleep_start}, sleep_end=${r.sleep_end}, ` +
+          `bedMin=${r.bedMin} (${fmtMinutesToTime(r.bedMin)}), wakeMin=${r.wakeMin} (${fmtMinutesToTime(r.wakeMin)}), ` +
+          `total_min=${r.total_min}`
+        );
+      });
+      const naiveAvgBed = Math.round(bedtimes.reduce((a, b) => a + b, 0) / bedtimes.length);
+      const naiveAvgWake = Math.round(waketimes.reduce((a, b) => a + b, 0) / waketimes.length);
+      console.log(
+        `[HealthConnectScreen] Sleep schedule diagnostic — raw bedtimes=${JSON.stringify(bedtimes)}, ` +
+        `raw waketimes=${JSON.stringify(waketimes)}, naive avgBedMin=${naiveAvgBed} (${fmtMinutesToTime(naiveAvgBed)}), ` +
+        `naive avgWakeMin=${naiveAvgWake} (${fmtMinutesToTime(naiveAvgWake)})`
+      );
+    }
+    if (bedtimes.length < 3) return null;
+    const avgWakeMin = Math.round(waketimes.reduce((a, b) => a + b, 0) / waketimes.length);
+    // Circular mean/stdDev for bedtimes — bedtimes genuinely straddle midnight (most
+    // nights after midnight, occasionally before it), which a plain arithmetic mean/stdDev
+    // can't handle: 11:55 PM (1435min) and 12:14 AM (14min) are ~19 minutes apart in real
+    // time but ~1421 minutes apart arithmetically. FIXED 2026-08-08 — confirmed via real
+    // device data that Night #5 (11:26 PM) and Night #18 (11:55 PM) are genuine, correct
+    // bedtimes, not bugs or session-fragment artifacts; they just fall on the other side
+    // of midnight from the other 19 nights, which is exactly what produced both the
+    // impossible 361-minute stdDev (mathematically impossible for the real ~9h range once
+    // you exclude these two, per Popoviciu's inequality) and the meaningless ~6:30 AM
+    // average. Standard circular-statistics approach: treat each bedtime as an angle on a
+    // 24h clock, average via atan2 of summed sin/cos components (not the raw minutes),
+    // convert back to a minutes-of-day value. This replaces the stale, never-actually-
+    // implemented "Handle overnight" comment that used to sit here.
+    const TWO_PI = Math.PI * 2;
+    const MINUTES_PER_DAY = 1440;
+    const bedAngles = bedtimes.map(m => (m / MINUTES_PER_DAY) * TWO_PI);
+    const sumSin = bedAngles.reduce((s, a) => s + Math.sin(a), 0);
+    const sumCos = bedAngles.reduce((s, a) => s + Math.cos(a), 0);
+    const meanAngle = Math.atan2(sumSin / bedtimes.length, sumCos / bedtimes.length);
+    const avgBedMin = Math.round((((meanAngle / TWO_PI) * MINUTES_PER_DAY) + MINUTES_PER_DAY) % MINUTES_PER_DAY);
+    // Circular standard deviation (Mardia's formula): R = mean resultant length (0-1,
+    // where 1 = zero dispersion), circular stdDev = sqrt(-2 * ln(R)) in radians — converted
+    // to a minutes-equivalent so it plugs into the existing minutes-based consistency
+    // formula below unchanged. Clamped at PI (720min-equivalent, half the clock) to guard
+    // against R approaching 0 (maximally dispersed bedtimes) blowing up toward Infinity.
+    const R = Math.sqrt(sumSin * sumSin + sumCos * sumCos) / bedtimes.length;
+    const circStdDevRad = R > 1e-9 ? Math.min(Math.PI, Math.sqrt(-2 * Math.log(R))) : Math.PI;
+    const stdDev = (circStdDevRad / TWO_PI) * MINUTES_PER_DAY;
+    // Consistency: within 30min = 100%, degrades by 2% per minute of std dev beyond 30
+    const consistency = Math.max(0, Math.min(100, Math.round(100 - Math.max(0, stdDev - 30) * 2)));
+    return {
+      avgBedtime: fmtMinutesToTime(avgBedMin),
+      avgWakeTime: fmtMinutesToTime(avgWakeMin),
+      consistency,
+      stdDevMin: Math.round(stdDev),
+      sampleDays: bedtimes.length,
+    };
+  }, [healthData]);
+
+  const wowBadge = (val: number | null, unit: string, invert = false) => {
+    if (val == null) return null;
+    const isGood = invert ? val < 0 : val > 0;
+    const color = val === 0 ? '#71717A' : isGood ? '#22C55E' : '#EF4444';
+    const arrow = val > 0 ? '\u2191' : val < 0 ? '\u2193' : '\u2192';
+    return { text: `${arrow}${Math.abs(val)}${unit}`, color };
+  };
+
+  // ── SLEEP QUALITY SCORE (0-100) ──
+  const sleepQualityScore = useMemo(() => {
+    if (!lastNightData || lastNightData.total_min <= 0) return null;
+    // Duration score (0-40): optimal 7-9h, penalize outside
+    const hours = lastNightData.total_min / 60;
+    let durationScore = 40;
+    if (hours < 5) durationScore = 5;
+    else if (hours < 6) durationScore = 15;
+    else if (hours < 7) durationScore = 28;
+    else if (hours <= 9) durationScore = 40;
+    else if (hours <= 10) durationScore = 30;
+    else durationScore = 15;
+    // Efficiency score (0-30)
+    const eff = lastNightData.sleep_efficiency || 0;
+    let effScore = 0;
+    if (eff >= 90) effScore = 30;
+    else if (eff >= 85) effScore = 25;
+    else if (eff >= 75) effScore = 18;
+    else if (eff >= 60) effScore = 10;
+    else if (eff > 0) effScore = 5;
+    // Consistency bonus (0-30) from sleep schedule
+    let consistScore = sleepSchedule ? Math.round(sleepSchedule.consistency * 0.3) : 10;
+    return Math.min(100, Math.max(0, durationScore + effScore + consistScore));
+  }, [lastNightData, sleepSchedule]);
+
+  const sleepQualityLabel = (s: number) => {
+    if (s >= 85) return { text: 'Excellent', color: '#22C55E' };
+    if (s >= 70) return { text: 'Good', color: '#22C55E' };
+    if (s >= 55) return { text: 'Fair', color: '#F59E0B' };
+    if (s >= 35) return { text: 'Poor', color: '#EF4444' };
+    return { text: 'Very Poor', color: '#EF4444' };
+  };
+
+  // ── 7-DAY TREND INSIGHT TEXT ──
+  const trendInsight = useMemo(() => {
+    if (!healthData || trendDays.length < 7) return null;
+    const recent7 = trendDays.slice(-7).map(d => d.value).filter((v): v is number => v != null);
+    if (recent7.length < 5) return null;
+    const avg7 = recent7.reduce((a, b) => a + b, 0) / recent7.length;
+    const prev7 = trendDays.slice(-14, -7).map(d => d.value).filter((v): v is number => v != null);
+    if (prev7.length < 3) return null;
+    const avgPrev7 = prev7.reduce((a, b) => a + b, 0) / prev7.length;
+    const pctChange = ((avg7 - avgPrev7) / Math.max(avgPrev7, 0.1)) * 100;
+    const unit = activeMetric === 'sleep' ? 'h' : activeMetric === 'hrv' ? 'ms' : 'bpm';
+    const metricName = activeMetric === 'sleep' ? 'sleep' : activeMetric === 'hrv' ? 'HRV' : 'resting heart rate';
+    const invertGood = activeMetric === 'rhr'; // lower RHR is better
+    const isImproving = invertGood ? pctChange < -3 : pctChange > 3;
+    const isDeclining = invertGood ? pctChange > 3 : pctChange < -3;
+    if (isImproving) {
+      return { text: `Your ${metricName} is trending up — ${Math.abs(Math.round(pctChange))}% higher than the previous week. This is a positive signal for recovery.`, color: '#22C55E', icon: 'trending-up' as const };
+    }
+    if (isDeclining) {
+      return { text: `Your ${metricName} has dipped ${Math.abs(Math.round(pctChange))}% vs. last week. Consider sleep, stress management, and recovery protocols.`, color: '#EF4444', icon: 'trending-down' as const };
+    }
+    return { text: `Your ${metricName} is stable this week — averaging ${avg7.toFixed(activeMetric === 'sleep' ? 1 : 0)}${unit}. Consistency is key for metabolic health.`, color: '#71717A', icon: 'remove' as const };
+  }, [healthData, trendDays, activeMetric]);
+
+  // ── LAYER CORRELATION DATA ──
+  const layerCorrelations = useMemo(() => {
+    if (!healthData) return [];
+    const corr: { layer: typeof LAYERS[0]; metric: string; value: string; status: 'good' | 'caution' | 'neutral'; note: string }[] = [];
+    // Layer 1 - Circadian: Sleep
+    const sleepAvg = healthData.total_sleep_avg;
+    if (sleepAvg) {
+      const h = sleepAvg;
+      corr.push({
+        layer: LAYERS[0], metric: 'Sleep Duration', value: `${sleepAvg}h`,
+        status: h >= 7 && h <= 9 ? 'good' : h >= 6 ? 'caution' : 'neutral',
+        note: h >= 7 && h <= 9 ? 'Within optimal range for circadian health' : h < 7 ? 'Below 7h may suppress circadian hormone cycling' : 'Over 9h may indicate recovery debt'
+      });
+    }
+    // Layer 2 - Neurochemical: HRV
+    if (healthData.hrv_avg) {
+      const hrv = healthData.hrv_avg;
+      corr.push({
+        layer: LAYERS[1], metric: 'HRV', value: `${healthData.hrv_avg}ms`,
+        status: hrv >= 50 ? 'good' : hrv >= 30 ? 'caution' : 'neutral',
+        note: hrv >= 50 ? 'Strong parasympathetic tone, good stress resilience' : hrv >= 30 ? 'Moderate vagal activity — room for improvement' : 'Low HRV suggests elevated sympathetic dominance'
+      });
+    }
+    // Layer 3 - Metabolic: RHR
+    if (healthData.rhr_avg) {
+      const rhr = healthData.rhr_avg;
+      corr.push({
+        layer: LAYERS[2], metric: 'Resting Heart Rate', value: `${healthData.rhr_avg}bpm`,
+        status: rhr <= 65 ? 'good' : rhr <= 75 ? 'caution' : 'neutral',
+        note: rhr <= 65 ? 'Low RHR indicates strong cardiovascular efficiency' : rhr <= 75 ? 'Slightly elevated — may improve with consistent movement' : 'Elevated RHR can signal metabolic stress'
+      });
+    }
+    // Layer 4 - Gut-Brain: HRV (vagal tone proxy)
+    if (healthData.hrv_avg) {
+      const hrv = healthData.hrv_avg;
+      corr.push({
+        layer: LAYERS[3], metric: 'Vagal Tone (HRV)', value: `${healthData.hrv_avg}ms`,
+        status: hrv >= 45 ? 'good' : hrv >= 30 ? 'caution' : 'neutral',
+        note: hrv >= 45 ? 'Healthy vagal tone supports gut-brain communication' : 'Lower vagal tone may affect gut motility and mood'
+      });
+    }
+    // Layer 5 - Identity: HRV trend
+    corr.push({
+      layer: LAYERS[4], metric: 'Recovery Capacity', value: healthData.hrv_avg ? `${healthData.hrv_avg}ms` : 'No data',
+      status: healthData.hrv_wow != null ? (healthData.hrv_wow > 0 ? 'good' : healthData.hrv_wow < -5 ? 'neutral' : 'caution') : 'neutral',
+      note: healthData.hrv_wow && healthData.hrv_wow > 0 ? 'Your recovery capacity is trending positively' : 'Track HRV over time to understand your resilience pattern'
+    });
+    return corr;
+  }, [healthData]);
+
+  // ── EXPORT HEALTH DATA ──
+  const [exporting, setExporting] = useState(false);
+  const doExport = useCallback(async () => {
+    if (!healthData) return;
+    setExporting(true);
+    try {
+      const dailyEntries = Object.entries(healthData.daily)
+        .sort(([a], [b]) => a.localeCompare(b))
+        .slice(-30)
+        .map(([date, d]: [string, any]) => ({
+          date,
+          sleep_h: d.total_min ? (d.total_min / 60).toFixed(1) + 'h' : '--',
+          efficiency: d.sleep_efficiency ? d.sleep_efficiency + '%' : '--',
+          hrv: d.hrv || '--',
+          rhr: d.rhr || '--',
+          bedtime: d.sleep_start ? fmtTime(d.sleep_start) : '--',
+          wake: d.sleep_end ? fmtTime(d.sleep_end) : '--',
+        }));
+      const lines = [
+        `Metabolic Score - Health Data Export`,
+        `Generated: ${new Date().toLocaleString()}`,
+        ``,
+        `7-Day Averages: Sleep ${healthData.total_sleep_avg || '--'}h | HRV ${healthData.hrv_avg || '--'}ms | RHR ${healthData.rhr_avg || '--'}bpm`,
+        `Respiratory Rate: ${healthData.resp_rate_avg || '--'} br/m`,
+        ``,
+        `Date | Sleep | Eff | HRV | RHR | Bedtime | Wake`,
+        `${'─'.repeat(65)}`,
+        ...dailyEntries.map(e => `${e.date} | ${e.sleep_h} | ${e.efficiency} | ${e.hrv} | ${e.rhr} | ${e.bedtime} | ${e.wake}`),
+        ``,
+        `This data is from your wearable via Apple Health.`,
+        `It is not a medical diagnosis — consult a healthcare professional.`,
+      ];
+      const content = lines.join('\n');
+      try {
+        const file = new ExpoFile(ExpoPaths.cache, 'metabolic-health-export.txt');
+        file.create();
+        file.write(new TextEncoder().encode(content));
+        if (await Sharing.isAvailableAsync()) {
+          await Sharing.shareAsync(file.uri, { mimeType: 'text/plain', dialogTitle: 'Share Health Data' });
+        } else {
+          await Clipboard.setStringAsync(content);
+          Alert.alert('Copied', 'Health data copied to clipboard.');
+        }
+      } catch (shareErr: any) {
+        console.error('[HealthConnect] share error:', shareErr);
+        try {
+          await Clipboard.setStringAsync(content);
+          Alert.alert('Copied to Clipboard', 'Could not open share sheet — data copied to clipboard instead.');
+        } catch (clipErr: any) {
+          Alert.alert('Export Failed', 'Could not share or copy data. Please try again.');
+        }
+      }
+    } catch (e: any) {
+      console.error('[HealthConnect] export error:', e);
+      Alert.alert('Export Failed', 'Something went wrong. Please try again.');
+    }
+    setExporting(false);
+  }, [healthData]);
+
+  // ── Layer mapping for info section ──
+  const layerMap = [
+    { layer: LAYERS[0], metrics: 'Sleep stages, total duration' },
+    { layer: LAYERS[1], metrics: 'HRV, Resting Heart Rate' },
+    { layer: LAYERS[2], metrics: 'RHR, Respiratory Rate' },
+    { layer: LAYERS[3], metrics: 'HRV (vagal tone)' },
+    { layer: LAYERS[4], metrics: 'HRV trend over time' },
   ];
+
+  // ── Metric cards config ──
+  const metricCards = [
+    { icon: 'heart-circle', label: 'HRV (Heart Rate Variability)', desc: 'Primary stress and recovery signal', color: '#22C55E' },
+    { icon: 'heart', label: 'Resting Heart Rate', desc: 'Metabolic efficiency and nervous system load', color: '#D42B2B' },
+    { icon: 'moon', label: 'Sleep Structure', desc: 'Deep, REM, Core sleep stages', color: '#7C5CFF' },
+    { icon: 'speedometer', label: 'Respiratory Rate', desc: 'Mitochondrial efficiency during sleep', color: '#F59E0B' },
+  ];
+
+  // ── 30-day chart SVG ─────────────────────────────────────
+  const renderTrendChart = () => {
+    const W = SCREEN_WIDTH - 88;
+    const chartH = 180;
+    const padTop = 24;
+    const padBottom = 28;
+    const H = chartH - padTop - padBottom;
+    const data = trendDays;
+    const validVals = data.map(d => d.value).filter((v): v is number => v != null);
+    if (validVals.length < 2) return null;
+
+    const minVal = Math.min(...validVals);
+    const maxVal = Math.max(...validVals);
+    const padding = (maxVal - minVal) * 0.15 || 5;
+    const yMin = minVal - padding;
+    const yMax = maxVal + padding;
+    const range = Math.max(yMax - yMin, 1);
+
+    const getX = (i: number) => (i / (data.length - 1)) * W;
+    const getY = (v: number) => padTop + H - ((v - yMin) / range) * H;
+
+    const isBar = activeMetric === 'sleep';
+    const metricColor = activeMetric === 'sleep' ? '#7C5CFF' : activeMetric === 'hrv' ? '#22C55E' : '#D42B2B';
+    const metricUnit = activeMetric === 'sleep' ? 'h' : activeMetric === 'hrv' ? 'ms' : 'bpm';
+
+    return (
+      <View style={{ marginTop: 16 }}>
+        <Svg width={W} height={chartH}>
+          {/* Y-axis grid lines */}
+          {[0, 0.25, 0.5, 0.75, 1].map(pct => {
+            const y = padTop + H * (1 - pct);
+            const val = yMin + range * pct;
+            return (
+              <G key={`grid-${pct}`}>
+                <Line x1={0} y1={y} x2={W} y2={y} stroke={`${colors.border}60`} strokeWidth={0.5} strokeDasharray="4,4" />
+                <SvgText x={0} y={y - 4} fontSize={9} fill={colors.textTertiary}>
+                  {activeMetric === 'sleep' ? val.toFixed(1) : Math.round(val)}
+                </SvgText>
+              </G>
+            );
+          })}
+
+          {isBar ? (
+            // Bar chart for sleep
+            <>
+              {data.map((d, i) => {
+                if (d.value == null) return null;
+                const x = getX(i);
+                const barW = Math.max(W / data.length - 3, 4);
+                const barH = ((d.value! - yMin) / range) * H;
+                const y = padTop + H - barH;
+                return (
+                  <G key={`bar-${d.key}`}>
+                    <Path d={`M${x - barW / 2},${padTop + H} L${x - barW / 2},${y + 4} Q${x - barW / 2},${y} ${x - barW / 2 + 4},${y} L${x + barW / 2 - 4},${y} Q${x + barW / 2},${y} ${x + barW / 2},${y + 4} L${x + barW / 2},${padTop + H} Z`} fill={`${metricColor}90`} />
+                  </G>
+                );
+              })}
+            </>
+          ) : (
+            // Line chart for HRV / RHR
+            <>
+              {/* 7-day rolling average line */}
+              {(() => {
+                const avgPts = data.filter(d => d.avg7 != null);
+                if (avgPts.length < 2) return null;
+                const linePath = avgPts.map((d, i) => {
+                  const x = getX(data.indexOf(d));
+                  const y = getY(d.avg7!);
+                  return `${i === 0 ? 'M' : 'L'}${x},${y}`;
+                }).join(' ');
+                return <Path d={linePath} fill="none" stroke={`${metricColor}50`} strokeWidth={1.5} strokeDasharray="6,3" />;
+              })()}
+              {/* Main data line */}
+              {(() => {
+                const pts = data.filter(d => d.value != null);
+                if (pts.length < 2) return null;
+                const linePath = pts.map((d, i) => {
+                  const x = getX(data.indexOf(d));
+                  const y = getY(d.value!);
+                  return `${i === 0 ? 'M' : 'L'}${x},${y}`;
+                }).join(' ');
+                // Area fill
+                const areaPath = `${linePath} L${getX(data.indexOf(pts[pts.length - 1]))},${padTop + H} L${getX(data.indexOf(pts[0]))},${padTop + H} Z`;
+                return (
+                  <G>
+                    <Path d={areaPath} fill={`${metricColor}12`} />
+                    <Path d={linePath} fill="none" stroke={metricColor} strokeWidth={2} strokeLinecap="round" strokeLinejoin="round" />
+                    {pts.map((d) => {
+                      const cx = getX(data.indexOf(d));
+                      const cy = getY(d.value!);
+                      const isLast = d.key === data[data.length - 1]?.key;
+                      return (
+                        <G key={`dot-${d.key}`}>
+                          {isLast && <Circle cx={cx} cy={cy} r={6} fill={`${metricColor}30`} />}
+                          <Circle cx={cx} cy={cy} r={isLast ? 4 : 2.5} fill={metricColor} />
+                        </G>
+                      );
+                    })}
+                  </G>
+                );
+              })()}
+            </>
+          )}
+
+          {/* X-axis labels — show every 5th day */}
+          {data.filter((_, i) => i % 5 === 0 || i === data.length - 1).map((d) => {
+            const x = getX(data.indexOf(d));
+            return (
+              <G key={`x-${d.key}`}>
+                <SvgText x={x} y={chartH - 8} fontSize={9} fill={colors.textTertiary} textAnchor="middle">
+                  {d.label}
+                </SvgText>
+                <SvgText x={x} y={chartH - 18} fontSize={8} fill={`${colors.textTertiary}80`} textAnchor="middle">
+                  {d.dayOfWeek}
+                </SvgText>
+              </G>
+            );
+          })}
+        </Svg>
+        {/* Legend */}
+        <View style={{ flexDirection: 'row', justifyContent: 'space-between', marginTop: 8, paddingHorizontal: 4 }}>
+          <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+            <View style={{ width: 12, height: 3, borderRadius: 1.5, backgroundColor: metricColor }} />
+            <Text style={{ fontSize: 10, color: colors.textTertiary }}>{activeMetric === 'sleep' ? 'Daily sleep' : 'Daily value'} ({metricUnit})</Text>
+          </View>
+          {!isBar && (
+            <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+              <Svg width={12} height={2}><Line x1={0} y1={1} x2={12} y2={1} stroke={metricColor} strokeWidth={1.5} strokeDasharray="3,2" /></Svg>
+              <Text style={{ fontSize: 10, color: colors.textTertiary }}>7-day avg</Text>
+            </View>
+          )}
+        </View>
+      </View>
+    );
+  };
 
   return (
     <View style={{ flex: 1, backgroundColor: colors.bg }}>
-      <SafeAreaView style={{ flex: 1 }} edges={['top']}>
+      <View style={{ flex: 1, paddingTop: Constants.statusBarHeight }}>
         <ScrollView style={{ flex: 1 }} contentContainerStyle={{ paddingBottom: 40 }} showsVerticalScrollIndicator={false}>
-          {/* Back button */}
-          <View style={{ paddingHorizontal: 24, paddingTop: 12, paddingBottom: 8 }}>
+          {/* Back + refresh */}
+          <View style={{ paddingHorizontal: 24, paddingTop: 12, paddingBottom: 8, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' }}>
             <TouchableOpacity onPress={() => onNavigate('profile')} style={{ width: 40, height: 40, borderRadius: 20, backgroundColor: colors.card, alignItems: 'center', justifyContent: 'center' }}>
               <Ionicons name="arrow-back" size={20} color={colors.textSecondary} />
             </TouchableOpacity>
+            {connected && (
+              <View style={{ flexDirection: 'row', gap: 8 }}>
+                <TouchableOpacity onPress={doExport} disabled={exporting || !healthData} style={{ width: 40, height: 40, borderRadius: 20, backgroundColor: colors.card, alignItems: 'center', justifyContent: 'center' }}>
+                  <Ionicons name={exporting ? 'ellipsis-horizontal-circle' : 'share-outline'} size={18} color={exporting ? colors.textTertiary : colors.textSecondary} />
+                </TouchableOpacity>
+                <TouchableOpacity onPress={doSync} disabled={syncing} style={{ width: 40, height: 40, borderRadius: 20, backgroundColor: colors.card, alignItems: 'center', justifyContent: 'center' }}>
+                  <Ionicons name="refresh" size={18} color={syncing ? colors.textTertiary : colors.red} />
+                </TouchableOpacity>
+              </View>
+            )}
+            {!connected && <View style={{ width: 40 }} />}
           </View>
 
           {/* Header */}
-          <View style={{ paddingHorizontal: 24, marginTop: 12, alignItems: 'center' }}>
-            <Text style={{ fontSize: 24, fontWeight: '900', color: colors.text, textAlign: 'center' }}>Connect Health App</Text>
-            <Text style={{ fontSize: 13, fontWeight: '700', letterSpacing: 1, color: colors.red, marginTop: 6, textTransform: 'uppercase' }}>Phase 2 — Coming Soon</Text>
+          <View style={{ paddingHorizontal: 24, marginTop: 8 }}>
+            <View style={{ flexDirection: 'row', alignItems: 'center', gap: 10 }}>
+              <Text style={{ fontSize: 24, fontWeight: '900', color: colors.text }}>Health Data</Text>
+              {connected && (
+                <View style={{ flexDirection: 'row', alignItems: 'center', gap: 4, paddingHorizontal: 8, paddingVertical: 3, borderRadius: 999, backgroundColor: '#22C55E18' }}>
+                  <Ionicons name="checkmark-circle" size={12} color="#22C55E" />
+                  <Text style={{ fontSize: 10, fontWeight: '700', color: '#22C55E' }}>Connected</Text>
+                </View>
+              )}
+            </View>
+            {connected && lastSyncTime && (
+              <Text style={{ fontSize: 12, color: colors.textTertiary, marginTop: 4 }}>Synced from Apple Health {fmtTimeAgo(lastSyncTime)}</Text>
+            )}
           </View>
 
-          {/* Floating icons card */}
-          <View style={{ paddingHorizontal: 24, marginTop: 28 }}>
-            <View style={{ borderRadius: 24, padding: 24, backgroundColor: colors.card, borderWidth: 1, borderColor: colors.border, alignItems: 'center' }}>
-              <View style={{ flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'center', gap: 16 }}>
-                {metrics.map((m, i) => (
-                  <BounceIcon key={m.label} icon={m.icon} label={m.label} color={m.color} delay={i * 150} />
-                ))}
+          {/* ERROR */}
+          {error && (
+            <View style={{ paddingHorizontal: 24, marginTop: 16 }}>
+              <View style={{ padding: 14, borderRadius: 12, backgroundColor: '#EF444418', borderWidth: 1, borderColor: '#EF444440' }}>
+                <Text style={{ fontSize: 12, color: '#EF4444', lineHeight: 18 }}>{error}</Text>
               </View>
             </View>
-          </View>
+          )}
 
-          {/* Coming Soon badge */}
-          <View style={{ paddingHorizontal: 24, marginTop: 20, alignItems: 'center' }}>
-            <View style={{ paddingHorizontal: 16, paddingVertical: 8, borderRadius: 999, backgroundColor: `${colors.red}14`, borderWidth: 1, borderColor: `${colors.red}40` }}>
-              <Text style={{ fontSize: 12, fontWeight: '700', letterSpacing: 1, color: colors.red, textTransform: 'uppercase' }}>Coming Soon</Text>
+          {/* SYNCING OVERLAY */}
+          {syncing && (
+            <View style={{ paddingHorizontal: 24, marginTop: 40, alignItems: 'center' }}>
+              <ActivityIndicator color={colors.red} size="large" />
+              <Text style={{ fontSize: 13, color: colors.textSecondary, marginTop: 12 }}>Reading 30 days from Apple Health...</Text>
+              <Text style={{ fontSize: 11, color: colors.textTertiary, marginTop: 4 }}>This takes a few seconds the first time.</Text>
             </View>
-          </View>
+          )}
 
-          {/* Description */}
-          <View style={{ paddingHorizontal: 24, marginTop: 24 }}>
-            <Text style={{ fontSize: 14, lineHeight: 22, color: colors.textSecondary, textAlign: 'center' }}>
-              We're building integrations with Apple Health and Health Connect (Android) to automatically sync your sleep, HRV, and heart rate data — making your Metabolic Score™ even more precise.
-            </Text>
-          </View>
+          {/* ── NOT CONNECTED ─────────────────────────────── */}
+          {!connected && !syncing && (
+            <View style={{ paddingHorizontal: 24, marginTop: 24 }}>
+              <View style={{ borderRadius: 20, padding: 20, backgroundColor: colors.card, gap: 14 }}>
+                {metricCards.map(m => (
+                  <View key={m.label} style={{ flexDirection: 'row', alignItems: 'center', gap: 12, paddingVertical: 4 }}>
+                    <View style={{ width: 42, height: 42, borderRadius: 12, backgroundColor: `${m.color}18`, alignItems: 'center', justifyContent: 'center' }}>
+                      <Ionicons name={m.icon as any} size={20} color={m.color} />
+                    </View>
+                    <View style={{ flex: 1 }}>
+                      <Text style={{ fontSize: 14, fontWeight: '700', color: colors.text }}>{m.label}</Text>
+                      <Text style={{ fontSize: 12, color: colors.textSecondary, marginTop: 1 }}>{m.desc}</Text>
+                    </View>
+                  </View>
+                ))}
+              </View>
+              <View style={{ marginTop: 20, borderRadius: 20, padding: 20, backgroundColor: colors.card }}>
+                <Text style={{ fontSize: 11, fontWeight: '700', letterSpacing: 1, color: colors.textSecondary, textTransform: 'uppercase', marginBottom: 12 }}>How this maps to your 5 layers</Text>
+                {layerMap.map(({ layer, metrics }) => (
+                  <View key={layer.id} style={{ flexDirection: 'row', alignItems: 'center', gap: 10, paddingVertical: 5 }}>
+                    <View style={{ width: 6, height: 6, borderRadius: 3, backgroundColor: layer.color }} />
+                    <Text style={{ fontSize: 12, fontWeight: '600', color: layer.color, width: 80 }}>{clinicalDepth ? layer.shortName.split(' \u2014 ')[1] : LAYER_PLAIN_SHORT[layer.id - 1]}</Text>
+                    <Text style={{ fontSize: 12, color: colors.textSecondary, flex: 1 }}>{metrics}</Text>
+                  </View>
+                ))}
+              </View>
+              <TouchableOpacity onPress={doSync} style={{ marginTop: 24, backgroundColor: colors.red, paddingVertical: 16, borderRadius: 14, alignItems: 'center' }}>
+                <Text style={{ color: '#fff', fontSize: 15, fontWeight: '700' }}>Connect Apple Health</Text>
+              </TouchableOpacity>
+              <Text style={{ fontSize: 11, color: colors.textTertiary, textAlign: 'center', marginTop: 12, lineHeight: 16 }}>Works with Whoop, Apple Watch, Oura Ring, and any wearable that syncs to Apple Health.</Text>
+            </View>
+          )}
 
-          {/* Bottom back button */}
-          <View style={{ paddingHorizontal: 24, marginTop: 32 }}>
-            <TouchableOpacity onPress={() => onNavigate('profile')} style={{ backgroundColor: colors.card, borderWidth: 1, borderColor: colors.border, paddingVertical: 14, borderRadius: 12, alignItems: 'center' }}>
-              <Text style={{ fontSize: 14, fontWeight: '700', color: colors.text }}>Back to Profile</Text>
-            </TouchableOpacity>
-          </View>
+          {/* ── CONNECTED WITH DATA ────────────────────────── */}
+          {connected && healthData && !syncing && (
+            <View key="connected-data" style={{ paddingHorizontal: 24, marginTop: 20, gap: 16 }}>
+
+              {/* ── LAST NIGHT HERO CARD ── */}
+              {lastNightData && lastNightData.total_min > 0 && (
+                <View style={{ borderRadius: 20, padding: 20, backgroundColor: colors.card }}>
+                  <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'flex-start' }}>
+                    <View style={{ flex: 1 }}>
+                      <Text style={{ fontSize: 11, fontWeight: '700', letterSpacing: 1, color: colors.textSecondary, textTransform: 'uppercase', marginBottom: 6 }}>Last Night</Text>
+                      <Text style={{ fontSize: 36, fontWeight: '900', color: colors.text, lineHeight: 40 }}>{Math.floor(lastNightData.total_min / 60)}h {lastNightData.total_min % 60}m</Text>
+                      <Text style={{ fontSize: 12, color: colors.textSecondary, marginTop: 2 }}>of sleep</Text>
+                    </View>
+                    {lastNightData.sleep_efficiency > 0 && (
+                      <View style={{ alignItems: 'center', paddingHorizontal: 12, paddingVertical: 8, borderRadius: 14, backgroundColor: `${lastNightData.sleep_efficiency >= 85 ? '#22C55E' : lastNightData.sleep_efficiency >= 70 ? '#F59E0B' : '#EF4444'}18` }}>
+                        <Text style={{ fontSize: 20, fontWeight: '900', color: lastNightData.sleep_efficiency >= 85 ? '#22C55E' : lastNightData.sleep_efficiency >= 70 ? '#F59E0B' : '#EF4444' }}>{lastNightData.sleep_efficiency}%</Text>
+                        <Text style={{ fontSize: 9, color: colors.textTertiary, marginTop: 1 }}>efficiency</Text>
+                      </View>
+                    )}
+                    {sleepQualityScore != null && (
+                      <View style={{ alignItems: 'center', paddingHorizontal: 12, paddingVertical: 8, borderRadius: 14, backgroundColor: `${sleepQualityLabel(sleepQualityScore).color}14` }}>
+                        <View style={{ flexDirection: 'row', alignItems: 'baseline', gap: 3 }}>
+                          <Text style={{ fontSize: 24, fontWeight: '900', color: sleepQualityLabel(sleepQualityScore).color }}>{sleepQualityScore}</Text>
+                          <Text style={{ fontSize: 10, fontWeight: '700', color: sleepQualityLabel(sleepQualityScore).color }}>/100</Text>
+                        </View>
+                        <Text style={{ fontSize: 8, fontWeight: '700', color: sleepQualityLabel(sleepQualityScore).color, marginTop: 1, textTransform: 'uppercase', letterSpacing: 0.5 }}>{sleepQualityLabel(sleepQualityScore).text}</Text>
+                      </View>
+                    )}
+                  </View>
+
+                  {/* Sleep score context — connect to quiz & Circadian layer */}
+                  {sleepQualityScore != null && latestHistory && (() => {
+                    const quizSleepEntry = latestHistory.answers?.[0]; // Q1 "how do you feel waking up" (Circadian self-assessment)
+                    const quizSleep = quizSleepEntry ? 5 - quizSleepEntry.ansIdx : null; // ansIdx: 0=best option..4=worst → rescale to 1-5, 5=best
+                    const circadianScore = latestHistory.layer1;
+                    const parts: string[] = [];
+                    if (circadianScore != null) {
+                      const maxCircadian = 20;
+                      const pct = Math.round((circadianScore / maxCircadian) * 100);
+                      if (sleepQualityScore >= 70 && pct < 50) {
+                        parts.push(`Your wearable sleep (${sleepQualityScore}/100) looks better than your Circadian layer score (${circadianScore}/${maxCircadian}). Your sleep timing may be irregular even when duration is okay — focus on a consistent bedtime.`);
+                      } else if (sleepQualityScore < 55 && pct >= 60) {
+                        parts.push(`Your Circadian score (${circadianScore}/${maxCircadian}) suggests good self-awareness, but your wearable data (${sleepQualityScore}/100) shows room for improvement. The score captures duration, efficiency, and regularity.`);
+                      } else if (sleepQualityScore >= 70 && pct >= 60) {
+                        parts.push(`Your wearable data (${sleepQualityScore}/100) and Circadian score (${circadianScore}/${maxCircadian}) are aligned — your sleep habits are reinforcing your metabolic foundation.`);
+                      }
+                    }
+                    if (quizSleep != null) {
+                      const quizLabel = quizSleep >= 4 ? 'good' : quizSleep >= 3 ? 'moderate' : 'poor';
+                      const wearableLabel = sleepQualityScore >= 70 ? 'good' : sleepQualityScore >= 55 ? 'moderate' : 'poor';
+                      if (quizLabel !== wearableLabel) {
+                        parts.push(`Interestingly, you rated your sleep as ${quizLabel} in the quiz, but your wearable shows ${wearableLabel}. This gap is worth exploring — it often reveals stress blindness or adaptation to poor sleep.`);
+                      }
+                    }
+                    return parts.length > 0 ? (
+                      <View style={{ marginTop: 12, paddingVertical: 10, paddingHorizontal: 14, borderRadius: 12, backgroundColor: `${sleepQualityLabel(sleepQualityScore).color}08`, borderLeftWidth: 3, borderLeftColor: sleepQualityLabel(sleepQualityScore).color }}>
+                        {parts.map((p, i) => (
+                          <Text key={i} style={{ fontSize: 12, color: colors.textSecondary, lineHeight: 18, marginTop: i > 0 ? 6 : 0 }}>{p}</Text>
+                        ))}
+                      </View>
+                    ) : null;
+                  })()}
+
+                  {/* Bedtime → Wake time row */}
+                  {(lastNightData.sleep_start || lastNightData.sleep_end) && (
+                    <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8, marginTop: 16, paddingVertical: 10, paddingHorizontal: 14, borderRadius: 12, backgroundColor: colors.bg }}>
+                      <Ionicons name="moon" size={14} color="#7C5CFF" />
+                      <Text style={{ fontSize: 13, fontWeight: '600', color: colors.text }}>{fmtTime(lastNightData.sleep_start)}</Text>
+                      <View style={{ flex: 1, height: 1, backgroundColor: colors.border, marginHorizontal: 4 }} />
+                      <Text style={{ fontSize: 11, color: colors.textTertiary }}>in bed</Text>
+                      <View style={{ flex: 1, height: 1, backgroundColor: colors.border, marginHorizontal: 4 }} />
+                      <Text style={{ fontSize: 13, fontWeight: '600', color: colors.text }}>{fmtTime(lastNightData.sleep_end)}</Text>
+                      <Ionicons name="sunny" size={14} color="#F59E0B" />
+                    </View>
+                  )}
+                </View>
+              )}
+
+              {/* ── TAPPABLE METRIC CARDS (3-column) ── */}
+              <View style={{ flexDirection: 'row', gap: 10 }}>
+                {/* Sleep Card */}
+                <TouchableOpacity
+                  activeOpacity={0.7}
+                  onPress={() => setActiveMetric('sleep')}
+                  style={{ flex: 1, borderRadius: 16, padding: 14, backgroundColor: activeMetric === 'sleep' ? '#7C5CFF18' : colors.card, borderWidth: activeMetric === 'sleep' ? 1.5 : 0, borderColor: '#7C5CFF' }}
+                >
+                  <Ionicons name="moon" size={18} color="#7C5CFF" />
+                  <Text style={{ fontSize: 20, fontWeight: '900', color: colors.text, marginTop: 8 }}>{healthData.total_sleep_avg}h</Text>
+                  <Text style={{ fontSize: 9, color: colors.textTertiary, marginTop: 1 }}>Sleep (7d avg)</Text>
+                  {(() => { const b = wowBadge(healthData.total_sleep_wow, 'h'); return b ? <Text style={{ fontSize: 10, fontWeight: '700', color: b.color, marginTop: 4 }}>{b.text}</Text> : null; })()}
+                </TouchableOpacity>
+                {/* HRV Card */}
+                <TouchableOpacity
+                  activeOpacity={0.7}
+                  onPress={() => setActiveMetric('hrv')}
+                  style={{ flex: 1, borderRadius: 16, padding: 14, backgroundColor: activeMetric === 'hrv' ? '#22C55E18' : colors.card, borderWidth: activeMetric === 'hrv' ? 1.5 : 0, borderColor: '#22C55E' }}
+                >
+                  <Ionicons name="heart-circle" size={18} color="#22C55E" />
+                  <Text style={{ fontSize: 20, fontWeight: '900', color: colors.text, marginTop: 8 }}>{healthData.hrv_avg || '--'}</Text>
+                  <Text style={{ fontSize: 9, color: colors.textTertiary, marginTop: 1 }}>HRV ms (7d avg)</Text>
+                  {(() => { const b = wowBadge(healthData.hrv_wow, ''); return b ? <Text style={{ fontSize: 10, fontWeight: '700', color: b.color, marginTop: 4 }}>{b.text}</Text> : null; })()}
+                </TouchableOpacity>
+                {/* RHR Card */}
+                <TouchableOpacity
+                  activeOpacity={0.7}
+                  onPress={() => setActiveMetric('rhr')}
+                  style={{ flex: 1, borderRadius: 16, padding: 14, backgroundColor: activeMetric === 'rhr' ? '#D42B2B18' : colors.card, borderWidth: activeMetric === 'rhr' ? 1.5 : 0, borderColor: '#D42B2B' }}
+                >
+                  <Ionicons name="heart" size={18} color="#D42B2B" />
+                  <Text style={{ fontSize: 20, fontWeight: '900', color: colors.text, marginTop: 8 }}>{healthData.rhr_avg || '--'}</Text>
+                  <Text style={{ fontSize: 9, color: colors.textTertiary, marginTop: 1 }}>RHR bpm (7d avg)</Text>
+                  {(() => { const b = wowBadge(healthData.rhr_wow, '', true); return b ? <Text style={{ fontSize: 10, fontWeight: '700', color: b.color, marginTop: 4 }}>{b.text}</Text> : null; })()}
+                </TouchableOpacity>
+              </View>
+
+              {/* ── 30-DAY TREND CHART ── */}
+              <View style={{ borderRadius: 20, padding: 20, backgroundColor: colors.card }}>
+                <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}>
+                  <Text style={{ fontSize: 11, fontWeight: '700', letterSpacing: 1, color: colors.textSecondary, textTransform: 'uppercase' }}>
+                    30-Day {activeMetric === 'sleep' ? 'Sleep' : activeMetric === 'hrv' ? 'HRV' : 'RHR'} Trend
+                  </Text>
+                  <Text style={{ fontSize: 12, color: colors.textTertiary }}>
+                    Tap cards above to switch
+                  </Text>
+                </View>
+                {/* Headline + prior-30-day comparison, sleep only. Comparison hides
+                    gracefully (total_sleep_wow_30d_min is null) until ~60 days of real
+                    sync history exist — see processHealthSamples, expected not a bug. */}
+                {activeMetric === 'sleep' && (() => {
+                  const delta = healthData.total_sleep_wow_30d_min;
+                  const deltaColor = delta == null ? colors.textTertiary : delta === 0 ? '#71717A' : delta > 0 ? '#22C55E' : '#EF4444';
+                  const arrow = delta == null ? '' : delta > 0 ? '↑' : delta < 0 ? '↓' : '→';
+                  return (
+                    <View style={{ marginTop: 14 }}>
+                      <Text style={{ fontSize: 32, fontWeight: '900', color: colors.text }}>{fmtDurationHM(healthData.total_sleep_avg_30d_min)}</Text>
+                      {delta != null ? (
+                        <Text style={{ fontSize: 13, fontWeight: '700', color: deltaColor, marginTop: 4 }}>
+                          {arrow} {fmtDurationHM(Math.abs(delta))} vs. prior 30 days
+                        </Text>
+                      ) : (
+                        <Text style={{ fontSize: 12, color: colors.textTertiary, marginTop: 4 }}>
+                          Comparison available once more history is synced
+                        </Text>
+                      )}
+                    </View>
+                  );
+                })()}
+                {renderTrendChart() || (
+                  <View style={{ height: 180, alignItems: 'center', justifyContent: 'center' }}>
+                    <Text style={{ fontSize: 13, color: colors.textTertiary }}>Not enough data for this metric yet.</Text>
+                  </View>
+                )}
+                {activeMetric === 'sleep' && trendDays.length > 0 && (() => {
+                  const parseLocalDateKey = (key: string) => {
+                    const [y, m, d] = key.split('-').map(Number);
+                    return new Date(y, m - 1, d);
+                  };
+                  const first = parseLocalDateKey(trendDays[0].key);
+                  const last = parseLocalDateKey(trendDays[trendDays.length - 1].key);
+                  return (
+                    <Text style={{ fontSize: 10, color: colors.textTertiary, textAlign: 'center', marginTop: 10 }}>
+                      {first.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}
+                      {' – '}
+                      {last.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })}
+                    </Text>
+                  );
+                })()}
+              </View>
+
+              {/* ── TREND INSIGHT CARD ── */}
+              {trendInsight && (
+                <View style={{ borderRadius: 16, padding: 16, backgroundColor: `${trendInsight.color}10`, borderWidth: 1, borderColor: `${trendInsight.color}25` }}>
+                  <View style={{ flexDirection: 'row', alignItems: 'flex-start', gap: 10 }}>
+                    <Ionicons name={trendInsight.icon} size={18} color={trendInsight.color} style={{ marginTop: 1 }} />
+                    <Text style={{ fontSize: 12, fontWeight: '600', color: trendInsight.color, lineHeight: 18, flex: 1 }}>{trendInsight.text}</Text>
+                  </View>
+                </View>
+              )}
+
+              {/* ── SLEEP SCHEDULE CARD ── */}
+              {sleepSchedule && (
+                <View style={{ borderRadius: 20, padding: 20, backgroundColor: colors.card }}>
+                  <Text style={{ fontSize: 11, fontWeight: '700', letterSpacing: 1, color: colors.textSecondary, textTransform: 'uppercase', marginBottom: 14 }}>Sleep Schedule ({sleepSchedule.sampleDays} nights)</Text>
+                  <View style={{ flexDirection: 'row', gap: 10 }}>
+                    {/* Avg Bedtime */}
+                    <View style={{ flex: 1, borderRadius: 14, padding: 14, backgroundColor: colors.bg, alignItems: 'center' }}>
+                      <Ionicons name="moon" size={16} color="#7C5CFF" />
+                      <Text style={{ fontSize: 18, fontWeight: '900', color: colors.text, marginTop: 8 }}>{sleepSchedule.avgBedtime}</Text>
+                      <Text style={{ fontSize: 9, color: colors.textTertiary, marginTop: 2 }}>Avg Bedtime</Text>
+                    </View>
+                    {/* Avg Wake Time */}
+                    <View style={{ flex: 1, borderRadius: 14, padding: 14, backgroundColor: colors.bg, alignItems: 'center' }}>
+                      <Ionicons name="sunny" size={16} color="#F59E0B" />
+                      <Text style={{ fontSize: 18, fontWeight: '900', color: colors.text, marginTop: 8 }}>{sleepSchedule.avgWakeTime}</Text>
+                      <Text style={{ fontSize: 9, color: colors.textTertiary, marginTop: 2 }}>Avg Wake Time</Text>
+                    </View>
+                    {/* Consistency */}
+                    <View style={{ flex: 1, borderRadius: 14, padding: 14, backgroundColor: colors.bg, alignItems: 'center' }}>
+                      <Ionicons name="checkmark-done-circle" size={16} color={sleepSchedule.consistency >= 80 ? '#22C55E' : '#F59E0B'} />
+                      <Text style={{ fontSize: 18, fontWeight: '900', color: sleepSchedule.consistency >= 80 ? '#22C55E' : '#F59E0B', marginTop: 8 }}>{sleepSchedule.consistency}%</Text>
+                      <Text style={{ fontSize: 9, color: colors.textTertiary, marginTop: 2 }}>Consistency</Text>
+                    </View>
+                  </View>
+                  {sleepSchedule.consistency < 80 && (
+                    <Text style={{ fontSize: 11, color: '#F59E0B', marginTop: 12, lineHeight: 16 }}>
+                      Your bedtime varies by an average of {sleepSchedule.stdDevMin} minutes. Consistent sleep/wake times improve circadian rhythm and metabolic health.
+                    </Text>
+                  )}
+                </View>
+              )}
+
+              {/* ── VITAL SIGNS ROW (compact, below schedule) ── */}
+              <View style={{ borderRadius: 20, padding: 20, backgroundColor: colors.card }}>
+                <Text style={{ fontSize: 11, fontWeight: '700', letterSpacing: 1, color: colors.textSecondary, textTransform: 'uppercase', marginBottom: 14 }}>All Metrics (7-day avg)</Text>
+                <View style={{ flexDirection: 'row', gap: 10 }}>
+                  {/* HRV */}
+                  <View style={{ flex: 1, borderRadius: 14, padding: 12, backgroundColor: colors.bg, alignItems: 'center' }}>
+                    <Ionicons name="heart-circle" size={16} color="#22C55E" />
+                    {healthData.hrv_avg ? (
+                      <>
+                        <Text style={{ fontSize: 18, fontWeight: '900', color: colors.text, marginTop: 6 }}>{healthData.hrv_avg}</Text>
+                        <Text style={{ fontSize: 9, color: colors.textTertiary }}>HRV (ms)</Text>
+                      </>
+                    ) : (
+                      <>
+                        <Text style={{ fontSize: 18, fontWeight: '900', color: colors.textTertiary, marginTop: 6 }}>--</Text>
+                        <Text style={{ fontSize: 8, color: colors.textTertiary, textAlign: 'center', lineHeight: 11, marginTop: 2 }}>Not from your wearable</Text>
+                      </>
+                    )}
+                  </View>
+                  {/* RHR */}
+                  <View style={{ flex: 1, borderRadius: 14, padding: 12, backgroundColor: colors.bg, alignItems: 'center' }}>
+                    <Ionicons name="heart" size={16} color="#D42B2B" />
+                    <Text style={{ fontSize: 18, fontWeight: '900', color: colors.text, marginTop: 6 }}>{healthData.rhr_avg || '--'}</Text>
+                    <Text style={{ fontSize: 9, color: colors.textTertiary }}>RHR (bpm)</Text>
+                  </View>
+                  {/* Resp Rate */}
+                  <View style={{ flex: 1, borderRadius: 14, padding: 12, backgroundColor: colors.bg, alignItems: 'center' }}>
+                    <Ionicons name="speedometer" size={16} color="#F59E0B" />
+                    <Text style={{ fontSize: 18, fontWeight: '900', color: colors.text, marginTop: 6 }}>{healthData.resp_rate_avg || '--'}</Text>
+                    <Text style={{ fontSize: 9, color: colors.textTertiary }}>Resp (br/m)</Text>
+                  </View>
+                </View>
+              </View>
+
+              {/* ── LAYER CORRELATION — your data mapped to 5 layers ── */}
+              {layerCorrelations.length > 0 && (
+                <View style={{ borderRadius: 20, padding: 20, backgroundColor: colors.card }}>
+                  <Text style={{ fontSize: 11, fontWeight: '700', letterSpacing: 1, color: colors.textSecondary, textTransform: 'uppercase', marginBottom: 14 }}>Your Data → 5 Layers</Text>
+                  {layerCorrelations.map(({ layer, metric, value, status, note }) => (
+                    <View key={layer.id + metric} style={{ paddingVertical: 10, borderBottomWidth: 1, borderBottomColor: colors.border }}>
+                      <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' }}>
+                        <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
+                          <View style={{ width: 8, height: 8, borderRadius: 4, backgroundColor: layer.color }} />
+                          <Text style={{ fontSize: 12, fontWeight: '700', color: layer.color }}>{clinicalDepth ? layer.shortName.split(' \u2014 ')[1] : LAYER_PLAIN_SHORT[layer.id - 1]}</Text>
+                        </View>
+                        <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+                          <Text style={{ fontSize: 13, fontWeight: '800', color: colors.text }}>{value}</Text>
+                          <View style={{ width: 8, height: 8, borderRadius: 4, backgroundColor: status === 'good' ? '#22C55E' : status === 'caution' ? '#F59E0B' : '#EF4444' }} />
+                        </View>
+                      </View>
+                      <Text style={{ fontSize: 10, color: colors.textTertiary, marginTop: 4, lineHeight: 15, paddingLeft: 16 }}>{metric}: {note}</Text>
+                    </View>
+                  ))}
+                </View>
+              )}
+
+              {/* Disconnect */}
+              <TouchableOpacity onPress={doDisconnect} style={{ paddingVertical: 14, borderRadius: 12, alignItems: 'center', borderWidth: 1, borderColor: colors.border }}>
+                <Text style={{ fontSize: 13, fontWeight: '600', color: colors.textSecondary }}>Disconnect Apple Health</Text>
+              </TouchableOpacity>
+            </View>
+          )}
+
+          {/* Connected but no data yet */}
+          {connected && !healthData && !syncing && !error && (
+            <View style={{ paddingHorizontal: 24, marginTop: 40, alignItems: 'center' }}>
+              <Ionicons name="watch" size={40} color={colors.textTertiary} />
+              <Text style={{ fontSize: 14, fontWeight: '600', color: colors.text, marginTop: 16, textAlign: 'center' }}>Connected, but no data found yet.</Text>
+              <Text style={{ fontSize: 13, color: colors.textSecondary, marginTop: 6, textAlign: 'center', lineHeight: 18, paddingHorizontal: 20 }}>Make sure your Whoop or wearable has synced data to Apple Health. Pull down to refresh after syncing.</Text>
+              <TouchableOpacity onPress={doSync} style={{ marginTop: 20, backgroundColor: colors.card, borderWidth: 1, borderColor: colors.border, paddingVertical: 12, paddingHorizontal: 24, borderRadius: 12 }}>
+                <Text style={{ color: colors.text, fontSize: 14, fontWeight: '700' }}>Try Again</Text>
+              </TouchableOpacity>
+            </View>
+          )}
+
         </ScrollView>
-      </SafeAreaView>
+      </View>
     </View>
   );
 }
-
-function BounceIcon({ icon, label, color, delay }: { icon: string; label: string; color: string; delay: number }) {
-  const translateY = useRef(new Animated.Value(0)).current;
-  useEffect(() => {
-    Animated.loop(
-      Animated.sequence([
-        Animated.timing(translateY, { toValue: -8, duration: 600, delay, useNativeDriver: true, easing: Easing.inOut(Easing.ease) }),
-        Animated.timing(translateY, { toValue: 0, duration: 600, useNativeDriver: true, easing: Easing.inOut(Easing.ease) }),
-      ])
-    ).start();
-  }, []);
-  return (
-    <Animated.View style={{ alignItems: 'center', width: 80, transform: [{ translateY }] }}>
-      <View style={{ width: 56, height: 56, borderRadius: 16, backgroundColor: `${color}1A`, alignItems: 'center', justifyContent: 'center', marginBottom: 8 }}>
-        <Ionicons name={icon as any} size={26} color={color} />
-      </View>
-      <Text style={{ fontSize: 10, fontWeight: '700', color: color, textAlign: 'center', letterSpacing: 0.5 }}>{label}</Text>
-    </Animated.View>
-  );
-}
-
 // ============================================================
 // BOTTOM NAV
 // ============================================================
@@ -7654,7 +10205,7 @@ function BottomNav({ active, onNavigate, hasScore }: { active: string; onNavigat
   return (
     <View style={{ borderTopWidth: 1, borderTopColor: colors.border, backgroundColor: colors.bg, flexDirection: 'row', alignItems: 'flex-end', justifyContent: 'space-around', paddingHorizontal: 8, paddingTop: 8, paddingBottom: 8 }}>
       {renderTab({ id: 'home', icon: 'home', label: 'Home', screen: 'home' })}
-      {renderTab({ id: 'layers', icon: 'layers', label: 'Layers', screen: 'layers' })}
+      {renderTab({ id: 'insights', icon: 'bulb', label: 'Insights', screen: 'insights' })}
       <TouchableOpacity onPress={() => onNavigate(hasScore ? 'score-history' : 'score')} style={{ flex: 1, alignItems: 'center', gap: 2 }}>
         <View style={{ width: 56, height: 56, borderRadius: 28, backgroundColor: colors.red, borderWidth: 3, borderColor: colors.bg, alignItems: 'center', justifyContent: 'center', marginTop: -24, shadowColor: '#D42B2B', shadowOffset: { width: 0, height: 4 }, shadowOpacity: 0.4, shadowRadius: 12, elevation: 8 }}>
           <Ionicons name="flash" size={24} color="#fff" />
@@ -7802,6 +10353,7 @@ function AppNavigator() {
       const effectiveScoreResult = scoreResult ?? (scoreHistory[0] ? reconstructScoreResultFromHistory(scoreHistory[0]) : null);
       return effectiveScoreResult ? <ResultsScreen onNavigate={navigate} result={effectiveScoreResult as ScoreResult} userData={userData} autoExpandN3={autoExpandN3} onSelectLayer={(id) => setSelectedLayer(id)} /> : <HomeScreen onNavigate={navigate} hasScore={hasScore} />;
     }
+    case 'insights': return <InsightsHubScreen onNavigate={navigate} hasScore={hasScore || !!scoreResult} scoreResult={scoreResult} />;
     case 'layers': return <LayersHubScreen onNavigate={navigate} onSelectLayer={(id) => { setSelectedLayer(id); navigate('layer-detail'); }} hasScore={hasScore || !!scoreResult} scoreResult={scoreResult} />;
     case 'layer-detail': return <LayerDetailScreen onNavigate={navigate} layerId={selectedLayer} onSelectArticle={(a) => { setSelectedArticle(a); navigate('article-reader'); }} />;
     case 'library': return <LibraryScreen onNavigate={navigate} hasScore={hasScore || !!scoreResult} scoreResult={scoreResult} onSelectArticle={(a) => { setSelectedArticle(a); navigate('article-reader'); }} />;
@@ -7900,17 +10452,19 @@ export default Sentry.wrap(function App() {
   }
 
   return (
-    <ErrorBoundary>
-      <ThemeProvider>
-        <AuthProvider>
-          <ClinicalDepthProvider>
-            <AppDataProvider>
-              <AppInner />
-            </AppDataProvider>
-          </ClinicalDepthProvider>
-        </AuthProvider>
-      </ThemeProvider>
-    </ErrorBoundary>
+    <SafeAreaProvider>
+      <ErrorBoundary>
+        <ThemeProvider>
+          <AuthProvider>
+            <ClinicalDepthProvider>
+              <AppDataProvider>
+                <AppInner />
+              </AppDataProvider>
+            </ClinicalDepthProvider>
+          </AuthProvider>
+        </ThemeProvider>
+      </ErrorBoundary>
+    </SafeAreaProvider>
   );
 });
 

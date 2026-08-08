@@ -1,0 +1,41 @@
+-- Run this in Supabase SQL editor.
+-- Requested 2026-08-07 while building the Home notification bell panel, which reads
+-- notification_log directly from the client. Confirmed missing via the same anon-key REST
+-- probe used for app_checkins/actions/habit_cycles earlier tonight — 401,
+-- "permission denied for table notification_log", with PostgREST's own
+-- "GRANT SELECT ON public.notification_log TO anon" hint. Fourth occurrence of this exact
+-- bug class in one session (app_checkins, actions, habit_cycles, now this) — see
+-- grant_actions_table_access.sql for the full root-cause writeup.
+--
+-- Not run from a live verified grants query — this environment deliberately has no
+-- service_role-authenticated DB access. Grants explicitly and idempotently instead: safe to
+-- run whether or not the grant was already present.
+--
+-- For a real, direct answer on current grant state before running this, check:
+--
+--   SELECT grantee, table_name, privilege_type FROM information_schema.role_table_grants
+--   WHERE table_name = 'notification_log' ORDER BY grantee;
+--
+-- Role split, per actual read/write paths in this repo:
+-- - `authenticated` needs SELECT only — the Home notification bell panel
+--   (notificationLog.list() in src/config/supabase.ts) reads a user's own rows; the app
+--   never writes to this table.
+-- - `service_role` needs SELECT, INSERT — metabolic-notification-worker.js writes a row
+--   every time it sends a push, and never deletes/updates one.
+--
+-- Separately worth confirming, not something this migration can safely do idempotently:
+-- does an RLS policy scoping SELECT to auth.uid() = user_id actually exist on this table?
+-- CREATE POLICY errors on a duplicate name, so — unlike GRANT — this can't be blindly
+-- re-run defensively. Check with:
+--
+--   SELECT policyname, cmd, roles FROM pg_policies WHERE tablename = 'notification_log';
+--
+-- If nothing shows up for authenticated/SELECT, add one before relying on this table being
+-- correctly scoped per-user:
+--
+--   ALTER TABLE public.notification_log ENABLE ROW LEVEL SECURITY;
+--   CREATE POLICY "notification_log_select_own" ON public.notification_log
+--     FOR SELECT USING (auth.uid() = user_id);
+
+grant select on public.notification_log to authenticated;
+grant select, insert on public.notification_log to service_role;

@@ -19,6 +19,16 @@ Follow it without being reminded.
    unprompted.
 7. **This project uses Claude only — no other AI coding tool.** Do not reference GLM or any
    other implementation partner.
+   - **Deliberate, logged exception (2026-08-08):** the Layer Correlation feature
+     (`HealthConnectScreen`'s `layerCorrelations` block, `App.tsx` ~9486-9530 — correlates
+     wearable metrics against the 5 Layers) was built with GLM2, not Claude Code. Amit
+     confirmed this explicitly and asked for it to be recorded as a deliberate, one-off
+     departure from this rule, not an accident to reverse (contrast with the actual
+     accidental GLM-file near-miss the same night, caught before anything merged — see
+     Known Issues below). Rule 7 otherwise remains in force; this is a named exception,
+     not a precedent for treating other-AI-authored code as routine going forward. Any
+     future file/diff that looks GLM- or other-AI-authored should still be flagged before
+     being touched, unless Amit names it as sanctioned the way this one was.
 8. **Never run `git commit` (or `git push`) on Amit's behalf.** He reviews and commits all
    changes himself. Editing files and staging changes for his review is fine; committing is
    not, until he explicitly says otherwise in this file or in a session.
@@ -76,6 +86,72 @@ Specific open bugs that have been diagnosed but deliberately not fixed yet. Unli
 failure-pattern list above (bug *classes* to watch for), these are concrete, located
 instances — check this list before re-diagnosing something that's already understood.
 
+- **`quizSleep >= 4` comparison (Layer Correlation feature) — FIXED 2026-08-08.** Was
+  comparing the whole `HistoryEntry` answer-record object (not a number) against `>=4`,
+  which coerced to `NaN` and made `quizLabel` unconditionally `'poor'` regardless of the
+  user's real answer — confirmed via direct trace, not assumed from the type error
+  alone. Fixed by rescaling `ansIdx` (0=best option..4=worst) via `5 - ansIdx`, matching
+  the 1-5/5-best scale the existing threshold logic was written for. `tsc --noEmit`
+  confirmed clean (the 2 `TS2365` errors this caused are gone). Not yet device-tested.
+- **`parseInt`/`parseFloat` on already-numeric `StoredHealthData` fields — FIXED
+  2026-08-08.** `total_sleep_avg`/`hrv_avg`/`rhr_avg` are typed/populated as `number`
+  already; the `parseFloat` calls were a true no-op, but `parseInt` on `rhr_avg`
+  truncated its real 1-decimal precision, which — traced, not assumed — silently
+  mis-categorized RHR averages landing just above the 65/75 bpm boundaries (e.g. 65.4
+  read as "good" instead of "caution"). All four `parseInt`/`parseFloat` calls removed;
+  the fields are used directly. `tsc --noEmit` confirmed clean. Not yet device-tested.
+- **Header/notification-bell regression — FIXED 2026-08-08, root cause was two separate
+  gaps, not one.** Reported by Amit: on every screen except Health Data, top content had
+  shifted upward and the bell (`HomeScreen` only) was untappable. Root cause #1: `app.json`
+  gained `"newArchEnabled": false` (bundled with the new `react-native-health` plugin)
+  in the same uncommitted diff, and **no `SafeAreaProvider` existed anywhere in this
+  codebase, ever** (confirmed via repo-wide grep + git history) — under New Architecture
+  (the prior default) something apparently supplied real insets to `SafeAreaView` anyway;
+  under the now-forced Old Architecture that stopped, so insets collapsed to 0 on every
+  normal screen. Fixed by adding `SafeAreaProvider` as the outermost wrapper in the root
+  `App()` (`App.tsx`, outside `ErrorBoundary`) — not by touching `newArchEnabled`, which
+  wasn't the actual defect. Root cause #2, found after #1 only partly fixed the symptom:
+  `NotificationBellPanel` renders inside a native `<Modal>`, which presents in its own
+  separate native view hierarchy — the app-root `SafeAreaProvider` doesn't reach content
+  inside a `Modal` even though React Context nominally does. Fixed with a second, nested
+  `SafeAreaProvider` inside the `Modal` itself. Both fixes `tsc --noEmit` clean. **Neither
+  device-confirmed yet.**
+- **Bedtime-variance message — FIXED 2026-08-08.** Was static text ("varies by more than
+  30 minutes") regardless of the real computed variance, shown whenever `consistency <
+  80`. `sleepSchedule` now also returns `stdDevMin` (the real rounded std-dev), and the
+  card interpolates it: "varies by an average of {X} minutes." Not yet device-tested.
+- **`tsc --noEmit` baseline: 13 on `App.tsx` as of 2026-08-08 (down from a temporary 19,
+  not the original 10).** The original 10 (7 `ImageSourcePropType`, 3 `author_interview`
+  union, confirmed via `App.backup.tsx`) are still present and untouched. 6 of the 9 new
+  errors introduced by the GLM2-built Layer Correlation feature were fixed same-day (the
+  `quizSleep`/`parseInt` items above). **3 remain, not yet fixed:** `TS2503: Cannot find
+  namespace 'JSX'` at ~4326/4338 (`JSX.Element[]` annotation — likely needs
+  `React.JSX.Element` instead of the bare global under the installed `@types/react`).
+  Future sessions should expect 13, not 10, until this is resolved.
+- **Nap vs. main-sleep conflation in the 7-day sleep average — FIXED 2026-08-08 (product
+  decision, not a blind code fix).** Investigated after Amit flagged a suspicious 9.4h
+  7-day average. Confirmed via a targeted diagnostic (not guessed): Aug 4 and Jul 19 each
+  genuinely contained 2 separate real sleep sessions on the same calendar day (a nap/
+  sleep-in plus a full overnight session) — not overlap/duplicate artifacts, and the
+  per-session merge logic itself was already correct. The bug was one level up:
+  `total_min` summed every session assigned to a day, so a nap + a full night combined
+  into one inflated "night." **Decision (Amit, 2026-08-08): Option C, scoped tightly** —
+  the day's single longest-by-real-minutes session becomes "main sleep" and feeds all
+  headline stats (same classification mechanism as the simplest option, A); every other
+  session that day is preserved on a new `secondary_sleep_sessions` field
+  (`total_min`/`sleep_start`/`sleep_end`) rather than discarded, but deliberately not
+  surfaced in any UI — how/whether naps ever get shown is an explicitly separate, not-yet-
+  made product decision. `tsc --noEmit` confirmed clean throughout. **Not yet
+  device-tested.**
+  - **Worth re-checking once this lands, may resolve partly or fully on its own:** the
+    still-open thread from earlier the same night — Apple's "time in bed" (7h6m) vs.
+    "time asleep" (6h26m) split, with this app's 30-day figure landing suspiciously close
+    to "time in bed" rather than "time asleep" (see the 2026-08-08 (cont'd 7) session log
+    entry). Nap-inflation is a plausible second, compounding contributor to that gap
+    alongside whatever the original investigation was chasing — not confirmed as the
+    (full) explanation, just newly plausible now that it's been found and fixed as a real
+    mechanism. Don't assume it's resolved without checking a fresh sync's numbers.
+
 - **HomeScreen's expanded "Fat Loss Resistance" detail view shows nothing after sign-in
   without retaking the test this session.** `App.tsx`, `HomeScreen`, the score-summary
   card's expanded section (~line 1930, the block using `generateLocalN1`/`rcsInfo`) is
@@ -98,6 +174,40 @@ instances — check this list before re-diagnosing something that's already unde
   investigation 2026-08-01. No PDF has ever actually been generated by it; there's no
   `expo-print` or HTML-template path anywhere in the repo — "PDF export" today is really
   just the in-app `ReportScreen` component itself. Not fixed, flagged for a future session.
+- **UTC/IST day-boundary bug — CONFIRMED (2026-08-08), upgraded from the "known edge
+  case, not urgent" note flagged 2026-08-06.** Any place in `App.tsx` that derives a
+  calendar-day key from a device-local `new Date()` instant via
+  `.toISOString().slice(0, 10)` computes the *UTC* calendar date, not the device's local
+  (IST, UTC+5:30) calendar date — so any event between 12:00 AM–5:30 AM IST gets keyed to
+  the previous day. Confirmed via direct diagnostic log evidence in the health-sync path
+  (`processHealthSamples`, `App.tsx` ~line 8560/8635): Aug 7 raw sleep samples #0-4
+  (04:31-05:45 AM IST, including the INBED anchor sample) all resolved to
+  `utcDateKey=2026-08-06` instead of `2026-08-07` — the direct cause of `sleep_start`/
+  `total_min` reading wrong for that night vs. Whoop/Apple Health (our app: 5:49 AM start,
+  6h0m total; Whoop/Apple: ~4:31-4:35 AM, ~7h — wake time matched exactly across all
+  three). **Fixed in `processHealthSamples` (`App.tsx`, local-timezone `localDateKey`
+  helper replacing all UTC-based keys), `tsc --noEmit` clean, confirmed exact on-device
+  for the single-night case.** `localDateKey` was hoisted to module scope 2026-08-08 (cont'd
+  5) and reused to fix a second confirmed instance: `HealthConnectScreen`'s
+  `getYesterdayKey`/`fallbackKey` had the identical bug, caught live when the "Last Night"
+  card disappeared right at local midnight into Aug 8 — see that session log entry. A
+  same-pattern audit across the rest of `App.tsx` (see 2026-08-08 session log entries for
+  the full site list) found the identical mechanism in several other places — streak/
+  check-in `today` computation, the Today's-1% dismiss-date key, the Streak Calendar's own
+  `todayStr`, weekly insight/craving day-grouping — not yet confirmed as *active* bugs the
+  way the two health-screen cases were, but sharing the exact same root cause and worth
+  treating as suspect until reviewed. Not fixed anywhere outside the health-sync/Health
+  Data screen yet — deliberately scoped there so far, per rule 3 (batch related work,
+  don't scope-creep into unconfirmed sites).
+- **Sleep session split at local midnight — CONFIRMED and fixed in `processHealthSamples`
+  (2026-08-08), not yet device-tested.** A single real sleep session could get counted as
+  two separate "nights" whenever its underlying HealthKit samples happened to end/restart
+  within seconds of local midnight (3 of 22 real nights affected, confirmed via log
+  evidence — see 2026-08-08 (cont'd 4) session log entry for full detail). Sessions are
+  now built by globally merging intervals with small gaps (≤15 min) before per-day
+  assignment, instead of bucketing raw samples to a day first. Needs on-device
+  verification across the Sleep Schedule average, the 30-day trend chart, and the Vital
+  Signs/Sleep Structure cards — not just one screen.
 
 ## Future Ideas Registry (flagged, not scoped into active work)
 
@@ -142,6 +252,537 @@ not a session-log entry — check here before re-proposing something already cap
 Update this at the end of every session (either with Claude Code or with Claude in
 chat) — what got fixed, what's still open. Keep entries short; this is a fast
 "where did we leave off" scan, not a full changelog. Newest entry on top.
+
+### 2026-08-08 (cont'd 7) — Gap-day averaging bug fixed in the 7-day sleep figures too
+(bundled); unbounded session-length bug found, hard-capped at 16h; "22→20 not ~19"
+mystery fully resolved (data regenerates between syncs, not a merge-logic bug); a bug in
+the diagnostic itself (not the real code) explained why it wasn't firing, also fixed
+
+**7-day sleep averages (`total_sleep_avg`/`total_sleep_wow`) had the same gap-day
+averaging bug as the 30-day figures (previous entry) — bundled and fixed together, per
+Amit's explicit request not to leave a known-live version of the same bug on-screen.**
+`deep_sleep_avg`/`rem_sleep_avg`/`core_sleep_avg`/`total_sleep_avg` now average over
+`real7` (`last7` filtered to `total_min > 0`) instead of the raw 7-day window;
+`total_sleep_wow` now diffs `thisWReal`/`prevWReal` the same way. Filter is at the
+day level (a day had *a* real session at all), not per-field, so a real night with
+genuinely 0 measured deep sleep still counts correctly — only actual gap days are
+excluded. `hrv_avg`/`rhr_avg`/`resp_rate_avg` untouched (already correct via `null`
+defaults). `tsc --noEmit`: same 10 pre-existing errors.
+
+**Device-confirmed the 30-day fix worked**: `curr30: 20/30 days with real sleep data
+(avg 421min)` — 7h 1m, computed only from real nights, up from the broken 4h 40m.
+`prior30: 0/30 days with real sleep data` correctly triggered the null-comparison gate
+(needs ≥10 real days both sides) — card showed the "not enough history yet" fallback as
+designed, not a bug.
+
+**"22→20, not ~19" question (open since two entries ago) — fully resolved with real
+evidence, not guessed.** Comparing the fresh device log to the original: the underlying
+raw HealthKit data actually changed between syncs (this is evidently test/simulated data
+that regenerates, not a static fixture). Jul 19→20 and Aug 4→5 both still merged
+correctly (new total_min for each exactly equals the sum of the old two nights' totals).
+Jul 21→22 correctly did *not* merge in this newer sync — not because of a bug, but
+because the real gap in the current data is 21 minutes (`...T02:18:38` → `...T02:39:38`),
+genuinely over the 15-min threshold, vs. the ~30 seconds an earlier (now-stale) log
+snapshot had shown. There was never a merge-logic bug for this pair — the data itself
+moved between the two syncs. Good case study for why this session kept demanding fresh
+evidence over trusting an earlier log indefinitely.
+
+**Real bug found from that same fresh log, unrelated to the above: unbounded session
+length.** Night #5 (2026-07-19) reached a ~27h span (927min total, exactly the old two
+nights' totals summed — a full, correct interval merge, just an implausible *span*);
+Night #18 (2026-08-04) reached ~29h. Root cause, confirmed via source, no ambiguity: the
+session-building loop (`processHealthSamples`) only checked the gap to the *next*
+interval against the running max-end — it never checked the session's *cumulative* span,
+so a chain of individually-small (≤15min) gaps could grow without limit. **Fixed:** added
+`MAX_SESSION_SPAN_MS` (16h) as a second condition on the merge — an interval only joins
+the current session if doing so keeps the session's overall span within the ceiling;
+otherwise it starts a new session instead. No data is discarded or truncated — an
+over-long chain now correctly splits back into multiple sessions at the point continuing
+would become implausible, rather than growing unboundedly.
+
+**The Long-session diagnostic (added investigating this) wasn't firing despite Night
+#5/#18 clearly exceeding its 12h threshold — root cause was a bug in the diagnostic
+itself, not the real aggregation code or a wiring problem.** It computed session span as
+`sorted[sorted.length - 1].end - sorted[0].start`, silently assuming the interval that
+starts last also ends last — untrue whenever intervals interleave (e.g. a CORE interval
+starting before a DEEP interval but ending after it), which understated the true span
+enough to stay under threshold even for genuinely 27h/29h sessions. The real aggregation
+code already avoided this exact mistake elsewhere (`Math.max(...)`/proper `reduce` for
+true max-end) — the diagnostic took a shortcut instead of reusing that pattern. Fixed to
+match. Kept in place permanently (not removed) as an ongoing sanity watch — should never
+fire now that the 16h ceiling exists, but will catch any future edge case in the capping
+logic itself. `tsc --noEmit`: same 10 pre-existing errors throughout both fixes.
+
+**Still open, not yet investigated:** the original discrepancy that started this
+sub-thread — Apple's "time in bed" (7h6m) vs. "time asleep" (6h26m) split, with our
+30-day figure landing suspiciously close to "time in bed" rather than "time asleep."
+The AWAKE-exclusion diagnostic Amit requested to check this was never built — superseded
+mid-turn by the session-length bug investigation above. Worth revisiting once the
+session-span fix is device-confirmed, since fixing the over-long sessions may partially
+or fully resolve this too (inflated total_min from over-merged sessions would have been
+pulling the 30-day average toward "time in bed" territory) — but that's not confirmed,
+just a plausible side effect, not to be assumed without checking.
+
+**Not yet device-tested:** the 16h span ceiling and the diagnostic fix both need a fresh
+sync to confirm Night #5/#18 no longer show implausible spans, and that the Long-session
+diagnostic now correctly stays silent (or fires correctly if something still exceeds
+12h). Nothing from this entry committed — staged/unstaged only, pending Amit's review,
+per rule 8.
+
+### 2026-08-08 (cont'd 6) — 30-day sleep trend card built (headline + prior-30-day
+comparison, enhancing the existing Daily Sleep chart, not a new one); HealthKit fetch
+window extended 30→60 days; trendDays' own UTC-key bug fixed as part of the same work
+
+**Underlying sleep data confirmed fully correct on-device** before this work started —
+session-merge fix, timezone fix, and the WoW unit fix (previous entries) all verified
+working. This entry is new feature work on top of that verified foundation, not another
+bug fix.
+
+**Two mismatches found between the originally-described design and what the code
+actually does, resolved before implementing (per rule 2/4, confirmed with Amit first):**
+1. `total_sleep_avg` (the field the plan assumed was the 30-day average to reuse) is
+   actually a **7-day** average (`StoredHealthData` field comment says so directly) and
+   only 0.1h precision — not enough for the confirmed "6h 42m" headline format. Built a
+   dedicated `total_sleep_avg_30d_min` (raw-minute precision) instead.
+2. There was no "prior 30 days" data anywhere to compare against — `syncHealthData`'s
+   HealthKit query and `processHealthSamples`'s daily-bucket init were both hard-limited
+   to 30 days. Both extended to 60 days (`App.tsx`) so a genuine prior-30-day window
+   exists to average against.
+
+**Built:**
+- `total_sleep_avg_30d_min`/`total_sleep_wow_30d_min` added to `StoredHealthData`/
+  `processHealthSamples` — both use the same "average includes every day in the window,
+  even 0-value gap days" convention as the existing 7-day averages, for consistency with
+  the already-documented midnight-dip behavior. The comparison (`_wow_30d_min`) is `null`
+  unless both the current and prior 30-day windows have at least 10 days with real
+  (non-zero) sleep data (`MIN_REAL_DAYS_FOR_30D_COMPARISON`) — avoids showing a delta
+  computed from 2-3 real nights against a mostly-empty window.
+- `fmtDurationHM` helper (`HealthConnectScreen`) — "Xh Ym" span formatting, distinct from
+  the existing `fmtMinutesToTime` (which formats a clock time, not a duration).
+- Header added to the existing 30-Day Trend card (`App.tsx` ~9476), sleep-tab only:
+  large headline (`fmtDurationHM(total_sleep_avg_30d_min)`), comparison line below with
+  ↑/↓ arrow and green/red color (`#22C55E`/`#EF4444`, same convention as `wowBadge` and
+  ProfileScreen's trajectory indicator) that hides itself entirely and shows a plain
+  "comparison available once more history is synced" line instead when the 30d WoW is
+  null. Existing bars/chart untouched below it. A muted date-range label (parsed via a
+  local, unambiguous `parseLocalDateKey` — deliberately not `new Date(key)` on a
+  date-only string, to avoid reintroducing the same UTC-parsing pitfall this session
+  already hit twice) was added below the bars, sleep-tab only.
+- **Bundled fix, same card:** `trendDays`' own day-key (`App.tsx` ~9040) still had the
+  UTC-based `.toISOString().slice(0,10)` bug — the exact bars this header sits on top of.
+  Swapped in `localDateKey`, same as the other two confirmed instances tonight.
+
+**Expected, not a bug — confirm on next sync and don't chase further (per Amit,
+2026-08-08):** this test account's usable sync history only spans ~July 14 onward
+(~25 days as of tonight). Even after extending the fetch window to 60 days, there isn't
+yet a full prior 30-day period with enough real data — so `total_sleep_wow_30d_min` will
+likely read `null` and the card will show the "comparison available once more history is
+synced" fallback line rather than a real delta, for now. This is expected behavior given
+the `MIN_REAL_DAYS_FOR_30D_COMPARISON` gate, not a bug — the comparison will start
+appearing naturally as more real sync history accumulates past the 30-day mark.
+
+`tsc --noEmit`: same 10 pre-existing errors throughout every step of this build, nothing
+new. **Not yet device-tested** — needs a fresh sync (60-day HealthKit window is new) and
+visual confirmation of the header, the graceful-hide fallback, and that the existing bars
+still render correctly with the fixed day-key. Nothing committed — staged/unstaged only,
+pending Amit's review, per rule 8.
+
+### 2026-08-08 (cont'd 5) — total_sleep_wow units bug fixed; getYesterdayKey's UTC/local
+bug caught live and fixed (second confirmed instance of the day-boundary bug class);
+localDateKey hoisted to module scope; 7-day-average midnight dip documented as expected,
+not a bug; session-merge "22→20 not ~19" question still open, unbundled
+
+**`total_sleep_wow` units bug — confirmed via direct source comparison, no new
+diagnostic needed.** The Sleep (7d avg) card showed "4.1h" with "↓130.2h" underneath — a
+physically impossible delta. Root cause: `total_sleep_avg` converts minutes to hours via
+`avgMinToHrs` before display; `total_sleep_wow` never did, computing the week-over-week
+diff on raw `total_min` (minutes) while the display code appends an `'h'` suffix with no
+conversion (`App.tsx` ~9402, `wowBadge(healthData.total_sleep_wow, 'h')`). A real ~-130
+minute (~-2.2h) delta was rendering as "-130.2h". Confirmed pre-existing, not a
+regression from the session-merge fix — that work never touched this code path. Fixed:
+`total_sleep_wow` now diffs `total_min / 60` on both sides, matching `total_sleep_avg`'s
+treatment. `tsc --noEmit`: same 10 pre-existing errors, nothing new.
+
+**`getYesterdayKey`'s UTC/local bug — caught live, not just audited as suspect.** The
+"Last Night" card on the Health Data screen disappeared right at the moment local time
+crossed midnight into Aug 8. Traced with real arithmetic (not new device diagnostics —
+this one was fully provable from source plus data already gathered): `getYesterdayKey`
+(`App.tsx` ~8988, now removed) still used `.toISOString().slice(0, 10)` — the same
+UTC-extraction pattern already fixed in `processHealthSamples` but never applied here.
+Just after midnight IST, its "before noon" branch computed `now - 1 day` then converted
+to UTC, landing on **Aug 6** instead of Aug 7 — a real gap day in the dataset (confirmed
+from the original 22-night log, nothing recorded Aug 6) — so the lookup came back empty.
+The 2-day fallback suffered the identical bug and likely also missed (Aug 5's data may
+have moved to Aug 4 under the session-merge fix). This is the second confirmed *active*
+instance of the UTC/IST day-boundary bug class (see the sleep-aggregation instance
+earlier tonight), upgrading `HealthConnectScreen`'s day-keying from "suspect, not yet
+confirmed" to confirmed.
+
+**Fixed, together:** `localDateKey` (previously function-local to `processHealthSamples`)
+hoisted to module scope so both places share one implementation instead of risking drift.
+`getYesterdayKey`'s time-of-day branching was removed entirely — it was a heuristic left
+over from when raw samples were bucketed to their own day before merging; now that
+sessions are always assigned to their bedtime's local day, "last night" is simply always
+`localDateKey(now - 1 day)`, no branching needed. `fallbackKey` updated the same way.
+`tsc --noEmit`: same 10 pre-existing errors, nothing new.
+
+**7-day sleep average dip (4.1h→3.5h) at midnight — investigated, concluded to be
+expected behavior, not a bug (per Amit, 2026-08-08).** Checked whether this shared the
+`getYesterdayKey` root cause — it doesn't: `total_sleep_avg`'s 7-day window filter
+(`processHealthSamples`, `new Date(k + 'T00:00:00')`, no UTC conversion) was already
+correctly local-time-based, unrelated to `getYesterdayKey`. The actual mechanism: `daily`
+always pre-initializes all 30 days including "today," and the rolling 7-day window
+advancing past midnight now includes a fresh Aug 8 entry with 0 sleep (today's bedtime
+hasn't happened yet), while dropping whatever day was 7 days back — `avgMinToHrs`
+averages across all 7 slots including zero-value ones, so a fresh empty "today" pulls the
+average down every midnight until tonight's sleep is logged. **Documented here so it
+isn't re-investigated as a bug later:** this is expected, intentional-shape behavior of a
+calendar-day-bucketed rolling average, not a defect — no fix planned.
+
+**Still open, unbundled:** the "22→20, not ~19" session-merge count from the previous
+entry — confirmed via the original log that all three candidate pairs have essentially
+identical ~30-second gaps (ruling out a legitimate near-threshold edge case), but the
+exact reason one of the three didn't merge on-device isn't identified yet. Needs a fresh
+`sleepSchedule` per-night diagnostic pull (still in the code) to see which of
+2026-07-20/07-22/08-05 is the holdout, before investigating further — deliberately not
+guessed at from source alone a second time tonight.
+
+**Not yet done:** device confirmation of tonight's two fixes above (WoW badge showing a
+sane hour value; "Last Night" card reappearing correctly across the midnight boundary).
+Nothing from this entry has been committed — staged/unstaged only, pending Amit's review,
+per rule 8.
+
+### 2026-08-08 (cont'd 4) — Sleep Schedule avg-bedtime discrepancy root-caused with real
+evidence (session-split-at-midnight bug, 3 of 22 nights affected, not a wraparound-
+averaging bug); fix implemented in `processHealthSamples`, not yet device-tested; window-
+length question closed
+
+**Discrepancy investigated:** Sleep Schedule card showed avg bedtime 4:20 AM vs. Apple
+Health's own 30-day average of 2:49 AM (~91min gap), even though the single-night
+timezone fix (previous entry) had just been confirmed exact on-device. Added a temporary
+diagnostic inside the `sleepSchedule` `useMemo` (`App.tsx`) logging each qualifying
+night's raw `sleep_start`/`sleep_end`/computed bedtime-in-minutes, plus the raw
+`bedtimes`/`waketimes` arrays actually being averaged.
+
+**First hypothesis (circular/wraparound-mean bug) — checked and ruled out with real
+data**, not assumed: the averaging code has a comment implying it handles bedtimes that
+straddle the day boundary (e.g. some nights 11 PM, others 1 AM) but the code right below
+it never actually does that adjustment. Real log data showed this wasn't the active
+issue here — all 22 nights' bedtimes fell between 12:14 AM and 9:16 AM, no late-evening
+values needing wraparound handling in this dataset. Filed as a latent gap worth knowing
+about if the dataset's bedtime distribution changes later, not touched this session.
+
+**Real root cause, found by inspecting the full log line-by-line:** a genuine single
+sleep session was being split into two separate "nights" purely because its underlying
+HealthKit samples happened to end/restart within seconds of local midnight — e.g. one
+session ends `2026-07-22T00:22:01`, the next begins `2026-07-22T00:22:31`, 30 seconds
+apart. Amit spotted the first instance (Night #7→#8); a full scan of every adjacent pair
+in the 22-night log found **two more identical instances** (Night #5→#6 and Night
+#19→#20 — all three with ~30-second gaps, all straddling midnight), so 3 of 22 nights
+(13.6%) were affected, not a one-off. Confirmed safe margin for a merge-based fix: every
+*genuine* gap between real separate nights in the same dataset was 19+ hours.
+
+**Fix implemented in `processHealthSamples` (`App.tsx` ~8554-8659) — not yet
+device-tested:** sleep-stage intervals are no longer bucketed to a calendar day before
+merging. They're now sorted globally and grouped into sessions first, bridging any gap
+≤ `SESSION_GAP_MS` (15 min, chosen with wide margin vs. the 19+ hour real gaps). Each
+whole session is then assigned to exactly one day — the local calendar day of the
+session's start (bedtime's date; confirmed convention: "last night" is named by when you
+went to bed, per Amit). `deep_min`/`rem_min`/`core_min`/`total_min`/`sleep_start`/
+`sleep_end`/`time_in_bed_min`/`sleep_efficiency` are then aggregated per day from
+whichever session(s) landed there (a day can still receive more than one session, e.g. a
+nap plus a real night — same as before). A day whose tail got merged into the previous
+day's session (July 20 and August 5, in the confirming dataset) now correctly has no
+session of its own and drops out of night counts/averages/the trend chart for that day —
+it was never a separate night. `tsc --noEmit`: still exactly the same 10 pre-existing
+errors after the change, nothing new. The overlap-merge fix and the local-timezone-key
+fix from the previous entry are both reused as-is inside this new session-building flow,
+not touched.
+
+**Window-length question — closed, not a discrepancy to chase further (per Amit,
+2026-08-08):** the original 4:20 AM vs. Apple's 2:49 AM gap is mostly attributable to
+comparing different window lengths — this app's all-time/30-day-when-available average
+vs. Apple Health's default 7-day view — which is the same intentional design choice
+already made for HRV's baseline reasoning (see `syncHealthData`'s 30-day window comment).
+Not re-investigating this specific angle again; the actual numeric gap will shift once
+the session-split fix above is verified on-device, since the underlying night count
+itself changes (fewer, more accurate nights).
+
+**Not yet done — next session or next check-in:**
+- Fresh on-device sync + confirm night count drops from 22 to ~19-20 (3 split pairs
+  merged into 3 single nights).
+- Confirm corrected numbers look sane in **all three** places that read this data, not
+  just the Sleep Schedule card: the Sleep Schedule average bedtime/waketime/consistency,
+  the 30-day trend chart (`trendDays`), and the Vital Signs/Sleep Structure cards on the
+  main Health Data screen.
+- The `logSingleNightRawSamples` and `sleepSchedule` per-night diagnostics are both still
+  in the code — kept intentionally for this verification pass, not yet removed.
+- Nothing from this entry has been committed — staged/unstaged only, pending Amit's
+  review, per rule 8.
+
+### 2026-08-08 (cont'd 3) — Sleep-aggregation overlap bug fixed (manual, by Amit) and
+device-confirmed; UTC/IST day-boundary bug confirmed in health-sync path via diagnostic
+evidence, plus full audit of every other day-keying site in App.tsx
+
+**Sleep-overlap fix (Amit's own manual edit to `App.tsx`, not built by Claude Code this
+session)** — `processHealthSamples`'s sleep aggregation now merges overlapping raw
+interval segments before summing durations, instead of naively adding each sample's
+duration independently. Root cause: Whoop can write multiple overlapping "ASLEEP"
+segments per night to Apple Health (sync retries/reconnects), so the naive sum could
+double-count — one real day showed a 27.5h naive total vs. 16.6h real elapsed time,
+a physically impossible number. Confirmed via `tsc --noEmit` (still exactly the same
+10 pre-existing errors, nothing new) and a logic read-through of the new
+`mergeIntervalsToMinutes` helper (standard sort-and-merge interval algorithm) before
+Amit tested on-device. **Device-confirmed working** — no more impossible totals.
+Separately, a second manual fix (moving `fmtMinutesToTime`'s definition above the
+`useMemo` that calls it in `HealthConnectScreen` — pure ordering issue, only surfaced
+once real sleep data started reaching that code path) also confirmed via `tsc --noEmit`,
+same 10 errors, nothing new.
+
+**New discrepancy found during on-device comparison, root-caused with real evidence —
+not source-reading alone, per the standing rule from the 2026-08-04 footer investigation
+not to guess:** comparing the Health Data screen against Whoop's own app and Apple Health
+directly for the night of Aug 7, our app showed `sleep_start` 5:49 AM / `total_min` 6h0m,
+while Whoop and Apple both showed ~4:31-4:35 AM / ~7h01-7:07. Wake time matched exactly
+across all three (12:17 PM), isolating the gap to how the *start* of the session gets
+determined, not the overlap-merge fix above.
+
+Added a temporary diagnostic, `logSingleNightRawSamples` (`App.tsx`, near
+`logSleepOverlapDiagnostic`, called from the same `getSleepSamples` callback in
+`syncHealthData`) — logs every raw HealthKit sleep sample in a wide window around Aug 7
+IST (Aug 6 18:00 UTC → Aug 8 00:00 UTC, wide enough to catch a sample even if it's
+currently keyed to the "wrong" day), including each sample's `value`/stage, raw
+`startDate`/`endDate`, computed duration, `sourceName`, `id`, and the UTC-date key it
+currently resolves to. `tsc --noEmit`: still the same 10 pre-existing errors after adding
+it. Purely additive — no change to aggregation logic.
+
+**Real device log confirmed the hypothesis directly:** samples #0-4 (04:31-05:45 AM IST,
+including the INBED anchor sample) all resolved to `utcDateKey=2026-08-06` instead of
+`2026-08-07`. Root cause: `processHealthSamples`'s day-bucketing key
+(`start.toISOString().slice(0, 10)`, `App.tsx` ~line 8560 and elsewhere in the same
+function) extracts the *UTC* calendar date from a device-local instant — any sample
+starting before 5:30 AM IST (when IST, UTC+5:30, has not yet crossed into the next UTC
+day) lands in the previous UTC day's bucket instead of the correct local day. This
+upgrades the "known edge case, not urgent" item flagged 2026-08-06 (originally about
+push/check-in timing) to a confirmed, active bug — see the new Known Issues entry above.
+
+**Fix approach agreed, not yet implemented:** replace the UTC-based day key throughout
+`processHealthSamples` with a local-timezone-aware key derived from `getFullYear()`/
+`getMonth()`/`getDate()` (device local time) instead of `toISOString()`, formatted
+consistently (`YYYY-MM-DD`, zero-padded) with the existing key shape so nothing
+downstream needs to change — only where the key itself is computed.
+
+**Full audit of every other `.toISOString().slice(0, 10)` (or equivalent
+`.split('T')[0]`) call site in `App.tsx` and `metabolic-notification-worker.js`,
+requested before assuming this bug is isolated to health sync:**
+
+- **Same pattern, likely same bug class, not yet confirmed as active — worth reviewing
+  once the health-sync fix's approach is settled:**
+  - `computeStreak` (~line 389-401) — `todayStr`/`yesterdayStr`/the walk-back `cursor`
+    all keyed via `.toISOString().slice(0,10)` on local `Date` instants. A check-in made
+    between midnight-5:30 AM IST could compute or read the wrong "today," affecting
+    streak counts.
+  - Today's-1% card dismiss-date key (~lines 2054, 2072, `ms_action_card_dismissed_date`)
+    — same pattern.
+  - `ms_action_done_dates` write/read (~lines 2156, 2192) — same pattern; feeds
+    `computeStreak` above and the Streak Calendar.
+  - Streak Calendar's own `todayStr` (~line 7059) — same pattern, the exact screen this
+    session's original discrepancy report wasn't about, but shares the identical
+    mechanism.
+  - Weekly insight day-map `weekDays` (~lines 3921-3939) and weekly craving grouping
+    `weeklyCravingSummary` (~line 5918) — same pattern; could misfile an action, craving,
+    or assessment logged in the 12-5:30 AM IST window into the wrong day's cell.
+  - `HealthConnectScreen`'s `getYesterdayKey`/`fallbackKey` (~lines 8938-8954) and the
+    30-day `trendDays` (~line 8965) — same pattern, directly adjacent to the confirmed
+    bug; likely compounds it (a wrong lookup key on top of what was a wrong storage key).
+- **Reviewed, NOT the same bug — different mechanism, deliberately left alone:**
+  - `addDaysStr` (~line 420-423) — operates purely on already-UTC-anchored `YYYY-MM-DD`
+    strings (`new Date('YYYY-MM-DD')` parses as UTC midnight; `setUTCDate`/
+    `.toISOString()` stay in UTC throughout) — never introduces a device-local instant,
+    so there's no local/UTC mismatch to have.
+  - `toDateOnly`/`daysSinceCalendar` (~line 409-415) — deliberately UTC-based, by design,
+    to mirror `metabolic-notification-worker.js`'s own `toDateOnly`/`daysBetween` exactly
+    (existing comment explains why: keeps the push notification and in-app reveal card
+    agreeing on which day's `copy_variants` entry to show). Also a day-*count* (diff of
+    two UTC-quantized endpoints), not a single-point "which day does this belong to"
+    bucketing check, so it isn't subject to the same failure mode. Changing this to local
+    time would need a matching Worker-side change (Cloudflare Workers always run in UTC —
+    there's no "device local time" concept server-side), so it's out of scope for an
+    App.tsx-only fix; flagged as a coupled decision if local-time keying is ever wanted
+    here too, not assumed to be needed.
+  - `metabolic-notification-worker.js`'s own `toDateOnly` (line 70) — server-side,
+    Cloudflare Workers always run in UTC, so there's no local-timezone ambiguity to have
+    on that side by construction.
+
+**Not yet done:** the actual fix to `processHealthSamples` (approach above, pending
+Amit's confirmation before implementation, per rule 2/4), and no decision made yet on
+whether/how to fix the other flagged-but-unconfirmed sites — deliberately not batched
+into the health-sync fix without discussing scope first. Nothing from this entry has been
+committed — staged/unstaged only, pending Amit's review, per rule 8.
+
+### 2026-08-08 — Retest-outcome card built (Results screen)
+
+New card, `ResultsScreen`, rendered once right after the score-gauge reveal and
+before the Fat Loss Readiness/Layer Breakdown cards — only when the current test
+is a genuine retest (real prior `app_scores` data exists).
+
+**Score delta — found and avoided a real race condition before writing any
+UI.** `saveScore()` (`AppDataContext.tsx`) optimistically prepends the
+just-completed test to `scoreHistory` synchronously, before `ResultsScreen` even
+mounts — so by render time `scoreHistory[0]` is already the current test, not
+the previous one. Using it as "previous" would have been a timing-dependent
+assumption. Instead, `AppNavigator.handleScoreComplete` now captures
+`scoreHistory[0]?.total_score` into a new `previousTotalScore` state **before**
+calling `saveScore()`, and passes it to `ResultsScreen` as an explicit prop —
+deterministic regardless of render/effect timing. Only passed on the live
+`scoreResult` path, never the reconstructed-from-history one (viewing an old
+result later), which is what makes the card "appears once, only right after a
+genuine retest" rather than needing a separate visibility flag.
+
+**Adherence — reused existing APIs, no new endpoints.** Same
+`habitCycles.getMine()` / `checkins.listSince()` calls `StreakCalendarScreen`
+already uses. Current cycle = active/extended row, falling back to the most
+recently closed one (in case the Worker's cron already closed it by the time the
+retest landed — the app has no way to know which happened first; the
+closed-then-immediately-retested edge case with a brand-new near-zero-adherence
+cycle isn't specially handled, wasn't in scope). Adherence count = completed
+`app_checkins` bounded by the cycle's own `start_date`/`end_date` — not a
+hardcoded 14, so it's correct for both normal (14-day) and extended (21-day)
+cycles. `retestWindowDays` (the "N" in "last N days") is derived the same way
+from the cycle's real span, per Amit's own catch: the locked copy literally says
+"last 14 days," which would read wrong for an extended cycle if hardcoded.
+
+**Branch logic (`buildRetestOutcomeCard`, new pure function near
+`computePointsAvailable`)** — adherence gates first (below 10 of the window
+makes the delta itself unreliable to read anything into), then delta once
+adherence clears that bar: ≥+5 / +1 to +4 / 0 to −4 / ≤−5. All 5 messages are
+Amit's exact locked copy (2026-08-08), each with `${adherence}`/`${windowDays}`
+substituted in place of the literal "14." Only the two negative/flat-delta,
+high-adherence branches (held steady, or regressed) get the "Talk to Amit" CTA,
+linking to the same `onNavigate('booking')` flow used everywhere else in the
+app — no new booking path.
+
+**Visual:** same rounded-card style as the other Results cards. Delta shown
+with an icon+color pair reused from `ProfileScreen`'s existing
+"↗/↘ since last" trajectory indicator (`#22C55E` up / `#EF4444` down — matching
+established precedent instead of inventing a new negative color), amber
+(`colors.amber`, already used elsewhere on this screen) for exactly flat.
+Adherence shown as a small pill badge next to the section label.
+
+`npx tsc --noEmit`: still exactly 10 pre-existing errors, confirmed clean.
+Nothing committed — staged only, pending Amit's review per rule 8.
+
+### 2026-08-07 — Insights Hub tab + notification bell panel built; Today's 1% card removed from Home then fully restored same session (see correction below); last scoreResult→scoreHistory fallback gap closed
+
+Continuation of the 2026-08-06 session (same overnight run, crossed midnight).
+
+**Correction, same session:** the Today's 1% card removal described below was a
+misreading of an ambiguous instruction — Amit's actual intent was only to remove
+a genuinely separate, persistent leftover strip *if one existed distinct from the
+card itself*. Investigated via direct diff against the last real commit before
+touching anything again: no such separate strip existed — the pending state, the
+complete state (checkmark/streak/X-dismiss), and the dismissed-to-`null` state
+were always one single unit. So per Amit's own fallback instruction, this was a
+full restore, not a partial one. Restored, verbatim from the pre-removal code:
+`streak`/`actionDone`/`actionDoneFlash` state, the swipe-to-dismiss
+(`dismissedToday`/`dismissX`/`dismissPanResponder`), the blink mechanism
+(`todaysOneBlinkAnim`/`todaysOneRef`/`triggerTodaysOneBlink`/the
+`highlightTodaysOne` effect), the `ms_action_done_dates` load effect,
+`markActionDone` (incl. its `[DEBUG checkin]` log, kept for fidelity — not yet
+cleaned up), `todayAction`/`actionRow`/`dayIndex`/`actionRevealText`, and the
+full JSX card. Also restored: `AppNavigator`'s `goToTodaysOne`/
+`highlightTodaysOne`, the `'home'`/`'profile'` prop pass-throughs, both
+`HomeScreen` cascade `onWorkOnThis` sites (→ `triggerTodaysOneBlink`), both
+`ProfileScreen` cascade sites (→ `onGoToTodaysOne`), and the push-notification
+tap listener's `checkin_reminder`/`streak_milestone` routing (→ `goToTodaysOne()`,
+reverted from the interim `streak-calendar` redirect). One deliberate net-new
+piece, requested explicitly this time rather than assumed: the notification bell
+panel's own row-tap handler (`handleSelectNotification`, new this session, not
+part of the original pre-removal code) now also calls `triggerTodaysOneBlink()`
+for those two types instead of navigating to the Streak Calendar — since the
+panel opens from Home already, no navigation is needed, and this keeps the bell
+panel and the push listener landing on the same place for the same notification
+types. `npx tsc --noEmit`: still exactly 10 pre-existing errors after the full
+restore, confirmed clean. The Streak Calendar screen itself, its "View streak
+calendar →" link from the restored card, the Insights Hub's own "Today's Habit"
+card, and everything else described below (Insights Hub, notification bell panel
+build, the `getLayerSignal` fix, the Points Available restyle) are unaffected —
+this correction only reverted the strip-removal piece.
+
+**Insights Hub (`InsightsHubScreen`, new) — bottom-nav "Layers" tab renamed
+"Insights" (icon → `bulb`).** 4 cards: 5 Layers (icon row, dominant-layer
+highlight, taps through to the original full breakdown — kept intact as
+`LayersHubScreen`, only its own `BottomNav active` value changed so the Insights
+tab stays highlighted), Today's Habit (own `computeStreak()`-derived streak, taps
+to the Streak Calendar), Points Available (restyled this session — see below),
+Coming Soon placeholder. Has its own empty state pre-first-test.
+
+**Notification bell panel (`NotificationBellPanel`/`NotificationRow`, new) on
+Home** — `Modal`-based, reads `notification_log` (client-side `SELECT` only,
+never written by the app — see `grant_notification_log_table_access.sql`, same
+missing-GRANT bug class hit 3x already 2026-08-06, caught proactively this time).
+65% width, top-right anchored, translucent `${colors.card}E6` background (chosen
+over real `expo-blur` to avoid a third un-rebuilt native dependency). Per-row X
+button, swipe-to-dismiss, "Clear All," 7-day count badge on the bell icon (caps at
+"9+"). Tap routes: `checkin_reminder`/`streak_milestone` → Streak Calendar,
+`retest_reminder` → score screen.
+- **Bug fixed, same root cause as the Streak Calendar grid bug (2026-08-06):**
+  panel text invisible / header wrapping — a percentage-width child of an
+  absolutely-positioned parent with no definite width (`top:0,right:0`, no
+  `left`). Fixed the same way: `top:0,left:0,right:0` on the parent,
+  `alignSelf:'flex-end'` on the child.
+- `dismissedNotifIds` was resetting on every tab switch — confirmed root cause
+  (not hypothesized): this app's screens fully unmount/remount on every
+  navigation (documented architecture fact, not new). Fixed by lifting
+  `dismissedNotifIds`/`markNotifDismissed` into `AppDataContext` (persists across
+  navigation, resets only on identity change like the rest of that context).
+- **Still open, not resolved this session:** swipe-to-dismiss still has a
+  temporary `[DEBUG notif-swipe]` diagnostic log in `NotificationRow`, pending a
+  real device test. A temporary yellow `backgroundColor` diagnostic was also left
+  on the empty-state `Text` — outcome not yet confirmed on device. Both need
+  removing once verified.
+
+**Today's 1%/streak strip removed from Home entirely** — now redundant with
+Insights' own "Today's Habit" card, which routes to the same Streak Calendar
+where the actual mark-as-done/streak UI lives (today's grid cell there does the
+same completion action the strip's "Mark as Done" button used to). Removed
+`HomeScreen`'s pending/complete-state card, swipe-dismiss, blink animation, and
+"View streak calendar →" link, plus all its backing state
+(`streak`/`actionDone`/`actionDoneFlash`/`dismissedToday`/`todaysOneBlinkAnim`/etc.)
+and the dedicated `goToTodaysOne`/`highlightTodaysOne` plumbing that existed only
+to jump to and blink that card (`AppNavigator`, `ProfileScreen`, the push-tap
+listener, both `HomeScreen` `CascadeVisualization` "Want to work on this?" call
+sites). Every former caller now just calls `onNavigate('streak-calendar')`
+directly instead — simpler than keeping a dedicated callback alive for a target
+that no longer needs special-casing. `ProfileScreen`'s two
+`CascadeVisualization` call sites (its own "Want to work on this?" cascade cards)
+updated the same way, since they'd been left referencing the now-removed
+`onGoToTodaysOne` prop.
+- Possible follow-up, not done: `HOME_SECTIONS`/`'daily-focus'` entry (likely
+  `src/data/appData.ts`, referenced by `CustomizeHomeScreen`) toggled the now-gone
+  strip and is probably orphaned — not cleaned up, wasn't explicitly requested.
+
+**Points Available card (Insights Hub) restyled to match Results screen's "Fat
+loss resistance & potential" card exactly** — same rounded card treatment,
+green accent color/label row, `+N points... over N weeks` framing, supporting
+sentence. Previously had its own different, plainer treatment (2026-08-06's
+"Minor follow-up" item, now closed).
+
+**Last fallback-pattern gap closed:** the same `scoreResult ?? scoreHistory[0]`
+fallback already applied throughout (Metabolic Score, Metabolic Story, 5 Layers,
+Latest Insights, Case Studies, cravings, symptoms) had missed one field —
+HomeScreen's `getLayerSignal` (the "Your Signal" quote under 5 Layers, e.g. "I
+feel constantly on edge even when nothing is wrong") was still reading only live
+`scoreResult.history`, so it went blank after sign-in without retaking the test
+this session. Fixed to read `scoreResult?.history ?? latestHistory?.answers`,
+consistent with the established pattern rather than a new approach. **Scope
+note:** the Insights Hub's own "5 Layers" card doesn't show a per-layer signal
+quote at all (more compact design than Home's) — nothing to fix there, the fix
+only applied where the field actually exists (Home).
+
+`npx tsc --noEmit`: still exactly 10 pre-existing errors (7 `ImageSourcePropType`,
+3 craving/insight union types) after this whole batch — confirmed clean, nothing
+new introduced. Nothing committed — staged only, pending Amit's review per rule 8.
 
 ### 2026-08-06 — PDF footer bug closed; full push notification engine + habit cycle
 engine built, deployed, and device-tested; multiple real production bugs found and
@@ -203,9 +844,11 @@ patched.**
 **App-side (`App.tsx`, `supabase.ts`, `AppDataContext.tsx`):**
 - Push token capture wired into `OnboardingScreen.handleComplete` + `ProfileScreen`
   manual toggle (shared function, fixed missing `projectId` in the old version)
-- Notification-tap deep-link routing: `checkin_reminder`/`streak_milestone` →
-  `goToTodaysOne()`, `retest_reminder` → score screen. Handles both warm/background
-  taps and cold-start taps.
+- Notification-tap deep-link routing: `checkin_reminder` → `goToTodaysOne()`,
+  `retest_reminder` → score screen. Handles both warm/background taps and cold-start
+  taps. (`streak_milestone` originally also routed to `goToTodaysOne()` here — corrected
+  2026-08-07 to route to the Streak Calendar screen instead, once that screen existed,
+  matching the bell panel's own tap routing built the same night.)
 - **Bug fixed:** cold-start taps were double-firing routing (both
   `addNotificationResponseReceivedListener` and `getLastNotificationResponseAsync()`
   independently triggered the same action) — deduped via notification identifier.
@@ -284,7 +927,8 @@ derived math, so users who never retest have a defined path back to a fresh cycl
 1. **Bell/inbox notification sync** — architecture agreed (reads from
    `notification_log`, no new writes needed), full brief written, never sent/built.
 2. **Retest-outcome card** (Results screen) — fully spec'd (5 branches by
-   adherence + score delta, all copy finalized), not started.
+   adherence + score delta, all copy finalized), not started. **Built 2026-08-08,
+   see that session's entry near the top of this log.**
 3. **Completion-UX redesign for "Mark as Done"** — real design gap identified:
    current checkmark-based interaction borrows diagnostic/form-entry visual
    language for what should be a habit-reward moment. Three concrete directions

@@ -6,6 +6,7 @@
     "orientation": "portrait",
     "userInterfaceStyle": "dark",
     "scheme": "metabolicscore",
+    "newArchEnabled": false,
     "ios": {
       "supportsTablet": true,
       "bundleIdentifier": "com.amitbaruna.metabolicscore",
@@ -18,6 +19,7 @@
     },
     "plugins": [
       "expo-notifications",
+      "react-native-health",
       [
         "@sentry/react-native/expo",
         {

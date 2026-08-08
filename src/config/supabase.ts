@@ -474,6 +474,42 @@ export const habitCycles = {
   },
 };
 
+// Read-only from the app's side — notification_log is only ever written by the
+// notification Worker (service_role) each time it sends a push. Feeds the Home
+// notification bell panel. `metadata.body` is only present on rows logged after
+// 2026-08-07 (see the Worker's logRows.push) — older rows only have `metadata.title`, the
+// panel shows title-only for those rather than treating a missing body as an error.
+export const notificationLog = {
+  async list(): Promise<any[]> {
+    const token = await auth.getToken();
+    const user = await auth.getSession();
+    if (!user?.id) return [];
+    const rows = await sbFetch(`/rest/v1/notification_log?user_id=eq.${user.id}&select=id,type,sent_at,metadata&order=sent_at.desc&limit=50`, {}, token);
+    if (!Array.isArray(rows)) {
+      console.warn('[notificationLog.list] unexpected response:', rows);
+      return [];
+    }
+    return rows;
+  },
+  // Bell icon badge — last 7 days only, not all-time (an all-time count would only ever
+  // grow and stop meaning anything). Returns full rows (not just a count) so the badge can
+  // be computed client-side after subtracting whatever's currently in HomeScreen's shared
+  // dismissedNotifIds set — corrected 2026-08-07: the badge is meant to match what the
+  // panel would actually show if opened right now, not a raw count independent of dismiss.
+  async listLast7Days(): Promise<{ id: string }[]> {
+    const token = await auth.getToken();
+    const user = await auth.getSession();
+    if (!user?.id) return [];
+    const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+    const rows = await sbFetch(`/rest/v1/notification_log?user_id=eq.${user.id}&sent_at=gte.${sevenDaysAgo}&select=id`, {}, token);
+    if (!Array.isArray(rows)) {
+      console.warn('[notificationLog.listLast7Days] unexpected response:', rows);
+      return [];
+    }
+    return rows;
+  },
+};
+
 export const membership = {
   async get() {
     const user = await auth.getSession();

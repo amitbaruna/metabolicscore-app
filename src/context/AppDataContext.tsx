@@ -87,6 +87,18 @@ type DataContextType = {
   setMiniQuizAnswers: (layerId: number, answers: number[]) => Promise<void>;
   lastQuizAnswers: { layer: number; q: number; selected: number[]; score: number }[];
   setLastQuizAnswers: (answers: { layer: number; q: number; selected: number[]; score: number }[]) => void;
+  // Locally-dismissed notification_log row ids for the Home bell panel — plain in-memory
+  // state (not AsyncStorage-backed), deliberately living here rather than in HomeScreen's
+  // own useState. HomeScreen fully unmounts/remounts on every navigation away and back
+  // (this app's screen router is a plain switch(screen), not a persistent tab navigator —
+  // see CLAUDE.md), so state local to it doesn't survive a Home → Profile → Home round
+  // trip. Living in this context instead (which persists for the app session, reset only
+  // on identity change below) makes "dismissed" survive navigation while still resetting
+  // on a genuine app restart, matching the original "session-local, not permanent" intent
+  // (confirmed root cause, 2026-08-07 — not a hypothesis, this app's unmount-on-nav
+  // behavior is already documented and repeatedly hit this exact bug class before).
+  dismissedNotifIds: Set<string>;
+  markNotifDismissed: (id: string) => void;
   loading: boolean;
 };
 
@@ -132,6 +144,10 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
   const [fullName, setFullNameState] = useState<string>('');
   const [miniQuiz, setMiniQuizState] = useState<MiniQuizMap>({});
   const [lastQuizAnswers, setLastQuizAnswersState] = useState<{ layer: number; q: number; selected: number[]; score: number }[]>([]);
+  const [dismissedNotifIds, setDismissedNotifIds] = useState<Set<string>>(new Set());
+  const markNotifDismissed = useCallback((id: string) => {
+    setDismissedNotifIds(prev => new Set(prev).add(id));
+  }, []);
 
   useEffect(() => {
     (async () => {
@@ -156,6 +172,10 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
         ]);
         await AsyncStorage.setItem(KEYS.lastUserId, currentIdentity);
         console.log('[AppDataContext] Identity changed (', lastIdentity, '->', currentIdentity, ') — cleared stale local cache');
+        // Not AsyncStorage-backed (plain in-memory), so not part of the Promise.all above —
+        // but still needs clearing here for the same reason: a newly-signed-in account
+        // must not inherit the previous account's dismissed-notification state.
+        setDismissedNotifIds(new Set());
       }
 
       const [c, s, g, fd, bl, sh, mq, lqa, cond] = await Promise.all([
@@ -535,7 +555,7 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
       hasScore, fullName, scoreHistory, refreshScoreHistory, saveProfile, saveScore,
       cravings, saveCraving, updateCraving, saveNpsRating, logReportDownload, logCheckin, logCheckinUndo, deleteCraving, refreshCravings, symptoms, setSymptoms, goals, setGoals,
       fatDeposition, setFatDeposition, baseline, setBaseline, conditions, setConditions,
-      miniQuiz, setMiniQuizAnswers, lastQuizAnswers, setLastQuizAnswers, loading,
+      miniQuiz, setMiniQuizAnswers, lastQuizAnswers, setLastQuizAnswers, dismissedNotifIds, markNotifDismissed, loading,
     }}>
       {children}
     </DataContext.Provider>
