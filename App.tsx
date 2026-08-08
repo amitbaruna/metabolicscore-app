@@ -4543,30 +4543,72 @@ function InsightsHubScreen({ onNavigate, hasScore, scoreResult }: { onNavigate: 
                 <Text style={{ fontSize: 12, lineHeight: 18, color: colors.textSecondary }}>Lowering your resistance may unlock <Text style={{ fontWeight: '600', color: '#22C55E' }}>+{pointsAvailable} points</Text> of recovery capacity over roughly <Text style={{ fontWeight: '600', color: colors.text }}>{pointsWeeks} weeks</Text>, with the right intervention sequence.</Text>
               </View>
 
+              {/* Honest placeholder — not functional, just so the screen doesn't feel
+                  incomplete. No overclaiming on timeline, matching this project's clinical
+                  language discipline. */}
+              <View style={{ borderRadius: 20, padding: 20, backgroundColor: colors.card, borderWidth: 1, borderColor: colors.border, borderStyle: 'dashed' }}>
+                <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
+                  <Ionicons name="time-outline" size={16} color={colors.textTertiary} />
+                  <Text style={{ fontSize: 11, fontWeight: '700', letterSpacing: 1, color: colors.textTertiary, textTransform: 'uppercase' }}>Coming Soon</Text>
+                </View>
+                <Text style={{ fontSize: 13, color: colors.textSecondary, marginTop: 10, lineHeight: 19 }}>Longitudinal trends across your assessments, and wearable data integration, are planned for a future phase — not available yet.</Text>
+              </View>
+
+              {/* 5 Layers — icon row (reuses LayerIcon, same component CascadeVisualization/
+                  LayersHubScreen already use, not recreated), dominant layer highlighted with
+                  a thicker ring + soft glow. Direct navigate on tap, per confirmed approach —
+                  no inline expand step. */}
+              <TouchableOpacity activeOpacity={0.95} onPress={() => onNavigate('layers')} style={{ borderRadius: 20, padding: 20, backgroundColor: colors.card }}>
+                <Text style={{ fontSize: 11, fontWeight: '700', letterSpacing: 1, color: colors.textSecondary, textTransform: 'uppercase' }}>5 Layers</Text>
+                <View style={{ flexDirection: 'row', justifyContent: 'space-between', marginTop: 14 }}>
+                  {LAYERS.map(layer => {
+                    const isDominant = layer.id === dominantLayerId;
+                    return (
+                      <View
+                        key={layer.id}
+                        style={{
+                          width: 44, height: 44, borderRadius: 22, backgroundColor: colors.bg,
+                          alignItems: 'center', justifyContent: 'center',
+                          borderWidth: isDominant ? 2 : 0, borderColor: isDominant ? layer.color : 'transparent',
+                          shadowColor: isDominant ? layer.color : 'transparent',
+                          shadowOpacity: isDominant ? 0.5 : 0, shadowRadius: isDominant ? 8 : 0,
+                          shadowOffset: { width: 0, height: 0 }, elevation: isDominant ? 4 : 0,
+                        }}
+                      >
+                        <LayerIcon name={layer.icon} size={20} color={layer.color} />
+                      </View>
+                    );
+                  })}
+                </View>
+                {dominantLayer && (
+                  <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8, marginTop: 14 }}>
+                    <View style={{ paddingHorizontal: 8, paddingVertical: 3, borderRadius: 6, backgroundColor: `${dominantLayer.color}20` }}>
+                      <Text style={{ fontSize: 10, fontWeight: '800', color: dominantLayer.color }}>L{dominantLayerId}</Text>
+                    </View>
+                    <Text style={{ fontSize: 14, fontWeight: '700', color: colors.text }}>{dominantLayerDisplayName}</Text>
+                  </View>
+                )}
+                <View style={{ marginTop: 12, paddingTop: 12, borderTopWidth: 1, borderTopColor: colors.border, alignItems: 'center' }}>
+                  <Text style={{ fontSize: 11, color: colors.textTertiary }}>Tap to see full breakdown →</Text>
+                </View>
+              </TouchableOpacity>
+
+              {/* Today's Habit — same streak concept as Home's Today's 1% card. */}
+              <TouchableOpacity activeOpacity={0.95} onPress={() => onNavigate('streak-calendar')} style={{ borderRadius: 20, padding: 20, backgroundColor: colors.card }}>
+                <Text style={{ fontSize: 11, fontWeight: '700', letterSpacing: 1, color: colors.textSecondary, textTransform: 'uppercase' }}>Today's Habit</Text>
+                <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8, marginTop: 10 }}>
+                  <Ionicons name="flame" size={20} color="#F59E0B" />
+                  <Text style={{ fontSize: 20, fontWeight: '800', color: colors.text }}>{streak} day streak</Text>
+                </View>
+                <View style={{ marginTop: 12, paddingTop: 12, borderTopWidth: 1, borderTopColor: colors.border, alignItems: 'center' }}>
+                  <Text style={{ fontSize: 11, color: colors.textTertiary }}>Tap to view streak calendar →</Text>
+                </View>
+              </TouchableOpacity>
+
               {/* ═══════════════════════════════════════════════════════════
                   QUICK LINKS
                  ═══════════════════════════════════════════════════════════ */}
               <View style={{ borderRadius: 20, backgroundColor: colors.card, overflow: 'hidden' }}>
-                <TouchableOpacity activeOpacity={0.95} onPress={() => onNavigate('layers')} style={{ flexDirection: 'row', alignItems: 'center', gap: 12, padding: 16, borderBottomWidth: 1, borderBottomColor: colors.border }}>
-                  <View style={{ width: 36, height: 36, borderRadius: 10, backgroundColor: '#7C5CFF1A', alignItems: 'center', justifyContent: 'center' }}>
-                    <Ionicons name="layers" size={18} color="#7C5CFF" />
-                  </View>
-                  <View style={{ flex: 1 }}>
-                    <Text style={{ fontSize: 13, fontWeight: '700', color: colors.text }}>5 Layers Breakdown</Text>
-                    <Text style={{ fontSize: 11, color: colors.textTertiary, marginTop: 1 }}>{dominantLayerDisplayName ? `Dominant: ${dominantLayerDisplayName}` : 'View your 5 metabolic layers'}</Text>
-                  </View>
-                  <Ionicons name="chevron-forward" size={16} color={colors.textTertiary} />
-                </TouchableOpacity>
-                <TouchableOpacity activeOpacity={0.95} onPress={() => onNavigate('streak-calendar')} style={{ flexDirection: 'row', alignItems: 'center', gap: 12, padding: 16, borderBottomWidth: 1, borderBottomColor: colors.border }}>
-                  <View style={{ width: 36, height: 36, borderRadius: 10, backgroundColor: '#F59E0B1A', alignItems: 'center', justifyContent: 'center' }}>
-                    <Ionicons name="flame" size={18} color="#F59E0B" />
-                  </View>
-                  <View style={{ flex: 1 }}>
-                    <Text style={{ fontSize: 13, fontWeight: '700', color: colors.text }}>Habit Streak</Text>
-                    <Text style={{ fontSize: 11, color: colors.textTertiary, marginTop: 1 }}>{streak} day streak</Text>
-                  </View>
-                  <Ionicons name="chevron-forward" size={16} color={colors.textTertiary} />
-                </TouchableOpacity>
                 <TouchableOpacity activeOpacity={0.95} onPress={() => onNavigate('score-history')} style={{ flexDirection: 'row', alignItems: 'center', gap: 12, padding: 16 }}>
                   <View style={{ width: 36, height: 36, borderRadius: 10, backgroundColor: `${colors.red}1A`, alignItems: 'center', justifyContent: 'center' }}>
                     <Ionicons name="time" size={18} color={colors.red} />
