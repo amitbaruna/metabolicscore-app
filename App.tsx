@@ -7364,24 +7364,53 @@ function ScoreHistoryScreen({ onNavigate }: { onNavigate: (s: ScreenId) => void 
 
 function StreakCalendarScreen({ onNavigate }: { onNavigate: (s: ScreenId) => void }) {
   const { colors } = useTheme();
+  const { user } = useAuth();
   const { scoreHistory, logCheckin, logCheckinUndo } = useAppData();
   const [cycles, setCycles] = useState<any[] | null>(null);
   const [checkinDates, setCheckinDates] = useState<Record<string, boolean>>({});
   const [expandedCycleId, setExpandedCycleId] = useState<string | null>(null);
 
-  useEffect(() => { habitCycles.getMine().then(setCycles).catch(() => setCycles([])); }, []);
+  // Falls back to the last-cached result on a failed fetch (e.g. offline) instead of
+  // defaulting straight to empty — a dead network was previously indistinguishable from
+  // "this user genuinely has no cycles yet," both rendering the same "hasn't started" empty
+  // state even when real cycle data had already loaded earlier in the session (confirmed
+  // 2026-08-11). Cache is per-user since habit_cycles rows are per-user.
+  useEffect(() => {
+    const cacheKey = `ms_streak_cycles_cache_${user?.id || 'anonymous'}`;
+    habitCycles.getMine().then(rows => {
+      setCycles(rows);
+      AsyncStorage.setItem(cacheKey, JSON.stringify(rows)).catch(() => {});
+    }).catch(async () => {
+      const cached = await AsyncStorage.getItem(cacheKey).catch(() => null);
+      if (cached) {
+        try { setCycles(JSON.parse(cached)); return; } catch {}
+      }
+      setCycles([]);
+    });
+  }, [user?.id]);
 
   const currentCycle = cycles?.find(c => c.status === 'active' || c.status === 'extended') ?? null;
   const pastCycles = (cycles ?? []).filter(c => c.status === 'closed_retest' || c.status === 'closed_reset');
 
+  // Same cache-fallback pattern as cycles above. Scoped by cycle start_date too (not just
+  // user) so a stale cached check-in map from an older, already-closed cycle can never be
+  // shown under a newly-started one.
   useEffect(() => {
     if (!currentCycle?.start_date) { setCheckinDates({}); return; }
+    const cacheKey = `ms_streak_checkins_cache_${user?.id || 'anonymous'}_${currentCycle.start_date}`;
     checkins.listSince(currentCycle.start_date).then(rows => {
       const map: Record<string, boolean> = {};
       rows.forEach(r => { if (r.completed) map[r.date] = true; });
       setCheckinDates(map);
-    }).catch(() => setCheckinDates({}));
-  }, [currentCycle?.start_date]);
+      AsyncStorage.setItem(cacheKey, JSON.stringify(map)).catch(() => {});
+    }).catch(async () => {
+      const cached = await AsyncStorage.getItem(cacheKey).catch(() => null);
+      if (cached) {
+        try { setCheckinDates(JSON.parse(cached)); return; } catch {}
+      }
+      setCheckinDates({});
+    });
+  }, [currentCycle?.start_date, user?.id]);
 
   // dominantLayerId + actionRow — this screen previously had neither, so its check-in write
   // always sent assigned_action_id: null, which violates app_checkins' NOT NULL constraint
@@ -7395,8 +7424,21 @@ function StreakCalendarScreen({ onNavigate }: { onNavigate: (s: ScreenId) => voi
     ? Number(Object.entries({ 1: latestScore.layer1, 2: latestScore.layer2, 3: latestScore.layer3, 4: latestScore.layer4, 5: latestScore.layer5 }).sort((a, b) => a[1] - b[1])[0][0])
     : 2);
   const [calendarActionRow, setCalendarActionRow] = useState<any>(null);
+  // Same cache-fallback pattern as cycles/checkinDates above. Layer-scoped only, not
+  // user-scoped — actionContent.get() reads the actions table with no user filter
+  // (src/config/supabase.ts), so this copy is identical for every user on a given layer.
   useEffect(() => {
-    actionContent.get(`L${dominantLayerId}`).then(setCalendarActionRow).catch(() => setCalendarActionRow(null));
+    const cacheKey = `ms_action_content_cache_L${dominantLayerId}`;
+    actionContent.get(`L${dominantLayerId}`).then(row => {
+      setCalendarActionRow(row);
+      AsyncStorage.setItem(cacheKey, JSON.stringify(row)).catch(() => {});
+    }).catch(async () => {
+      const cached = await AsyncStorage.getItem(cacheKey).catch(() => null);
+      if (cached) {
+        try { setCalendarActionRow(JSON.parse(cached)); return; } catch {}
+      }
+      setCalendarActionRow(null);
+    });
   }, [dominantLayerId]);
 
   const todayStr = new Date().toISOString().slice(0, 10);
