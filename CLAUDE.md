@@ -208,6 +208,15 @@ instances — check this list before re-diagnosing something that's already unde
   assignment, instead of bucketing raw samples to a day first. Needs on-device
   verification across the Sleep Schedule average, the 30-day trend chart, and the Vital
   Signs/Sleep Structure cards — not just one screen.
+- **Notification bell empty state doesn't show** ("You're all caught up 🙂" not
+  appearing when the panel has nothing to display, flagged 2026-08-07). Investigated
+  with debug logging; root cause not found after ~2 hours, deprioritized as low-value
+  polish. Still open, low priority.
+- **`StreakCalendarScreen`'s grid hardcodes 14 days**, even for extended (21-day)
+  cycles (flagged 2026-08-07, found while building the retest-outcome card). Small
+  pre-existing inconsistency — the retest-outcome card itself derives its window
+  length correctly from the cycle's real `start_date`/`end_date`; the calendar grid
+  still doesn't. Not fixed, not urgent.
 
 ## Future Ideas Registry (flagged, not scoped into active work)
 
@@ -227,6 +236,9 @@ not a session-log entry — check here before re-proposing something already cap
   report's own HTML/CSS. Real fix would need `pdf-lib` post-processing to add actual PDF
   link annotations, including mapping each case row to its rendered coordinates —
   nontrivial, not started. Not worth the implementation risk this close to submission.
+- **PostHog product analytics (decided as the tool, flagged 2026-08-07), not yet built.**
+  Own dedicated session — daily/session activity, click tracking, heatmaps,
+  content-engagement tracking — explicitly separate from Sentry (crash reporting only).
 
 ## Source-of-truth rules
 
@@ -670,7 +682,8 @@ established precedent instead of inventing a new negative color), amber
 Adherence shown as a small pill badge next to the section label.
 
 `npx tsc --noEmit`: still exactly 10 pre-existing errors, confirmed clean.
-Nothing committed — staged only, pending Amit's review per rule 8.
+**Confirmed working on real device 2026-08-07, with a live retest showing a
+real delta.** Nothing committed — staged only, pending Amit's review per rule 8.
 
 ### 2026-08-07 — Insights Hub tab + notification bell panel built; Today's 1% card removed from Home then fully restored same session (see correction below); last scoreResult→scoreHistory fallback gap closed
 
@@ -927,8 +940,9 @@ derived math, so users who never retest have a defined path back to a fresh cycl
 1. **Bell/inbox notification sync** — architecture agreed (reads from
    `notification_log`, no new writes needed), full brief written, never sent/built.
 2. **Retest-outcome card** (Results screen) — fully spec'd (5 branches by
-   adherence + score delta, all copy finalized), not started. **Built 2026-08-08,
-   see that session's entry near the top of this log.**
+   adherence + score delta, all copy finalized), not started. **Built and
+   device-confirmed 2026-08-07, see that session's entry near the top of this
+   log.**
 3. **Completion-UX redesign for "Mark as Done"** — real design gap identified:
    current checkmark-based interaction borrows diagnostic/form-entry visual
    language for what should be a habit-reward moment. Three concrete directions

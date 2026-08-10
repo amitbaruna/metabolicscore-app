@@ -3359,6 +3359,47 @@ function computePointsAvailable(answers: { ansIdx: number }[] | undefined | null
   const weeks = totalScore <= 30 ? '10–14' : totalScore <= 50 ? '8–12' : '6–10';
   return { avail, weeks };
 }
+// Retest-outcome card copy — 5 locked messages (Amit, 2026-08-08), branching on adherence
+// first (low/mid adherence makes the score delta itself unreliable to read anything into,
+// so it pre-empts every delta branch below it), then on score delta once adherence is high
+// enough to trust. windowDays is the cycle's own actual span (14 normally, 21 once
+// extended — never hardcoded), so "the last N days" always matches the real cycle length
+// the adherence count was drawn from, not a fixed literal.
+function buildRetestOutcomeCard(delta: number, adherence: number, windowDays: number): { tier: 1 | 2 | 3 | 4 | 5; message: string; needsCta: boolean } {
+  if (adherence < 10) {
+    return {
+      tier: 1,
+      message: `Your score didn't move much this cycle — looking back, ${adherence} of the last ${windowDays} days had a completed check-in. Worth giving the habit a real, consistent run before your next retest — that's really the fairest test.`,
+      needsCta: false,
+    };
+  }
+  if (delta >= 5) {
+    return {
+      tier: 2,
+      message: `Solid — your score is up ${delta} points, and you followed through ${adherence} of the last ${windowDays} days. That's not a coincidence.`,
+      needsCta: false,
+    };
+  }
+  if (delta >= 1) {
+    return {
+      tier: 3,
+      message: `Small but real movement — your score is up ${delta} points, and you followed through ${adherence} of the last ${windowDays} days. That's the habit starting to work. Worth keeping the streak going into the next cycle.`,
+      needsCta: false,
+    };
+  }
+  if (delta >= -4) {
+    return {
+      tier: 4,
+      message: `You followed through consistently — ${adherence} of the last ${windowDays} days — and your score held steady. That's worth a closer look. If you'd like, a short conversation with Amit might help pinpoint what's underneath this.`,
+      needsCta: true,
+    };
+  }
+  return {
+    tier: 5,
+    message: `You followed through consistently — ${adherence} of the last ${windowDays} days — but your score moved in the other direction this cycle. That's not a sign you did anything wrong; it usually means something else is actively at play. Worth a short conversation with Amit to look closer.`,
+    needsCta: true,
+  };
+}
 // Monday-first weekday index (0=Mon..6=Sun) for a 'YYYY-MM-DD' date string — used by
 // StreakCalendarScreen to align its 14-day grid to real calendar columns under the fixed
 // M/T/W/T/F/S/S header, rather than always starting day 0 in the first (Monday) column
@@ -3367,7 +3408,7 @@ function weekdayMondayFirst(dateStr: string): number {
   return (new Date(dateStr).getUTCDay() + 6) % 7;
 }
 
-function ResultsScreen({ onNavigate, result, userData, autoExpandN3, onSelectLayer }: { onNavigate: (s: ScreenId) => void; result: ScoreResult; userData: UserData; autoExpandN3?: boolean; onSelectLayer?: (id: number) => void }) {
+function ResultsScreen({ onNavigate, result, userData, autoExpandN3, onSelectLayer, previousTotalScore }: { onNavigate: (s: ScreenId) => void; result: ScoreResult; userData: UserData; autoExpandN3?: boolean; onSelectLayer?: (id: number) => void; previousTotalScore?: number | null }) {
   const [rating, setRating] = useState(0);
   const [ratingDone, setRatingDone] = useState(false);
   const [localReveal, setLocalReveal] = useState(false);
@@ -3471,6 +3512,46 @@ function ResultsScreen({ onNavigate, result, userData, autoExpandN3, onSelectLay
 
   const { avail, weeks } = computePointsAvailable(result.history, result.totalScore);
 
+  // Retest-outcome card — only ever relevant right after a genuine retest (previousTotalScore
+  // is only passed by AppNavigator on the live scoreResult path, captured from scoreHistory[0]
+  // *before* saveScore's optimistic prepend, never on the reconstructed-from-history path — see
+  // handleScoreComplete). Adherence is read from the actual habit_cycles record + its real
+  // app_checkins, not re-derived from raw date math, per Amit's explicit instruction
+  // (2026-08-08) — same APIs StreakCalendarScreen already uses (habitCycles.getMine(),
+  // checkins.listSince), not new endpoints.
+  const isGenuineRetest = previousTotalScore != null;
+  const [retestCycles, setRetestCycles] = useState<any[] | null>(null);
+  useEffect(() => {
+    if (!isGenuineRetest) return;
+    habitCycles.getMine().then(setRetestCycles).catch(() => setRetestCycles([]));
+  }, [isGenuineRetest]);
+  // Prefer the currently open cycle; fall back to the most recently closed one in case the
+  // Worker's day-14/21 cron already closed it out by the time this retest landed (the app has
+  // no way to know which happened first). Doesn't special-case the closed_reset-then-immediate-
+  // retest edge case (a brand-new cycle with near-zero adherence) — not covered by the spec,
+  // not built.
+  const retestCurrentCycle = retestCycles?.find(c => c.status === 'active' || c.status === 'extended') ?? retestCycles?.[0] ?? null;
+  const [retestAdherence, setRetestAdherence] = useState<number | null>(null);
+  useEffect(() => {
+    if (!retestCurrentCycle?.start_date) { setRetestAdherence(null); return; }
+    const rangeEnd = retestCurrentCycle.end_date ?? new Date().toISOString().slice(0, 10);
+    checkins.listSince(retestCurrentCycle.start_date).then(rows => {
+      setRetestAdherence(rows.filter(r => r.completed && r.date <= rangeEnd).length);
+    }).catch(() => setRetestAdherence(null));
+  }, [retestCurrentCycle?.start_date, retestCurrentCycle?.end_date]);
+  // Real elapsed span of the cycle itself (14 normally, 21 once extended) — derived from the
+  // cycle's own start/end dates, not assumed, so the copy's "last N days" always matches what
+  // retestAdherence was actually counted over.
+  const retestWindowDays = retestCurrentCycle
+    ? Math.round((toDateOnly(new Date(retestCurrentCycle.end_date ?? new Date().toISOString().slice(0, 10))).getTime() - toDateOnly(new Date(retestCurrentCycle.start_date)).getTime()) / 86400000) + 1
+    : 14;
+  const retestDelta = isGenuineRetest ? result.totalScore - (previousTotalScore as number) : 0;
+  const retestOutcome = (isGenuineRetest && retestAdherence != null)
+    ? buildRetestOutcomeCard(retestDelta, retestAdherence, retestWindowDays)
+    : null;
+  const retestDeltaColor = retestDelta > 0 ? '#22C55E' : retestDelta < 0 ? '#EF4444' : colors.amber;
+  const retestDeltaIcon = retestDelta > 0 ? 'trending-up' : retestDelta < 0 ? 'trending-down' : 'remove';
+
   const toggleCard = (id: string) => setExpandedCard(expandedCard === id ? null : id);
 
   // PIPELINE 3: Retest countdown — days remaining until next retest is recommended.
@@ -3541,6 +3622,34 @@ function ResultsScreen({ onNavigate, result, userData, autoExpandN3, onSelectLay
           </>
         )}
       </View>
+
+      {/* Retest outcome — appears once, only right after a genuine retest (previousTotalScore
+          set means real prior data exists). Never shown on a first-ever test or when just
+          viewing a past result later (reconstructed-from-history path doesn't pass
+          previousTotalScore at all, see AppNavigator's case 'results'). */}
+      {retestOutcome && (
+        <View style={{ paddingHorizontal: 24, marginTop: 20 }}>
+          <View style={{ borderRadius: 20, padding: 20, backgroundColor: colors.card }}>
+            <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' }}>
+              <Text style={{ fontSize: 10, fontWeight: '700', letterSpacing: 1, color: colors.textSecondary, textTransform: 'uppercase' }}>Since Your Last Test</Text>
+              <View style={{ backgroundColor: colors.iconBg, borderRadius: 20, paddingHorizontal: 10, paddingVertical: 4 }}>
+                <Text style={{ fontSize: 11, fontWeight: '700', color: colors.text }}>{retestAdherence} of {retestWindowDays} days</Text>
+              </View>
+            </View>
+            <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8, marginTop: 12 }}>
+              <Ionicons name={retestDeltaIcon as any} size={20} color={retestDeltaColor} />
+              <Text style={{ fontSize: 22, fontWeight: '900', color: retestDeltaColor }}>{retestDelta > 0 ? `+${retestDelta}` : retestDelta}</Text>
+              <Text style={{ fontSize: 13, fontWeight: '600', color: colors.text }}>points since last test</Text>
+            </View>
+            <Text style={{ fontSize: 13, lineHeight: 20, color: colors.textSecondary, marginTop: 12 }}>{retestOutcome.message}</Text>
+            {retestOutcome.needsCta && (
+              <TouchableOpacity onPress={() => onNavigate('booking')} style={{ marginTop: 16, backgroundColor: colors.red, paddingVertical: 12, borderRadius: 12, alignItems: 'center' }}>
+                <Text style={{ color: '#fff', fontSize: 13, fontWeight: '700', letterSpacing: 0.5 }}>Talk to Amit</Text>
+              </TouchableOpacity>
+            )}
+          </View>
+        </View>
+      )}
 
       <View style={{ paddingHorizontal: 24, marginTop: 20 }}>
         <View style={{ borderRadius: 16, padding: 18, backgroundColor: `${result.rcsInfo.color}14`, borderLeftWidth: 3, borderLeftColor: result.rcsInfo.color }}>
@@ -3848,12 +3957,21 @@ function InsightsHubScreen({ onNavigate, hasScore, scoreResult }: { onNavigate: 
   const latestHistory = scoreHistory[0];
   const prevHistory = scoreHistory[1];
 
+  // Same dominant-layer fallback chain LayersHubScreen itself uses — prefer the live
+  // in-session result, fall back to the latest persisted assessment.
   const dominantLayerId = scoreResult?.dominantLayer ?? latestHistory?.dominant_layer ?? null;
   const dominantLayer = dominantLayerId ? LAYERS[dominantLayerId - 1] : null;
+  // Simple-mode name uses LAYER_PLAIN_SHORT ('Energy'), not LayersHubScreen's own
+  // LAYER_PLAIN (a full sentence fragment, "How your body manages energy") — this card is
+  // a compact icon-row summary next to a small "L3" badge, where the short form actually
+  // fits; LayersHubScreen's longer descriptive form doesn't apply to this layout.
   const dominantLayerDisplayName = dominantLayer
     ? (clinicalDepth ? dominantLayer.name : LAYER_PLAIN_SHORT[dominantLayerId - 1])
     : null;
 
+  // Streak — re-derived the same way HomeScreen's own Today's 1% card does (same
+  // computeStreak() function, same ms_action_done_dates AsyncStorage key), not a second
+  // streak concept. This screen has no other access to HomeScreen's local state.
   const [streak, setStreak] = useState(0);
   const [actionDoneDates, setActionDoneDates] = useState<string[]>([]);
   const [cravingDates, setCravingDates] = useState<string[]>([]);
@@ -3881,6 +3999,8 @@ function InsightsHubScreen({ onNavigate, hasScore, scoreResult }: { onNavigate: 
     AsyncStorage.getItem('ms_health_data').then(v => { if (v) { try { setHealthData(JSON.parse(v)); } catch {} } }).catch(() => {});
   }, []);
 
+  // Same shared computePointsAvailable() ResultsScreen/StreakCalendarScreen use — prefers
+  // the live in-session result (freshest), falls back to the persisted latest assessment.
   const totalScore = scoreResult?.totalScore ?? latestHistory?.total_score ?? 0;
   const answers = scoreResult?.history ?? latestHistory?.answers;
   const { avail: pointsAvailable, weeks: pointsWeeks } = computePointsAvailable(answers, totalScore);
@@ -4620,7 +4740,6 @@ function InsightsHubScreen({ onNavigate, hasScore, scoreResult }: { onNavigate: 
                   <Ionicons name="chevron-forward" size={16} color={colors.textTertiary} />
                 </TouchableOpacity>
               </View>
-
             </View>
           )}
         </ScrollView>
@@ -10273,6 +10392,13 @@ function AppNavigator() {
   // freshly logged-in account never inherits the previous account's quiz result.
   // Same identity signal (user?.id) that AppDataContext's own identity-change check is built from.
   useEffect(() => { setScoreResult(null); }, [user?.id]);
+  // Captured in handleScoreComplete, BEFORE saveScore() runs — saveScore optimistically
+  // prepends the just-completed test to scoreHistory synchronously, so by the time
+  // ResultsScreen mounts scoreHistory[0] is already the current test, not the previous one.
+  // Capturing here avoids depending on that timing at all. Reset alongside scoreResult on
+  // identity change for the same reason (never let a new account inherit a stale value).
+  const [previousTotalScore, setPreviousTotalScore] = useState<number | null>(null);
+  useEffect(() => { setPreviousTotalScore(null); }, [user?.id]);
   const [userData, setUserData] = useState<UserData>({ gender: 'Male', age: '26–35', conditions: [], sleepScore: 5, stressScore: 5, gutScore: 5 });
   const [selectedLayer, setSelectedLayer] = useState(1);
   const [selectedArticle, setSelectedArticle] = useState<Insight | null>(null);
@@ -10360,6 +10486,9 @@ function AppNavigator() {
   }, [user, loading]);
 
   const handleScoreComplete = (result: ScoreResult, data: UserData) => {
+    // Must read scoreHistory[0] here, before saveScore() below mutates it — see
+    // previousTotalScore's declaration above for why.
+    setPreviousTotalScore(scoreHistory[0]?.total_score ?? null);
     setScoreResult(result);
     setUserData(data);
     setLastQuizAnswers(result.history);
@@ -10393,7 +10522,7 @@ function AppNavigator() {
       // itself returns null for rows saved before the 2026-07-30 cascade_risk/dominant_layer
       // persistence fix, so pre-fix rows correctly still show nothing (HomeScreen) here.
       const effectiveScoreResult = scoreResult ?? (scoreHistory[0] ? reconstructScoreResultFromHistory(scoreHistory[0]) : null);
-      return effectiveScoreResult ? <ResultsScreen onNavigate={navigate} result={effectiveScoreResult as ScoreResult} userData={userData} autoExpandN3={autoExpandN3} onSelectLayer={(id) => setSelectedLayer(id)} /> : <HomeScreen onNavigate={navigate} hasScore={hasScore} />;
+      return effectiveScoreResult ? <ResultsScreen onNavigate={navigate} result={effectiveScoreResult as ScoreResult} userData={userData} autoExpandN3={autoExpandN3} onSelectLayer={(id) => setSelectedLayer(id)} previousTotalScore={scoreResult ? previousTotalScore : null} /> : <HomeScreen onNavigate={navigate} hasScore={hasScore} />;
     }
     case 'insights': return <InsightsHubScreen onNavigate={navigate} hasScore={hasScore || !!scoreResult} scoreResult={scoreResult} />;
     case 'layers': return <LayersHubScreen onNavigate={navigate} onSelectLayer={(id) => { setSelectedLayer(id); navigate('layer-detail'); }} hasScore={hasScore || !!scoreResult} scoreResult={scoreResult} />;
