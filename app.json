@@ -7,6 +7,7 @@
     "userInterfaceStyle": "dark",
     "scheme": "metabolicscore",
     "newArchEnabled": false,
+    "icon": "./src/assets/icon/appicon.png",
     "ios": {
       "supportsTablet": true,
       "bundleIdentifier": "com.amitbaruna.metabolicscore",
@@ -19,7 +20,6 @@
     },
     "plugins": [
       "expo-notifications",
-      "react-native-health",
       [
         "@sentry/react-native/expo",
         {

@@ -3976,6 +3976,7 @@ function InsightsHubScreen({ onNavigate, hasScore, scoreResult }: { onNavigate: 
   const [actionDoneDates, setActionDoneDates] = useState<string[]>([]);
   const [cravingDates, setCravingDates] = useState<string[]>([]);
   const [healthConnected, setHealthConnected] = useState(false);
+  const [showHealthComingSoon, setShowHealthComingSoon] = useState(false);
   const [showThenNow, setShowThenNow] = useState(false);
   const [healthData, setHealthData] = useState<Record<string, any> | null>(null);
 
@@ -3995,7 +3996,6 @@ function InsightsHubScreen({ onNavigate, hasScore, scoreResult }: { onNavigate: 
   }, []);
 
   useEffect(() => {
-    AsyncStorage.getItem('ms_health_sync_time').then(v => setHealthConnected(!!v)).catch(() => {});
     AsyncStorage.getItem('ms_health_data').then(v => { if (v) { try { setHealthData(JSON.parse(v)); } catch {} } }).catch(() => {});
   }, []);
 
@@ -4561,7 +4561,7 @@ function InsightsHubScreen({ onNavigate, hasScore, scoreResult }: { onNavigate: 
                   <Text style={{ fontSize: 11, color: colors.textTertiary, textAlign: 'center', marginTop: 12 }}>Tap for full health data, trends, and sleep analysis</Text>
                 </TouchableOpacity>
               ) : (
-                <TouchableOpacity activeOpacity={0.95} onPress={() => onNavigate('health-connect')} style={{ borderRadius: 20, padding: 20, backgroundColor: colors.card, borderWidth: 1, borderColor: colors.border, borderStyle: 'dashed' }}>
+                <TouchableOpacity activeOpacity={0.95} onPress={() => setShowHealthComingSoon(!showHealthComingSoon)} style={{ borderRadius: 20, padding: 20, backgroundColor: colors.card, borderWidth: 1, borderColor: colors.border, borderStyle: 'dashed' }}>
                   <View style={{ flexDirection: 'row', alignItems: 'center', gap: 12 }}>
                     <View style={{ width: 44, height: 44, borderRadius: 14, backgroundColor: `${colors.red}14`, alignItems: 'center', justifyContent: 'center' }}>
                       <Ionicons name="watch" size={22} color={colors.red} />
@@ -4570,8 +4570,13 @@ function InsightsHubScreen({ onNavigate, hasScore, scoreResult }: { onNavigate: 
                       <Text style={{ fontSize: 14, fontWeight: '700', color: colors.text }}>Connect Your Wearable</Text>
                       <Text style={{ fontSize: 12, color: colors.textSecondary, marginTop: 2, lineHeight: 17 }}>Sync HRV, sleep, and heart rate data for deeper metabolic insights.</Text>
                     </View>
-                    <Ionicons name="chevron-forward" size={18} color={colors.textTertiary} />
+                    <Ionicons name="chevron-forward" size={18} color={colors.textTertiary} style={{ transform: [{ rotate: showHealthComingSoon ? '90deg' : '0deg' }] }} />
                   </View>
+                  {showHealthComingSoon && (
+                    <View style={{ marginTop: 14, paddingTop: 14, borderTopWidth: 1, borderTopColor: colors.border }}>
+                      <Text style={{ fontSize: 12, color: colors.textSecondary, lineHeight: 17 }}>Apple Health sync is coming in a future update.</Text>
+                    </View>
+                  )}
                 </TouchableOpacity>
               )}
 
@@ -6345,6 +6350,7 @@ function ProfileScreen({ onNavigate, hasScore, scoreResult, onGoToCravings, onGo
   const [baselineWeight, setBaselineWeight] = useState(ctxBaseline.weight || '');
   // FIX 10: Help & Support expand
   const [showHelpSupport, setShowHelpSupport] = useState(false);
+  const [showHealthComingSoon, setShowHealthComingSoon] = useState(false);
   const [editConditions, setEditConditions] = useState(false);
   const [userConditions, setUserConditions] = useState<string[]>(ctxConditions.length > 0 ? ctxConditions : []);
 
@@ -6998,11 +7004,16 @@ function ProfileScreen({ onNavigate, hasScore, scoreResult, onGoToCravings, onGo
                 <Ionicons name="chevron-forward" size={16} color={colors.textSecondary} />
               </TouchableOpacity>
               <View style={{ height: 1, marginHorizontal: 16, backgroundColor: colors.border }} />
-              <TouchableOpacity onPress={() => onNavigate('health-connect')} style={{ flexDirection: 'row', alignItems: 'center', gap: 12, padding: 16 }}>
+              <TouchableOpacity onPress={() => setShowHealthComingSoon(!showHealthComingSoon)} style={{ flexDirection: 'row', alignItems: 'center', gap: 12, padding: 16 }}>
                 <View style={{ width: 36, height: 36, borderRadius: 8, backgroundColor: '#4DA8FF20', alignItems: 'center', justifyContent: 'center' }}><Ionicons name="heart-circle" size={16} color="#4DA8FF" /></View>
                 <View style={{ flex: 1 }}><Text style={{ fontSize: 14, fontWeight: '600', color: colors.text }}>Connect Health App</Text><Text style={{ fontSize: 12, color: colors.textSecondary, marginTop: 2 }}>Apple Health / Google Fit</Text></View>
-                <Ionicons name="chevron-forward" size={16} color={colors.textSecondary} />
+                <Ionicons name="chevron-forward" size={16} color={colors.textSecondary} style={{ transform: [{ rotate: showHealthComingSoon ? '90deg' : '0deg' }] }} />
               </TouchableOpacity>
+              {showHealthComingSoon && (
+                <View style={{ paddingHorizontal: 16, paddingBottom: 16, paddingTop: 4, backgroundColor: colors.cardAlt }}>
+                  <Text style={{ fontSize: 12, color: colors.textSecondary, lineHeight: 17 }}>Apple Health sync is coming in a future update.</Text>
+                </View>
+              )}
               <View style={{ height: 1, marginHorizontal: 16, backgroundColor: colors.border }} />
               <TouchableOpacity onPress={() => setShowHelpSupport(!showHelpSupport)} style={{ flexDirection: 'row', alignItems: 'center', gap: 12, padding: 16 }}>
                 <View style={{ width: 36, height: 36, borderRadius: 8, backgroundColor: '#4DA8FF20', alignItems: 'center', justifyContent: 'center' }}><Ionicons name="help-circle" size={16} color="#4DA8FF" /></View>
