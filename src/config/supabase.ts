@@ -480,11 +480,14 @@ export const habitCycles = {
 // 2026-08-07 (see the Worker's logRows.push) — older rows only have `metadata.title`, the
 // panel shows title-only for those rather than treating a missing body as an error.
 export const notificationLog = {
+  // dismissed_at is.null — a dismissed row simply stops coming back from the server at all
+  // (2026-08-13, replacing the old client-side dismissedNotifIds-only filter), which is what
+  // makes a swipe-dismiss durable across a cold start instead of resetting on every launch.
   async list(): Promise<any[]> {
     const token = await auth.getToken();
     const user = await auth.getSession();
     if (!user?.id) return [];
-    const rows = await sbFetch(`/rest/v1/notification_log?user_id=eq.${user.id}&select=id,type,sent_at,metadata&order=sent_at.desc&limit=50`, {}, token);
+    const rows = await sbFetch(`/rest/v1/notification_log?user_id=eq.${user.id}&dismissed_at=is.null&select=id,type,sent_at,metadata&order=sent_at.desc&limit=50`, {}, token);
     if (!Array.isArray(rows)) {
       console.warn('[notificationLog.list] unexpected response:', rows);
       return [];
@@ -492,21 +495,33 @@ export const notificationLog = {
     return rows;
   },
   // Bell icon badge — last 7 days only, not all-time (an all-time count would only ever
-  // grow and stop meaning anything). Returns full rows (not just a count) so the badge can
-  // be computed client-side after subtracting whatever's currently in HomeScreen's shared
-  // dismissedNotifIds set — corrected 2026-08-07: the badge is meant to match what the
-  // panel would actually show if opened right now, not a raw count independent of dismiss.
+  // grow and stop meaning anything). dismissed_at is.null keeps this in sync with list()
+  // server-side now, rather than relying on the client subtracting dismissedNotifIds itself.
   async listLast7Days(): Promise<{ id: string }[]> {
     const token = await auth.getToken();
     const user = await auth.getSession();
     if (!user?.id) return [];
     const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
-    const rows = await sbFetch(`/rest/v1/notification_log?user_id=eq.${user.id}&sent_at=gte.${sevenDaysAgo}&select=id`, {}, token);
+    const rows = await sbFetch(`/rest/v1/notification_log?user_id=eq.${user.id}&dismissed_at=is.null&sent_at=gte.${sevenDaysAgo}&select=id`, {}, token);
     if (!Array.isArray(rows)) {
       console.warn('[notificationLog.listLast7Days] unexpected response:', rows);
       return [];
     }
     return rows;
+  },
+  // PATCH scoped by both id AND user_id — RLS (auth.uid() = user_id) already enforces this
+  // server-side, but the extra filter is defense-in-depth (same discipline as cravings.delete
+  // above) and means a zero-row response is unambiguous: either the id doesn't exist or it
+  // isn't this user's row, either way nothing was dismissed. Callers check the row count
+  // before treating this as success, same as every other write in this file.
+  async dismiss(id: string) {
+    const token = await auth.getToken();
+    const user = await auth.getSession();
+    if (!user?.id) return null;
+    return await sbFetch(`/rest/v1/notification_log?id=eq.${id}&user_id=eq.${user.id}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ dismissed_at: new Date().toISOString() }),
+    }, token);
   },
 };
 
@@ -650,8 +665,13 @@ export const account = {
     // everything else is gone. Uses id, not user_id, per app_profiles' own schema.
     await del('profile', `/rest/v1/app_profiles?id=eq.${user.id}`);
     // Local device data — symptoms/goals/baseline live in app_profiles.symptoms JSON (just
-    // deleted above), but streak history and cached profile are device-local, clear those too.
-    await AsyncStorage.multiRemove(['ms_action_done_dates', 'ms_action_done_today', 'ms_profile', 'ms_domino_ever_shown', 'ms_domino_last_date', 'ms_domino_last_idx']).catch(() => {});
+    // deleted above), but cached profile data is device-local, clear that too. The old
+    // ms_action_done_dates/ms_action_done_today streak keys are gone from this list as of
+    // the 2026-08-13 streak consolidation — nothing writes them anymore (checkinDates now
+    // lives in AppDataContext, sourced from app_checkins, cleared per-user on identity
+    // change the same way the rest of that context's state is), so removing them here would
+    // be a no-op against keys that no longer exist.
+    await AsyncStorage.multiRemove(['ms_profile', 'ms_domino_ever_shown', 'ms_domino_last_date', 'ms_domino_last_idx']).catch(() => {});
     await auth.signOut();
     return { ok: errors.length === 0, errors };
   },

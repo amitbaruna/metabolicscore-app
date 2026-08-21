@@ -114,7 +114,7 @@ async function registerForPushNotificationsAsync(userId: string): Promise<'grant
 
 // Infrastructure
 import { AuthProvider, useAuth } from './src/context/AuthContext';
-import { AppDataProvider, useAppData, type ScoreHistoryEntry } from './src/context/AppDataContext';
+import { AppDataProvider, useAppData, type ScoreHistoryEntry, logScoreTrace, DEBUG_SCORE_TRACE_KEY } from './src/context/AppDataContext';
 import { THEMES, type Theme, type ThemeColors } from './src/config/theme';
 
 // Data
@@ -296,7 +296,7 @@ type ScreenId =
   | 'article-reader' | 'about' | 'specialisation'
   | 'symptom-tracker'
   | 'profile' | 'customize' | 'booking' | 'report' | 'health-connect' | 'score-history'
-  | 'streak-calendar' | 'insights';
+  | 'streak-calendar' | 'insights' | 'debug-score-trace';
 
 type UserData = {
   gender: string;
@@ -345,15 +345,21 @@ function useTheme() { return useContext(ThemeContext); }
 type ClinicalDepthCtx = { clinicalDepth: boolean; toggleClinicalDepth: () => void };
 const ClinicalDepthContext = createContext<ClinicalDepthCtx>({} as ClinicalDepthCtx);
 function ClinicalDepthProvider({ children }: { children: ReactNode }) {
-  const { user } = useAuth();
+  const { user, loading: authLoading } = useAuth();
   const userId = user?.id || 'anonymous';
   const [clinicalDepth, setClinicalDepth] = useState(false);
 
   useEffect(() => {
+    // Same authLoading gate as AppDataContext's identity-check effect (2026-08-13) — user is
+    // null until AuthContext's own async session restore resolves, so without this guard this
+    // effect read ms_clinical_depth_anonymous first on every cold start, then corrected itself
+    // a moment later once the real id resolved. Never destructive (read-only, unlike the
+    // AppDataContext case), but a needless flicker toward Simple mode this closes too.
+    if (authLoading) return;
     AsyncStorage.getItem(`ms_clinical_depth_${userId}`).then(saved => {
       setClinicalDepth(saved === 'true');
     }).catch(() => {});
-  }, [userId]);
+  }, [userId, authLoading]);
 
   const toggleClinicalDepth = () => {
     const next = !clinicalDepth;
@@ -384,22 +390,9 @@ function getEngagementGrade(seconds: number): 'A' | 'B' | 'C' | 'D' {
   return 'A';
 }
 
-// Consecutive daily-action completions ending at today (or yesterday, if today's not done yet —
-// the streak stays "alive" for one day before resetting, standard habit-tracker behavior).
-function computeStreak(doneDates: string[]): number {
-  if (doneDates.length === 0) return 0;
-  const doneSet = new Set(doneDates);
-  const todayStr = new Date().toISOString().slice(0, 10);
-  const yesterdayStr = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
-  let cursor: Date | null = doneSet.has(todayStr) ? new Date() : doneSet.has(yesterdayStr) ? new Date(Date.now() - 86400000) : null;
-  if (!cursor) return 0;
-  let count = 0;
-  while (doneSet.has(cursor.toISOString().slice(0, 10))) {
-    count++;
-    cursor = new Date(cursor.getTime() - 86400000);
-  }
-  return count;
-}
+// computeStreak() moved to src/context/AppDataContext.tsx (2026-08-13 streak
+// consolidation) — now a memoized value on AppDataContext (`streak`), derived from the
+// shared, server-backed checkinDates map instead of three independent AsyncStorage reads.
 
 // Calendar-date-only day difference — deliberately mirrors metabolic-notification-worker.js's
 // toDateOnly/daysBetween exactly (UTC calendar date, not a raw Date.now() - created_at
@@ -542,8 +535,9 @@ function SplashScreen() {
         </Animated.View>
       </View>
       <View style={{ position: 'absolute', bottom: 48, left: 0, right: 0, alignItems: 'center' }}>
-        <Text style={{ fontSize: 14, fontWeight: '700', color: '#FFFFFF' }}>{BRAND.fullName}</Text>
-        <Text style={{ fontSize: 12, color: colors.textSecondary, marginTop: 2 }}>{BRAND.title}</Text>
+        <Text style={{ fontSize: 10, fontWeight: '700', color: colors.red, letterSpacing: 1.5, textTransform: 'uppercase' }}>Powered by</Text>
+        <Text style={{ fontSize: 14, fontWeight: '700', color: '#FFFFFF', marginTop: 4 }}>{BRAND.fullName}</Text>
+        <View style={{ width: 28, height: 2, borderRadius: 1, backgroundColor: colors.red, marginTop: 6 }} />
       </View>
     </ScreenShell>
   );
@@ -2024,8 +2018,11 @@ function HomeScreen({ onNavigate, hasScore, scoreResult, onSelectLayer, onNaviga
   const { colors, theme, toggleTheme } = useTheme();
   const { user } = useAuth();
   const { clinicalDepth, toggleClinicalDepth } = useClinicalDepth();
-  const { fullName, cravings: loggedCravings, deleteCraving, symptoms: ctxSymptoms, scoreHistory, refreshCravings, conditions: ctxConditions, logCheckin, dismissedNotifIds, markNotifDismissed } = useAppData();
+  const { fullName, cravings: loggedCravings, deleteCraving, symptoms: ctxSymptoms, scoreHistory, refreshCravings, conditions: ctxConditions, logCheckin, checkinDates, streak, dismissedNotifIds, markNotifDismissed } = useAppData();
   useEffect(() => { refreshCravings(); }, [refreshCravings]);
+  // TEMPORARY diagnostic (2026-08-19, see AppDataContext.tsx's logScoreTrace) — tracing the
+  // offline cold-restart score-history bug. Logs whenever this screen sees scoreHistory change.
+  useEffect(() => { logScoreTrace('HomeScreen:render', { length: scoreHistory.length, ids: scoreHistory.map(s => s.id) }); }, [scoreHistory]);
   // Derived fresh every render from real data (hasScore/scoreResult come from AppDataContext,
   // scoreHistory is the live Supabase-backed list) — not captured once at mount, so it stays
   // correct even when this data finishes loading after HomeScreen has already mounted.
@@ -2046,7 +2043,6 @@ function HomeScreen({ onNavigate, hasScore, scoreResult, onSelectLayer, onNaviga
   const [notif7dRows, setNotif7dRows] = useState<{ id: string }[]>([]);
   useEffect(() => { notificationLog.listLast7Days().then(setNotif7dRows).catch(() => {}); }, []);
   const notifCount7d = notif7dRows.filter(r => !dismissedNotifIds.has(r.id)).length;
-  const [streak, setStreak] = useState(0);
   const [myBooking, setMyBooking] = useState<any>(null);
   useEffect(() => { booking.getMyBooking().then(setMyBooking).catch(() => {}); }, []);
   const [actionDone, setActionDone] = useState(false);
@@ -2160,24 +2156,7 @@ function HomeScreen({ onNavigate, hasScore, scoreResult, onSelectLayer, onNaviga
     return defaults;
   });
 
-  // FIX 3: Restore persistence for daily action — check AsyncStorage on mount
   useEffect(() => {
-    const today = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
-    AsyncStorage.getItem('ms_action_done_dates').then(async saved => {
-      let dates: string[] = [];
-      if (saved) {
-        try { dates = JSON.parse(saved); } catch { dates = []; }
-      } else {
-        // Migrate the old single-date key, if it exists, so an in-progress streak isn't lost
-        const legacy = await AsyncStorage.getItem('ms_action_done_today').catch(() => null);
-        if (legacy) {
-          dates = [legacy];
-          AsyncStorage.setItem('ms_action_done_dates', JSON.stringify(dates)).catch(() => {});
-        }
-      }
-      setStreak(computeStreak(dates));
-      if (dates.includes(today)) setActionDone(true);
-    }).catch(() => { /* ignore */ });
     // PIPELINE 1: Load home section visibility from AsyncStorage
     AsyncStorage.getItem('ms_home_sections').then(saved => {
       if (saved) {
@@ -2189,6 +2168,17 @@ function HomeScreen({ onNavigate, hasScore, scoreResult, onSelectLayer, onNaviga
     }).catch(() => { /* ignore */ });
   }, []);
 
+  // actionDone now tracks the shared, server-backed checkinDates from AppDataContext
+  // (2026-08-13 streak consolidation) instead of a local AsyncStorage read — same source
+  // StreakCalendarScreen and the Insights Hub habit card now read too, so all three agree
+  // without needing a remount to pick up a change made on another screen. Only ever sets
+  // true here — markActionDone's own setTimeout still owns the false→true flash sequence
+  // for a fresh tap this session, unaffected by this sync.
+  useEffect(() => {
+    const today = new Date().toISOString().slice(0, 10);
+    if (checkinDates[today]) setActionDone(true);
+  }, [checkinDates]);
+
   // Waits for logCheckin's real result before touching AsyncStorage/actionDone — previously
   // this wrote local state unconditionally and fired the "done" UI on a timer regardless of
   // whether the server write actually succeeded (confirmed 2026-08-07, found via the
@@ -2198,23 +2188,15 @@ function HomeScreen({ onNavigate, hasScore, scoreResult, onSelectLayer, onNaviga
   const markActionDone = async () => {
     console.log('[DEBUG checkin] markActionDone fired — actionRow:', actionRow, 'dominantLayerId:', dominantLayerId);
     setActionDoneFlash(true);
-    const today = new Date().toISOString().slice(0, 10);
     const ok = await logCheckin(actionRow?.id ?? null);
     if (!ok) {
       setActionDoneFlash(false);
       Alert.alert('Could not save', 'Your check-in couldn\'t be saved — please check your connection and try again.');
       return;
     }
-    AsyncStorage.getItem('ms_action_done_dates').then(saved => {
-      let dates: string[] = [];
-      if (saved) {
-        try { dates = JSON.parse(saved); } catch { dates = []; }
-      }
-      if (!dates.includes(today)) dates.push(today);
-      AsyncStorage.setItem('ms_action_done_dates', JSON.stringify(dates)).catch(() => {});
-      AsyncStorage.setItem('ms_action_done_today', today).catch(() => {}); // kept for backward compat
-      setStreak(computeStreak(dates));
-    }).catch(() => { /* ignore */ });
+    // logCheckin already updated the shared checkinDates (and streak, derived from it) in
+    // AppDataContext on this confirmed server write — no local AsyncStorage bookkeeping
+    // needed here anymore (2026-08-13 streak consolidation).
     setTimeout(() => { setActionDoneFlash(false); setActionDone(true); }, 3000);
   };
 
@@ -3408,6 +3390,26 @@ function weekdayMondayFirst(dateStr: string): number {
   return (new Date(dateStr).getUTCDay() + 6) % 7;
 }
 
+// Branded score-share card content — the exact visual captured by ViewShot and sent via
+// Sharing.shareAsync from both ResultsScreen and ReportScreen's WhatsApp buttons (2026-08-19,
+// unifying the two: Results already used this image via the OS share sheet; Report used to
+// send a text-only wa.me deep link instead, since wa.me can't carry an attachment). Extracted
+// so both screens share one definition instead of two copies that could drift.
+function ScoreShareCardContent({ score, band, pattern }: { score: number; band: { color: string; status: string }; pattern: string }) {
+  return (
+    <View style={{ padding: 20, alignItems: 'center' }}>
+      <Text style={{ fontSize: 9, letterSpacing: 2, color: 'rgba(255,255,255,0.3)', textTransform: 'uppercase', marginBottom: 8 }}>Metabolic Score™</Text>
+      <Text style={{ fontSize: 48, fontWeight: '900', color: band.color, marginBottom: 4 }}>{score}</Text>
+      <Text style={{ fontSize: 12, color: 'rgba(255,255,255,0.4)', marginBottom: 12 }}>/100</Text>
+      <View style={{ paddingHorizontal: 12, paddingVertical: 4, borderRadius: 6, backgroundColor: band.color, marginBottom: 12 }}>
+        <Text style={{ fontSize: 10, fontWeight: '700', letterSpacing: 1, color: '#fff', textTransform: 'uppercase' }}>{band.status}</Text>
+      </View>
+      <Text style={{ fontSize: 12, color: 'rgba(255,255,255,0.6)', marginBottom: 4 }}>Pattern: {pattern}</Text>
+      <Text style={{ fontSize: 10, color: 'rgba(255,255,255,0.3)' }}>amitbaruna.com/metabolic-score</Text>
+    </View>
+  );
+}
+
 function ResultsScreen({ onNavigate, result, userData, autoExpandN3, onSelectLayer, previousTotalScore }: { onNavigate: (s: ScreenId) => void; result: ScoreResult; userData: UserData; autoExpandN3?: boolean; onSelectLayer?: (id: number) => void; previousTotalScore?: number | null }) {
   const [rating, setRating] = useState(0);
   const [ratingDone, setRatingDone] = useState(false);
@@ -3876,16 +3878,7 @@ function ResultsScreen({ onNavigate, result, userData, autoExpandN3, onSelectLay
       {/* Share Card */}
       <View style={{ paddingHorizontal: 24, marginTop: 16 }}>
         <ViewShot ref={shareCardRef} options={{ format: 'png', quality: 1 }} style={{ borderRadius: 20, overflow: 'hidden', backgroundColor: '#0D1B2A' }}>
-          <View style={{ padding: 20, alignItems: 'center' }}>
-            <Text style={{ fontSize: 9, letterSpacing: 2, color: 'rgba(255,255,255,0.3)', textTransform: 'uppercase', marginBottom: 8 }}>Metabolic Score™</Text>
-            <Text style={{ fontSize: 48, fontWeight: '900', color: band.color, marginBottom: 4 }}>{animatedScore}</Text>
-            <Text style={{ fontSize: 12, color: 'rgba(255,255,255,0.4)', marginBottom: 12 }}>/100</Text>
-            <View style={{ paddingHorizontal: 12, paddingVertical: 4, borderRadius: 6, backgroundColor: band.color, marginBottom: 12 }}>
-              <Text style={{ fontSize: 10, fontWeight: '700', letterSpacing: 1, color: '#fff', textTransform: 'uppercase' }}>{band.status}</Text>
-            </View>
-            <Text style={{ fontSize: 12, color: 'rgba(255,255,255,0.6)', marginBottom: 4 }}>Pattern: {result.patternEngine.dominant_pattern}</Text>
-            <Text style={{ fontSize: 10, color: 'rgba(255,255,255,0.3)' }}>amitbaruna.com/metabolic-score</Text>
-          </View>
+          <ScoreShareCardContent score={animatedScore} band={band} pattern={result.patternEngine.dominant_pattern} />
         </ViewShot>
         <View style={{ flexDirection: 'row', gap: 8, marginTop: 8 }}>
           <TouchableOpacity onPress={shareScoreImage} style={{ flex: 1, backgroundColor: '#25D366', paddingVertical: 12, borderRadius: 12, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8 }}>
@@ -3953,7 +3946,10 @@ function ResultsScreen({ onNavigate, result, userData, autoExpandN3, onSelectLay
 function InsightsHubScreen({ onNavigate, hasScore, scoreResult }: { onNavigate: (s: ScreenId) => void; hasScore?: boolean; scoreResult?: any }) {
   const { colors } = useTheme();
   const { clinicalDepth } = useClinicalDepth();
-  const { scoreHistory } = useAppData();
+  const { scoreHistory, checkinDates, streak } = useAppData();
+  // TEMPORARY diagnostic (2026-08-19, see AppDataContext.tsx's logScoreTrace) — tracing the
+  // offline cold-restart score-history bug. Logs whenever this screen sees scoreHistory change.
+  useEffect(() => { logScoreTrace('InsightsHubScreen:render', { length: scoreHistory.length, ids: scoreHistory.map(s => s.id) }); }, [scoreHistory]);
   const latestHistory = scoreHistory[0];
   const prevHistory = scoreHistory[1];
 
@@ -3969,25 +3965,14 @@ function InsightsHubScreen({ onNavigate, hasScore, scoreResult }: { onNavigate: 
     ? (clinicalDepth ? dominantLayer.name : LAYER_PLAIN_SHORT[dominantLayerId - 1])
     : null;
 
-  // Streak — re-derived the same way HomeScreen's own Today's 1% card does (same
-  // computeStreak() function, same ms_action_done_dates AsyncStorage key), not a second
-  // streak concept. This screen has no other access to HomeScreen's local state.
-  const [streak, setStreak] = useState(0);
-  const [actionDoneDates, setActionDoneDates] = useState<string[]>([]);
+  // Streak/checkinDates now both come straight from AppDataContext (2026-08-13 streak
+  // consolidation) — same shared source Home and StreakCalendarScreen read, so this card
+  // no longer needs its own AsyncStorage read/derivation to agree with them.
   const [cravingDates, setCravingDates] = useState<string[]>([]);
   const [healthConnected, setHealthConnected] = useState(false);
   const [showHealthComingSoon, setShowHealthComingSoon] = useState(false);
   const [showThenNow, setShowThenNow] = useState(false);
   const [healthData, setHealthData] = useState<Record<string, any> | null>(null);
-
-  useEffect(() => {
-    AsyncStorage.getItem('ms_action_done_dates').then(saved => {
-      let dates: string[] = [];
-      if (saved) { try { dates = JSON.parse(saved); } catch { dates = []; } }
-      setActionDoneDates(dates);
-      setStreak(computeStreak(dates));
-    }).catch(() => {});
-  }, []);
 
   useEffect(() => {
     AsyncStorage.getItem('ms_cravings').then(saved => {
@@ -4037,13 +4022,18 @@ function InsightsHubScreen({ onNavigate, hasScore, scoreResult }: { onNavigate: 
     return best.delta !== 0 ? best : null;
   }, [layerDeltas]);
 
-  // Layer trend data for chart (requires >= 3 assessments)
+  // Layer trend data for the (currently unused) SVG chart below — requires >= 3 assessments.
+  // 2026-08-14: fixed a slice-order bug — scoreHistory is newest-first, so
+  // [...scoreHistory].reverse().slice(0, 10) took the OLDEST 10 tests ever taken once a user
+  // passed 10 total, not the most recent 10 (reverse-then-slice(0,N) grabs from the start of
+  // the now-oldest-first array). slice(0, 10) first (newest 10, still newest-first), then
+  // reverse for chronological chart order, is correct regardless of total history length.
   const layerTrendData = useMemo(() => {
     if (scoreHistory.length < 3) return null;
-    const reversed = [...scoreHistory].reverse().slice(0, 10); // oldest first, max 10
+    const recent10 = scoreHistory.slice(0, 10).reverse(); // most recent 10, oldest-first order
     return layerKeys.map(({ key, layer }) => ({
       layer,
-      points: reversed.map(s => s[key] ?? 0),
+      points: recent10.map(s => s[key] ?? 0),
     }));
   }, [scoreHistory]);
 
@@ -4059,14 +4049,14 @@ function InsightsHubScreen({ onNavigate, hasScore, scoreResult }: { onNavigate: 
         dateStr,
         label: d.toLocaleDateString('en-US', { weekday: 'short' }),
         short: d.getDate().toString(),
-        hasAction: actionDoneDates.includes(dateStr),
+        hasAction: !!checkinDates[dateStr],
         hasCraving: cravingDates.some(cd => cd.startsWith(dateStr)),
         hasAssessment: scoreHistory.some(s => { try { return new Date(s.date).toISOString().slice(0, 10) === dateStr; } catch { return false; } }),
         assessmentScore: scoreHistory.find(s => { try { return new Date(s.date).toISOString().slice(0, 10) === dateStr; } catch { return false; } })?.total_score,
       });
     }
     return days;
-  }, [actionDoneDates, cravingDates, scoreHistory]);
+  }, [checkinDates, cravingDates, scoreHistory]);
 
   // Keep / Watch insights
   const keepWatch = useMemo(() => {
@@ -4412,23 +4402,25 @@ function InsightsHubScreen({ onNavigate, hasScore, scoreResult }: { onNavigate: 
               {/* ═══════════════════════════════════════════════════════════
                   4. LAYER TRENDS — COMPACT INSIGHTS
                  ═══════════════════════════════════════════════════════════ */}
-              {layerTrendData ? (
+              {layerDeltas ? (
                 <View style={{ borderRadius: 20, padding: 16, backgroundColor: colors.card }}>
                   <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8, marginBottom: 12 }}>
                     <Ionicons name="trending-up" size={14} color={colors.textSecondary} />
                     <Text style={{ fontSize: 11, fontWeight: '700', letterSpacing: 1, color: colors.textSecondary, textTransform: 'uppercase' }}>Layer Trends</Text>
                   </View>
                   {(() => {
-                    const summaries = layerTrendData.map(({ layer, points }) => {
-                      if (points.length < 2) return null;
-                      const recent = points[points.length - 1];
-                      const earlier = points[0];
-                      const trend = recent - earlier;
-                      return { layer, trend, recent, earlier };
-                    }).filter(Boolean).sort((a: any, b: any) => (b as any).trend - (a as any).trend);
-                    const mostImproved = summaries.find((s: any) => s.trend > 0);
-                    const mostDeclined = [...summaries].reverse().find((s: any) => (s as any).trend < 0);
-                    const mostConsistent = [...summaries].sort((a: any, b: any) => Math.abs((b as any).recent - (b as any).earlier) - Math.abs((a as any).recent - (a as any).earlier)).find((s: any) => Math.abs((s as any).recent - (s as any).earlier) <= 1);
+                    // 2026-08-14: was computed from layerTrendData (latest vs. the oldest test in
+                    // up to a 10-test window) — a genuinely different metric than the Signals pad
+                    // below (latest vs. immediately-previous test), so the two could show
+                    // conflicting numbers for the same layer after a retest, and the window's
+                    // slice-order bug (fixed above) could freeze this pad on a stale value
+                    // entirely once a user passed 10 total tests. Now built from layerDeltas — the
+                    // same source Signals already uses — so both pads always agree.
+                    const summaries = layerDeltas.map(({ layer, cur, delta }) => ({ layer, trend: delta, recent: cur }))
+                      .sort((a, b) => b.trend - a.trend);
+                    const mostImproved = summaries.find((s) => s.trend > 0);
+                    const mostDeclined = [...summaries].reverse().find((s) => s.trend < 0);
+                    const mostConsistent = [...summaries].sort((a, b) => Math.abs(a.trend) - Math.abs(b.trend)).find((s) => Math.abs(s.trend) <= 1);
                     // Build contextual meaning per layer
                     const contextFor = (layerId: number, trend: number) => {
                       if (layerId === 1) { // Circadian
@@ -4474,7 +4466,10 @@ function InsightsHubScreen({ onNavigate, hasScore, scoreResult }: { onNavigate: 
                     );
                   })()}
                 </View>
-              ) : scoreHistory.length >= 2 ? (
+              ) : scoreHistory.length >= 1 ? (
+                // layerDeltas needs 2 tests (latestHistory + prevHistory); with exactly 1, one
+                // more unlocks it — was previously gated at >= 2 back when this pad needed a
+                // 3-test window via layerTrendData.
                 <TouchableOpacity activeOpacity={0.95} onPress={() => onNavigate('score-history')} style={{ borderRadius: 20, padding: 20, backgroundColor: colors.card, borderWidth: 1, borderColor: colors.border, borderStyle: 'dashed' }}>
                   <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
                     <Ionicons name="trending-up" size={14} color={colors.textTertiary} />
@@ -6226,6 +6221,12 @@ function SpecialisationScreen({ onNavigate }: { onNavigate: (s: ScreenId) => voi
           <Ionicons name="download-outline" size={18} color={colors.textTertiary} />
         </TouchableOpacity>
       </View>
+
+      {/* TEMPORARY diagnostic entry point (2026-08-19) — see DebugScoreTraceScreen. Remove
+          alongside it once the offline cold-restart score-history bug is confirmed/fixed. */}
+      <TouchableOpacity onPress={() => onNavigate('debug-score-trace')} style={{ marginTop: 14, alignItems: 'center' }}>
+        <Text style={{ fontSize: 11, color: colors.textTertiary, textDecorationLine: 'underline' }}>View score trace log (debug)</Text>
+      </TouchableOpacity>
     </ScrollScreen>
   );
 }
@@ -6243,8 +6244,23 @@ function ProfileScreen({ onNavigate, hasScore, scoreResult, onGoToCravings, onGo
   useEffect(() => { refreshScoreHistory(); }, [refreshScoreHistory]);
   const [myMembership, setMyMembership] = useState<any>({ status: 'trial' });
   const [myBooking, setMyBooking] = useState<any>(null);
+  // Per-user cache, same convention as ClinicalDepthProvider's ms_clinical_depth_${uid} key —
+  // membership.get() was previously live-fetch-or-placeholder with no offline fallback, so a
+  // paid member offline (or right after reconnect, before the fetch resolves) saw "Trial"
+  // instead of their real status (2026-08-14). Cache is read first so a returning user's real
+  // status shows immediately; 'trial' only remains the shown value when nothing was ever cached.
   useEffect(() => {
-    membership.get().then(setMyMembership).catch(() => {});
+    const membershipCacheKey = `ms_membership_status_${user?.id || 'anonymous'}`;
+    (async () => {
+      try {
+        const cached = await AsyncStorage.getItem(membershipCacheKey);
+        if (cached) setMyMembership(JSON.parse(cached));
+      } catch { /* ignore, fall through to live fetch */ }
+    })();
+    membership.get().then(m => {
+      setMyMembership(m);
+      AsyncStorage.setItem(membershipCacheKey, JSON.stringify(m)).catch(() => {});
+    }).catch(() => {});
     booking.getMyBooking().then(setMyBooking).catch(() => {});
   }, []);
   const latestHistory = scoreHistory[0];
@@ -7262,6 +7278,9 @@ function ScoreHistoryScreen({ onNavigate }: { onNavigate: (s: ScreenId) => void 
   const [expandedId, setExpandedId] = useState<string | null>(null);
 
   useEffect(() => { refreshScoreHistory(); }, [refreshScoreHistory]);
+  // TEMPORARY diagnostic (2026-08-19, see AppDataContext.tsx's logScoreTrace) — tracing the
+  // offline cold-restart score-history bug. Logs whenever this screen sees scoreHistory change.
+  useEffect(() => { logScoreTrace('ScoreHistoryScreen:render', { length: scoreHistory.length, ids: scoreHistory.map(s => s.id) }); }, [scoreHistory]);
 
   const toggleExpand = (id: string) => setExpandedId(expandedId === id ? null : id);
 
@@ -7370,15 +7389,88 @@ function ScoreHistoryScreen({ onNavigate }: { onNavigate: (s: ScreenId) => void 
 }
 
 // ============================================================
+// DEBUG SCORE TRACE SCREEN — TEMPORARY (2026-08-19)
+// ============================================================
+// On-screen viewer for logScoreTrace's AsyncStorage-backed log (AppDataContext.tsx),
+// tracing the offline cold-restart "prior score history vanishes, new offline entry
+// survives" bug. Reads straight off the device — deliberately not dependent on a live
+// Metro/terminal connection, since the whole point is to capture a sequence that spans an
+// app close/reopen while offline, exactly when a live connection isn't available. Remove
+// this screen (and its ProfileScreen entry point, and every logScoreTrace call site) once
+// the mechanism is confirmed and fixed.
+function DebugScoreTraceScreen({ onNavigate }: { onNavigate: (s: ScreenId) => void }) {
+  const { colors } = useTheme();
+  const [entries, setEntries] = useState<any[]>([]);
+  const [loadedAt, setLoadedAt] = useState<string>('');
+
+  const load = () => {
+    AsyncStorage.getItem(DEBUG_SCORE_TRACE_KEY).then(raw => {
+      try { setEntries(raw ? JSON.parse(raw) : []); } catch { setEntries([]); }
+      setLoadedAt(new Date().toLocaleTimeString());
+    }).catch(() => { setEntries([]); setLoadedAt(new Date().toLocaleTimeString()); });
+  };
+  useEffect(() => { load(); }, []);
+
+  const clearLog = () => {
+    AsyncStorage.removeItem(DEBUG_SCORE_TRACE_KEY).then(load).catch(() => {});
+  };
+
+  // Newest-first — the most relevant entries (right after a reopen) are what you want on
+  // screen without scrolling.
+  const ordered = [...entries].reverse();
+
+  return (
+    <ScrollScreen bg={colors.bg} bottomPad={40}>
+      <View style={{ paddingHorizontal: 24, paddingTop: 12, flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}>
+        <TouchableOpacity onPress={() => onNavigate('profile')} style={{ width: 40, height: 40, borderRadius: 20, backgroundColor: colors.card, alignItems: 'center', justifyContent: 'center' }}>
+          <Ionicons name="arrow-back" size={20} color={colors.textSecondary} />
+        </TouchableOpacity>
+        <Text style={{ fontSize: 16, fontWeight: '700', color: colors.text, textTransform: 'uppercase' }}>Score Trace Log</Text>
+        <View style={{ width: 40 }} />
+      </View>
+
+      <View style={{ paddingHorizontal: 24, marginTop: 16, flexDirection: 'row', gap: 10 }}>
+        <TouchableOpacity onPress={load} style={{ flex: 1, backgroundColor: colors.card, paddingVertical: 12, borderRadius: 12, alignItems: 'center', borderWidth: 1, borderColor: colors.border }}>
+          <Text style={{ color: colors.text, fontSize: 13, fontWeight: '700' }}>Refresh</Text>
+        </TouchableOpacity>
+        <TouchableOpacity onPress={clearLog} style={{ flex: 1, backgroundColor: colors.card, paddingVertical: 12, borderRadius: 12, alignItems: 'center', borderWidth: 1, borderColor: colors.border }}>
+          <Text style={{ color: colors.red, fontSize: 13, fontWeight: '700' }}>Clear Log</Text>
+        </TouchableOpacity>
+      </View>
+
+      <Text style={{ paddingHorizontal: 24, marginTop: 10, fontSize: 11, color: colors.textTertiary }}>
+        {entries.length} entries (newest first) · loaded {loadedAt}
+      </Text>
+
+      <View style={{ paddingHorizontal: 16, marginTop: 12, gap: 8 }}>
+        {ordered.length === 0 ? (
+          <Text style={{ fontSize: 13, color: colors.textSecondary, paddingHorizontal: 8 }}>No trace entries yet.</Text>
+        ) : ordered.map((e, i) => (
+          <View key={i} style={{ borderRadius: 10, padding: 10, backgroundColor: colors.card, borderWidth: 1, borderColor: colors.border }}>
+            <Text selectable style={{ fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace', fontSize: 10, color: colors.text, lineHeight: 15 }}>
+              {JSON.stringify(e, null, 2)}
+            </Text>
+          </View>
+        ))}
+      </View>
+    </ScrollScreen>
+  );
+}
+
+// ============================================================
 // STREAK CALENDAR SCREEN (Habit_Cycle_Engine_SPEC.md §7)
 // ============================================================
 
 function StreakCalendarScreen({ onNavigate }: { onNavigate: (s: ScreenId) => void }) {
   const { colors } = useTheme();
   const { user } = useAuth();
-  const { scoreHistory, logCheckin, logCheckinUndo } = useAppData();
+  // checkinDates now comes straight from AppDataContext (2026-08-13 streak consolidation)
+  // — same shared, server-backed source Home and the Insights Hub habit card read, instead
+  // of this screen's own cycle-scoped fetch/cache. It's a 60-day rolling lookback rather
+  // than cycle-start-scoped, which comfortably covers the ≤21-day cycle window this screen
+  // filters it down to below (adherence/gridDays).
+  const { scoreHistory, logCheckin, logCheckinUndo, checkinDates } = useAppData();
   const [cycles, setCycles] = useState<any[] | null>(null);
-  const [checkinDates, setCheckinDates] = useState<Record<string, boolean>>({});
   const [expandedCycleId, setExpandedCycleId] = useState<string | null>(null);
 
   // Falls back to the last-cached result on a failed fetch (e.g. offline) instead of
@@ -7402,26 +7494,6 @@ function StreakCalendarScreen({ onNavigate }: { onNavigate: (s: ScreenId) => voi
 
   const currentCycle = cycles?.find(c => c.status === 'active' || c.status === 'extended') ?? null;
   const pastCycles = (cycles ?? []).filter(c => c.status === 'closed_retest' || c.status === 'closed_reset');
-
-  // Same cache-fallback pattern as cycles above. Scoped by cycle start_date too (not just
-  // user) so a stale cached check-in map from an older, already-closed cycle can never be
-  // shown under a newly-started one.
-  useEffect(() => {
-    if (!currentCycle?.start_date) { setCheckinDates({}); return; }
-    const cacheKey = `ms_streak_checkins_cache_${user?.id || 'anonymous'}_${currentCycle.start_date}`;
-    checkins.listSince(currentCycle.start_date).then(rows => {
-      const map: Record<string, boolean> = {};
-      rows.forEach(r => { if (r.completed) map[r.date] = true; });
-      setCheckinDates(map);
-      AsyncStorage.setItem(cacheKey, JSON.stringify(map)).catch(() => {});
-    }).catch(async () => {
-      const cached = await AsyncStorage.getItem(cacheKey).catch(() => null);
-      if (cached) {
-        try { setCheckinDates(JSON.parse(cached)); return; } catch {}
-      }
-      setCheckinDates({});
-    });
-  }, [currentCycle?.start_date, user?.id]);
 
   // dominantLayerId + actionRow — this screen previously had neither, so its check-in write
   // always sent assigned_action_id: null, which violates app_checkins' NOT NULL constraint
@@ -7452,19 +7524,18 @@ function StreakCalendarScreen({ onNavigate }: { onNavigate: (s: ScreenId) => voi
     });
   }, [dominantLayerId]);
 
-  const todayStr = new Date().toISOString().slice(0, 10);
-
   // Toggles a day within the 2-day edit window (today, and the 2 days before it — matches
   // the app-wide 2-day backfill limit, e.g. streak-reset tolerance in
   // Habit_Notification_Engine_SPEC_DRAFT.md §3). Works both directions: marks done if not
-  // done, undoes if already done. Writes to the exact same two AsyncStorage keys
-  // HomeScreen's markActionDone (App.tsx ~line 1744) reads/writes, so navigating back to
-  // Home (which fully remounts, per this app's switch-based nav) picks up the change.
+  // done, undoes if already done.
   //
-  // Waits for the server write's real result (logCheckin/logCheckinUndo now return a
-  // success boolean) before touching AsyncStorage or checkinDates — previously this updated
-  // local state unconditionally, so a failed write (e.g. the assigned_action_id NOT NULL
-  // violation below) still left Home showing "done" (confirmed 2026-08-07).
+  // Waits for the server write's real result (logCheckin/logCheckinUndo return a success
+  // boolean) before treating it as done — previously this updated local state
+  // unconditionally, so a failed write (e.g. the assigned_action_id NOT NULL violation
+  // below) still left Home showing "done" (confirmed 2026-08-07). logCheckin/logCheckinUndo
+  // themselves now update the shared checkinDates in AppDataContext directly on a confirmed
+  // write (2026-08-13 streak consolidation), so Home and the Insights Hub habit card pick
+  // this up instantly — no local AsyncStorage bookkeeping needed here anymore.
   const toggleDayFromCalendar = async (dateStr: string, currentlyDone: boolean) => {
     const ok = currentlyDone
       ? await logCheckinUndo(dateStr)
@@ -7474,25 +7545,6 @@ function StreakCalendarScreen({ onNavigate }: { onNavigate: (s: ScreenId) => voi
       Alert.alert('Could not save', 'This check-in couldn\'t be saved — please check your connection and try again.');
       return;
     }
-
-    try {
-      const saved = await AsyncStorage.getItem('ms_action_done_dates');
-      let dates: string[] = [];
-      if (saved) { try { dates = JSON.parse(saved); } catch { dates = []; } }
-      dates = currentlyDone ? dates.filter(d => d !== dateStr) : Array.from(new Set([...dates, dateStr]));
-      await AsyncStorage.setItem('ms_action_done_dates', JSON.stringify(dates));
-      if (dateStr === todayStr) {
-        if (currentlyDone) await AsyncStorage.removeItem('ms_action_done_today');
-        else await AsyncStorage.setItem('ms_action_done_today', todayStr);
-      }
-    } catch { /* ignore — local streak cache is best-effort; the server write above is the
-                  source of truth and is already confirmed successful at this point */ }
-
-    setCheckinDates(prev => {
-      const next = { ...prev };
-      if (currentlyDone) delete next[dateStr]; else next[dateStr] = true;
-      return next;
-    });
   };
 
   const gridDays = currentCycle ? Array.from({ length: 14 }, (_, i) => {
@@ -7568,7 +7620,7 @@ function StreakCalendarScreen({ onNavigate }: { onNavigate: (s: ScreenId) => voi
             </View>
             <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6, paddingHorizontal: 10, paddingVertical: 4, borderRadius: 6, backgroundColor: 'rgba(245,158,11,0.12)' }}>
               <Ionicons name="flame" size={12} color="#F59E0B" />
-              <Text style={{ fontSize: 11, fontWeight: '700', color: '#F59E0B' }}>{adherence} day streak</Text>
+              <Text style={{ fontSize: 11, fontWeight: '700', color: '#F59E0B' }}>{adherence} of 14 days followed</Text>
             </View>
           </View>
 
@@ -8549,6 +8601,22 @@ function ReportScreen({ onNavigate, scoreResult, userData }: { onNavigate: (s: S
   const { colors } = useTheme();
   const { fullName, cravings: loggedCravings, symptoms: ctxSymptoms, scoreHistory, baseline, logReportDownload } = useAppData();
   const [downloadingPdf, setDownloadingPdf] = useState(false);
+  // Same ViewShot-capture + Sharing.shareAsync pattern as ResultsScreen's WhatsApp button
+  // (2026-08-19) — previously this screen sent a text-only wa.me deep link instead, since
+  // wa.me can't carry an image attachment; see ScoreShareCardContent's own comment.
+  const shareCardRef = useRef<ViewShot>(null);
+  const shareScoreImage = async () => {
+    try {
+      const uri = await shareCardRef.current?.capture?.();
+      if (uri && (await Sharing.isAvailableAsync())) {
+        await Sharing.shareAsync(uri, { dialogTitle: 'Share your Metabolic Score' });
+      } else if (uri) {
+        Alert.alert('Sharing not available on this device');
+      }
+    } catch (e) {
+      Alert.alert('Could not create share image', 'Please try again.');
+    }
+  };
 
   // Use real scoreResult if available, else fall back to latest scoreHistory
   const latestHistory = scoreHistory[0];
@@ -8608,9 +8676,6 @@ function ReportScreen({ onNavigate, scoreResult, userData }: { onNavigate: (s: S
     n2: n2Text,
     n3: n3Data,
   };
-
-  // WhatsApp share text
-  const shareText = `My Metabolic Score™ is ${totalScore}/100. Fat loss resistance: ${rcsInfo.compPct}%. Primary pattern: ${pattern}. Get yours at amitbaruna.com`;
 
   const downloadPdfReport = async () => {
     if (downloadingPdf) return;
@@ -8810,12 +8875,20 @@ function ReportScreen({ onNavigate, scoreResult, userData }: { onNavigate: (s: S
         <Text style={{ fontSize: 10, color: colors.textTertiary, marginTop: 4 }}>{BRAND.instagramHandle}</Text>
       </View>
 
+      {/* Share Card — same branded card ResultsScreen's WhatsApp button captures/shares
+          (ScoreShareCardContent), so both entry points send the identical image. */}
+      <View style={{ paddingHorizontal: 24, marginBottom: 4 }}>
+        <ViewShot ref={shareCardRef} options={{ format: 'png', quality: 1 }} style={{ borderRadius: 20, overflow: 'hidden', backgroundColor: '#0D1B2A' }}>
+          <ScoreShareCardContent score={totalScore} band={band} pattern={pattern} />
+        </ViewShot>
+      </View>
+
       <View style={{ paddingHorizontal: 24, gap: 12 }}>
         <TouchableOpacity onPress={downloadPdfReport} disabled={downloadingPdf} style={{ backgroundColor: colors.red, paddingVertical: 14, borderRadius: 12, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8, opacity: downloadingPdf ? 0.7 : 1 }}>
           {downloadingPdf ? <ActivityIndicator size="small" color="#fff" /> : <Ionicons name="document-text" size={16} color="#fff" />}
           <Text style={{ color: '#fff', fontSize: 14, fontWeight: '700', letterSpacing: 0.5 }}>{downloadingPdf ? 'Generating...' : 'Download PDF Report'}</Text>
         </TouchableOpacity>
-        <TouchableOpacity onPress={() => Linking.openURL(`https://wa.me/?text=${encodeURIComponent(shareText)}`)} style={{ backgroundColor: '#25D366', paddingVertical: 14, borderRadius: 12, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8 }}>
+        <TouchableOpacity onPress={shareScoreImage} style={{ backgroundColor: '#25D366', paddingVertical: 14, borderRadius: 12, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8 }}>
           <Ionicons name="logo-whatsapp" size={16} color="#fff" />
           <Text style={{ color: '#fff', fontSize: 14, fontWeight: '700' }}>Share via WhatsApp</Text>
         </TouchableOpacity>
@@ -10596,6 +10669,7 @@ function AppNavigator() {
     case 'health-connect': return <HealthConnectScreen onNavigate={navigate} />;
     case 'score-history': return <ScoreHistoryScreen onNavigate={navigate} />;
     case 'streak-calendar': return <StreakCalendarScreen onNavigate={navigate} />;
+    case 'debug-score-trace': return <DebugScoreTraceScreen onNavigate={navigate} />;
     default: return <HomeScreen onNavigate={navigate} hasScore={hasScore} />;
   }
 }
