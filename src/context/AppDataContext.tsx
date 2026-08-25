@@ -60,7 +60,10 @@ type DataContextType = {
   fullName: string;
   scoreHistory: ScoreHistoryEntry[];
   refreshScoreHistory: () => Promise<void>;
-  saveProfile: (data: any) => Promise<void>;
+  // identityOverride: for callers (e.g. OnboardingScreen, right after signUp) that have a
+  // just-created user id/email in hand but can't rely on this context's own `user` having
+  // caught up to the new session yet — see saveProfile's implementation comment.
+  saveProfile: (data: any, identityOverride?: { id: string; email?: string | null }) => Promise<void>;
   saveScore: (data: any) => Promise<void>;
   cravings: CravingEntry[];
   saveCraving: (entry: Omit<CravingEntry, 'id' | 'created_at'>) => Promise<void>;
@@ -95,9 +98,9 @@ type DataContextType = {
   fatDeposition: string;
   setFatDeposition: (id: string) => Promise<void>;
   baseline: BaselineEntry;
-  setBaseline: (data: BaselineEntry) => Promise<void>;
+  setBaseline: (data: BaselineEntry, identityOverride?: { id: string }) => Promise<void>;
   conditions: string[];
-  setConditions: (data: string[]) => Promise<void>;
+  setConditions: (data: string[], identityOverride?: { id: string }) => Promise<void>;
   miniQuiz: MiniQuizMap;
   setMiniQuizAnswers: (layerId: number, answers: number[]) => Promise<void>;
   lastQuizAnswers: { layer: number; q: number; selected: number[]; score: number }[];
@@ -226,9 +229,19 @@ async function readStringMigrated(namespacedKey: string, legacyKey: string): Pro
 // wholesale with server-only data, with no merge step). A successful sync reconciles the entry
 // to its real server id/created_at, same pattern saveCraving already uses; a failed attempt
 // (still offline, or a genuine save error) keeps the entry as-is so it isn't lost either way.
-async function syncPendingLocalScores(pending: ScoreHistoryEntry[]): Promise<ScoreHistoryEntry[]> {
+async function syncPendingLocalScores(pending: ScoreHistoryEntry[], postedIds: Set<string>): Promise<ScoreHistoryEntry[]> {
   const results: ScoreHistoryEntry[] = [];
   for (const entry of pending) {
+    if (postedIds.has(entry.id)) {
+      // Already posted once — by saveScore's own save, or an earlier sync pass for this same
+      // id — so the real row already exists (or that original attempt is what should be
+      // trusted to complete). Dropping it here rather than re-adding the stale local entry is
+      // safe: the server-side list fetch this same refresh performs already includes the real
+      // row once committed, and if the original attempt is still genuinely in flight, its own
+      // eventual refreshScoreHistory() call brings the real row back on the next pass.
+      postedIds.delete(entry.id);
+      continue;
+    }
     try {
       const { id, date, created_at, ...payload } = entry;
       const result = await scoreApi.save(payload);
@@ -293,6 +306,18 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
   // refreshScoreHistory(), [refreshScoreHistory])`) on every score change, looping.
   const scoreHistoryRef = useRef(scoreHistory);
   useEffect(() => { scoreHistoryRef.current = scoreHistory; }, [scoreHistory]);
+  // Guards the exact duplicate-save mechanism confirmed via ms_debug_score_trace on
+  // 2026-08-22: saveScore's own success path calls refreshScoreHistory() below, which — via
+  // syncPendingLocalScores — re-POSTs any 'local-' prefixed entry still sitting in
+  // scoreHistory, including the one saveScore itself just successfully saved (nothing
+  // reconciles it out of state until that same refresh's own merge finishes). That produced a
+  // guaranteed second insert on every completed quiz, 100% reproducible, with no navigation or
+  // double-tap involved. Tracks local entry ids that already had a real scoreApi.save POST
+  // dispatched for them, so any syncPendingLocalScores pass — this save's own refresh, a
+  // caller screen's mount refresh, or the identity-change effect — skips re-submitting that id
+  // instead of blindly retrying it. Shared at the provider level (not per-call) since the
+  // whole point is to close this regardless of which code path triggers the second attempt.
+  const scoreSavePostedIdsRef = useRef<Set<string>>(new Set());
   const [fullName, setFullNameState] = useState<string>('');
   const [miniQuiz, setMiniQuizState] = useState<MiniQuizMap>({});
   const [lastQuizAnswers, setLastQuizAnswersState] = useState<{ layer: number; q: number; selected: number[]; score: number }[]>([]);
@@ -408,7 +433,7 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
               // Never let this refetch silently discard a not-yet-synced score — reconcile any
               // 'local-' entries (attempt the sync they missed while offline) before merging, don't
               // just overwrite with server-only data.
-              const reconciledLocal = await syncPendingLocalScores(pendingLocalScores);
+              const reconciledLocal = await syncPendingLocalScores(pendingLocalScores, scoreSavePostedIdsRef.current);
               const merged = [...mapped, ...reconciledLocal].sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
               setScoreHistory(merged);
               await writeJSON(nsKey(KEYS.scoreHistory, user.id), merged);
@@ -761,31 +786,37 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
     try { if (user?.id) await profileApi.updateFields(user.id, { fat_deposition: id }); } catch (e) { console.warn('FatDeposition sync failed:', e); }
   }, [user?.id]);
 
-  const setBaseline = useCallback(async (data: BaselineEntry) => {
-    const uid = user?.id || 'anonymous';
+  const setBaseline = useCallback(async (data: BaselineEntry, identityOverride?: { id: string }) => {
+    const uid = identityOverride?.id || user?.id || 'anonymous';
     setBaselineState(data);
     await writeJSON(nsKey(KEYS.baseline, uid), data);
-    try { if (user?.id) await profileApi.updateFields(user.id, { baseline: data }); } catch (e) { console.warn('Baseline sync failed:', e); }
+    try { if (uid !== 'anonymous') await profileApi.updateFields(uid, { baseline: data }); } catch (e) { console.warn('Baseline sync failed:', e); }
   }, [user?.id]);
 
-  const setConditions = useCallback(async (data: string[]) => {
-    const uid = user?.id || 'anonymous';
+  const setConditions = useCallback(async (data: string[], identityOverride?: { id: string }) => {
+    const uid = identityOverride?.id || user?.id || 'anonymous';
     setConditionsState(data);
     await writeJSON(nsKey(KEYS.conditions, uid), data);
-    try { if (user?.id) await profileApi.updateFields(user.id, { conditions: data }); } catch (e) { console.warn('Conditions sync failed:', e); }
+    try { if (uid !== 'anonymous') await profileApi.updateFields(uid, { conditions: data }); } catch (e) { console.warn('Conditions sync failed:', e); }
   }, [user?.id]);
 
-  const saveProfile = useCallback(async (data: any) => {
-    if (!user) { console.warn('[saveProfile] BAILED — no user in AppDataContext at call time. data was:', data); return; }
-    console.log('[saveProfile] upserting for user.id:', user.id, 'email:', user.email, 'data:', data);
+  const saveProfile = useCallback(async (data: any, identityOverride?: { id: string; email?: string | null }) => {
+    // identityOverride exists because this context's own `user` (from its own useAuth() call)
+    // can still be null for a render or two right after a fresh signUp() resolves elsewhere —
+    // AppDataContext is a separate component tree and hasn't necessarily re-rendered with the
+    // new session yet by the time a caller (OnboardingScreen) invokes this. Falling back to
+    // `user` unchanged for every other (non-signup) call site.
+    const identity = identityOverride ?? (user ? { id: user.id, email: user.email } : null);
+    if (!identity) { console.warn('[saveProfile] BAILED — no user available (context or override) at call time. data was:', data); return; }
+    console.log('[saveProfile] upserting for user.id:', identity.id, 'email:', identity.email, 'data:', data);
     try {
-      const result = await profileApi.upsert({ id: user.id, email: user.email, ...data });
+      const result = await profileApi.upsert({ id: identity.id, email: identity.email, ...data });
       console.log('[saveProfile] upsert result:', result);
       // Identity doesn't change on a fresh onboarding save, so the identity-change effect
       // above won't refire to pick this up — set it immediately so Home/Profile reflect
       // a just-onboarded name without needing a re-sign-in. Also cached, so a later offline
       // load doesn't fall back to the 'Friend' placeholder for a name that was already set.
-      if (data.full_name) { setFullNameState(data.full_name); await AsyncStorage.setItem(nsKey(KEYS.fullName, user.id), data.full_name); }
+      if (data.full_name) { setFullNameState(data.full_name); await AsyncStorage.setItem(nsKey(KEYS.fullName, identity.id), data.full_name); }
     } catch (e) { console.warn('[saveProfile] upsert THREW:', e); }
   }, [user]);
 
@@ -817,7 +848,7 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
         // this overwrite silently discard a not-yet-synced 'local-' entry — reconcile/retry it
         // and merge, instead of replacing scoreHistory with server-only data.
         const pendingLocalScores = scoreHistoryRef.current.filter(e => e.id.startsWith('local-'));
-        const reconciledLocal = await syncPendingLocalScores(pendingLocalScores);
+        const reconciledLocal = await syncPendingLocalScores(pendingLocalScores, scoreSavePostedIdsRef.current);
         const merged = [...mapped, ...reconciledLocal].sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
         setScoreHistory(merged);
         await writeJSON(nsKey(KEYS.scoreHistory, user.id), merged);
@@ -866,14 +897,25 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
       return;
     }
     try {
+      // Marked BEFORE the POST fires, not after it resolves — refreshScoreHistory() below is
+      // called synchronously once this succeeds, and syncPendingLocalScores must already see
+      // this id as posted by the time it runs, not race it. See scoreSavePostedIdsRef's
+      // declaration for the duplicate-save mechanism this closes.
+      scoreSavePostedIdsRef.current.add(localEntry.id);
       const result = await scoreApi.save(data);
       if (result && (result.code || result.error) && !Array.isArray(result)) {
         console.warn('[saveScore] Supabase save returned error:', result);
+        // Didn't actually succeed — un-guard so a later sync pass (e.g. on reconnect) can
+        // still legitimately retry this entry instead of it being skipped forever.
+        scoreSavePostedIdsRef.current.delete(localEntry.id);
       } else {
         console.log('[saveScore] Supabase save succeeded — refreshing history');
         refreshScoreHistory();
       }
-    } catch (e) { console.warn('[saveScore] save failed:', e); }
+    } catch (e) {
+      console.warn('[saveScore] save failed:', e);
+      scoreSavePostedIdsRef.current.delete(localEntry.id);
+    }
   }, [user, scoreHistory, refreshScoreHistory]);
 
   const setMiniQuizAnswers = useCallback(async (layerId: number, answers: number[]) => {

@@ -24,7 +24,11 @@ type AuthContextType = {
   loading: boolean;
   isDemoMode: boolean;
   signIn: (email: string, password: string) => Promise<{ error: any }>;
-  signUp: (email: string, password: string, name: string) => Promise<{ error: any }>;
+  // Returns the freshly-created user alongside any error — callers that need the id/email
+  // immediately (e.g. OnboardingScreen, right after signUp, before other context providers
+  // have re-rendered with the new session) shouldn't rely on this hook's own `user` value,
+  // which can still reflect the pre-signup state for a render or two.
+  signUp: (email: string, password: string, name: string) => Promise<{ error: any; user?: any }>;
   signInWithGoogle: () => Promise<{ error: any; cancelled?: boolean }>;
   signOut: () => Promise<void>;
 };
@@ -54,7 +58,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const signUp = async (email: string, password: string, name: string) => {
     const { user, error } = await auth.signUp(email, password, name);
     if (user) setUser(user);
-    return { error };
+    return { error, user };
   };
   const signInWithGoogle = async () => {
     const result = await promptAsync();

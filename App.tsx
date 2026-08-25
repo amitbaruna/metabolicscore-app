@@ -573,8 +573,9 @@ function LoginScreen({ onNavigate }: { onNavigate: (s: ScreenId) => void }) {
   };
 
   const handleSignIn = async () => {
+    if (!email.trim() || !password) { setError('Please enter both email and password.'); return; }
     setLoading(true); setError('');
-    const { error } = await signIn(email || 'guest@example.com', password || 'password');
+    const { error } = await signIn(email.trim(), password);
     setLoading(false);
     if (error) setError(error.message || 'Sign in failed');
     else await routeAfterAuth();
@@ -882,7 +883,7 @@ function ComplianceScreen({ onNavigate, fromProfile }: { onNavigate: (s: ScreenI
 
 function OnboardingScreen({ onNavigate }: { onNavigate: (s: ScreenId) => void }) {
   const { colors } = useTheme();
-  const { user } = useAuth();
+  const { signUp } = useAuth();
   const { saveProfile: saveProfileCtx, baseline: ctxBaseline, setBaseline: ctxSetBaseline, setConditions: ctxSetConditions } = useAppData();
   const [step, setStep] = useState(0);
   const [name, setName] = useState('');
@@ -891,6 +892,10 @@ function OnboardingScreen({ onNavigate }: { onNavigate: (s: ScreenId) => void })
   const [conditions, setConditions] = useState<string[]>([]);
   const [customCondition, setCustomCondition] = useState('');
   const [referralCodeInput, setReferralCodeInput] = useState('');
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [authError, setAuthError] = useState('');
+  const [submitting, setSubmitting] = useState(false);
 
   const conditionList = gender === 'Male' ? CONDITIONS_MALE : CONDITIONS_FEMALE;
 
@@ -901,33 +906,51 @@ function OnboardingScreen({ onNavigate }: { onNavigate: (s: ScreenId) => void })
   };
 
   const handleComplete = async () => {
-    console.log('[Onboarding] handleComplete starting, saving profile:', { full_name: name || 'Friend', gender, conditions, onboarded: true });
+    setAuthError('');
+    setSubmitting(true);
+    // Creates the real account first — everything below only runs once this succeeds. On
+    // failure, stay on this step with the real Supabase error shown and all prior form state
+    // (name/age/gender/conditions/referral) intact, so the user can fix it and retry without
+    // re-entering anything.
+    const { error, user: newUser } = await signUp(email.trim(), password, name || 'Friend');
+    if (error) {
+      setSubmitting(false);
+      setAuthError(error.message || 'Could not create your account. Please try again.');
+      return;
+    }
+    console.log('[Onboarding] signUp succeeded, saving profile:', { full_name: name || 'Friend', gender, conditions, onboarded: true });
     try {
-      await saveProfileCtx({ full_name: name || 'Friend', gender, conditions, onboarded: true });
+      // Pass the just-created user's identity explicitly rather than relying on `user` from
+      // useAuth() here, or on AppDataContext's own copy — both are separate React state reads
+      // that can still reflect the pre-signup (signed-out) render for a beat after signUp()
+      // resolves, which would otherwise make saveProfileCtx silently bail.
+      const identity = newUser?.id ? { id: newUser.id, email: newUser.email ?? email.trim() } : undefined;
+      await saveProfileCtx({ full_name: name || 'Friend', gender, conditions, onboarded: true }, identity);
       console.log('[Onboarding] saveProfileCtx call completed without throwing');
-      if (age) await ctxSetBaseline({ ...ctxBaseline, age });
-      if (conditions.length) await ctxSetConditions(conditions);
+      if (age) await ctxSetBaseline({ ...ctxBaseline, age }, identity);
+      if (conditions.length) await ctxSetConditions(conditions, identity);
       if (referralCodeInput.trim()) await referral.recordSignup(referralCodeInput.trim());
       // Post-onboarding, not first-launch — asked once here, right after the profile save,
       // rather than the moment the app first opens. Denied/unavailable fails silently (see
       // registerForPushNotificationsAsync) — never blocks the onNavigate('home') below.
-      if (user?.id) await registerForPushNotificationsAsync(user.id);
+      if (newUser?.id) await registerForPushNotificationsAsync(newUser.id);
       console.log('[Onboarding] handleComplete finished all steps successfully');
     } catch (e) { console.warn('[Onboarding] handleComplete FAILED:', e); }
+    setSubmitting(false);
     onNavigate('home');
   };
 
   return (
     <ScrollScreen bg={colors.bg} bottomPad={40}>
       <View style={{ paddingHorizontal: 24, paddingTop: 60, flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}>
-        <Text style={{ fontSize: 12, color: colors.textSecondary }}>Step {step + 1} of 4</Text>
+        <Text style={{ fontSize: 12, color: colors.textSecondary }}>Step {step + 1} of 5</Text>
         {step > 0 ? (
-          <TouchableOpacity onPress={() => setStep(step - 1)}><Text style={{ fontSize: 12, fontWeight: '700', color: colors.red }}>Back</Text></TouchableOpacity>
+          <TouchableOpacity onPress={() => { setAuthError(''); setStep(step - 1); }}><Text style={{ fontSize: 12, fontWeight: '700', color: colors.red }}>Back</Text></TouchableOpacity>
         ) : <View />}
       </View>
       <View style={{ paddingHorizontal: 24, marginTop: 12 }}>
         <View style={{ height: 4, backgroundColor: colors.card, borderRadius: 2, overflow: 'hidden' }}>
-          <Animated.View style={{ height: 4, backgroundColor: colors.red, width: `${((step + 1) / 4) * 100}%` }} />
+          <Animated.View style={{ height: 4, backgroundColor: colors.red, width: `${((step + 1) / 5) * 100}%` }} />
         </View>
       </View>
 
@@ -1039,20 +1062,52 @@ function OnboardingScreen({ onNavigate }: { onNavigate: (s: ScreenId) => void })
             </View>
           </>
         )}
+        {step === 4 && (
+          <>
+            <Text style={{ fontSize: 20, fontWeight: '900', color: colors.text }}>Create your account</Text>
+            <Text style={{ fontSize: 14, color: colors.textSecondary, marginTop: 8 }}>Your email and password secure your data and let you sign back in on any device.</Text>
+            <Text style={{ fontSize: 11, fontWeight: '700', letterSpacing: 1, color: colors.textSecondary, marginTop: 24, marginBottom: 8, textTransform: 'uppercase' }}>Email</Text>
+            <TextInput
+              value={email}
+              onChangeText={(v) => { setEmail(v); if (authError) setAuthError(''); }}
+              placeholder="you@example.com"
+              placeholderTextColor={colors.textTertiary}
+              autoCapitalize="none"
+              keyboardType="email-address"
+              style={{ backgroundColor: colors.card, borderWidth: 1, borderColor: colors.border, borderRadius: 12, paddingHorizontal: 16, paddingVertical: 16, color: colors.text, fontSize: 16 }}
+            />
+            <Text style={{ fontSize: 11, fontWeight: '700', letterSpacing: 1, color: colors.textSecondary, marginTop: 16, marginBottom: 8, textTransform: 'uppercase' }}>Password</Text>
+            <TextInput
+              value={password}
+              onChangeText={(v) => { setPassword(v); if (authError) setAuthError(''); }}
+              placeholder="At least 8 characters"
+              placeholderTextColor={colors.textTertiary}
+              secureTextEntry
+              style={{ backgroundColor: colors.card, borderWidth: 1, borderColor: colors.border, borderRadius: 12, paddingHorizontal: 16, paddingVertical: 16, color: colors.text, fontSize: 16 }}
+            />
+            {authError ? (
+              <Text style={{ marginTop: 12, fontSize: 12, color: colors.red }}>{authError}</Text>
+            ) : null}
+          </>
+        )}
       </View>
 
       <View style={{ paddingHorizontal: 24, marginTop: 40 }}>
-        <TouchableOpacity onPress={() => {
+        <TouchableOpacity disabled={submitting} onPress={() => {
           if (step === 0 && !name.trim()) { Alert.alert('Almost there', 'Please enter your name to continue.'); return; }
           if (step === 1 && !age.trim()) { Alert.alert('Almost there', 'Please enter your age to continue.'); return; }
           if (step === 2 && !gender) { Alert.alert('Almost there', 'Please select an option to continue.'); return; }
           if (step === 3 && conditions.length === 0) { Alert.alert('Almost there', 'Please make a selection — choose "No known condition" if none apply.'); return; }
-          step < 3 ? setStep(step + 1) : handleComplete();
-        }} style={{ backgroundColor: colors.red, paddingVertical: 14, borderRadius: 12, alignItems: 'center' }}>
-          <Text style={{ color: '#fff', fontSize: 14, fontWeight: '700', letterSpacing: 0.5 }}>{step === 3 ? 'Complete' : 'Continue'}</Text>
+          if (step === 4) {
+            if (!email.trim()) { setAuthError('Please enter your email to continue.'); return; }
+            if (password.length < 8) { setAuthError('Password must be at least 8 characters.'); return; }
+          }
+          step < 4 ? setStep(step + 1) : handleComplete();
+        }} style={{ backgroundColor: colors.red, paddingVertical: 14, borderRadius: 12, alignItems: 'center', opacity: submitting ? 0.6 : 1 }}>
+          {submitting ? <ActivityIndicator color="#fff" size="small" /> : <Text style={{ color: '#fff', fontSize: 14, fontWeight: '700', letterSpacing: 0.5 }}>{step === 4 ? 'Complete' : 'Continue'}</Text>}
         </TouchableOpacity>
         {step === 3 && (
-          <TouchableOpacity onPress={() => onNavigate('home')} style={{ marginTop: 12, paddingVertical: 8, alignItems: 'center' }}>
+          <TouchableOpacity onPress={() => setStep(4)} style={{ marginTop: 12, paddingVertical: 8, alignItems: 'center' }}>
             <Text style={{ fontSize: 12, color: colors.textSecondary }}>Skip for now</Text>
           </TouchableOpacity>
         )}
@@ -2883,6 +2938,13 @@ function ScoreToolScreen({ onNavigate, onComplete }: { onNavigate: (s: ScreenId)
   const [adaptiveSel, setAdaptiveSel] = useState<Set<number>>(new Set());
   const [result, setResult] = useState<ScoreResult | null>(null);
   const [showMicroInsight, setShowMicroInsight] = useState(false);
+  // Disables the three completion buttons below once tapped — same pattern as
+  // OnboardingScreen's submit guard. UX-level only (prevents the double-tap that
+  // caused this in the first place); the actual duplicate-save prevention is the
+  // synchronous ref guard in AppNavigator's handleScoreComplete, which this can't
+  // fully replace since setSubmitting(true) isn't guaranteed to apply before a
+  // near-simultaneous second tap.
+  const [submitting, setSubmitting] = useState(false);
   // Cinematic analyzing animation — driven by the user's actual answers
   const [cinemaStep, setCinemaStep] = useState(0);
   const cinemaSteps = useMemo(() => {
@@ -2948,9 +3010,11 @@ function ScoreToolScreen({ onNavigate, onComplete }: { onNavigate: (s: ScreenId)
   };
 
   const finishSliders = () => {
+    if (submitting) return;
     const scoreResult = calculateScore(history, sleepScore, stressScore, gutScore, ctxConditions);
     setResult(scoreResult);
     if (scoreResult.adaptiveQCount === 0) {
+      setSubmitting(true);
       setPhase('analyzing');
       setTimeout(() => onComplete(scoreResult, { gender: 'Male', age: '26–35', conditions: [], sleepScore, stressScore, gutScore, timeSpentSeconds: Math.round((Date.now() - quizStartTime.current) / 1000) }), 5500);
     } else {
@@ -2986,7 +3050,7 @@ function ScoreToolScreen({ onNavigate, onComplete }: { onNavigate: (s: ScreenId)
   };
 
   const nextAdaptive = () => {
-    if (adaptiveSel.size === 0) return;
+    if (adaptiveSel.size === 0 || submitting) return;
     const item = adaptiveQueue[adaptiveIdx];
     const scores = Array.from(adaptiveSel).map(i => ANS_SCORES[i]);
     const worstScore = Math.min(...scores);
@@ -3016,6 +3080,7 @@ function ScoreToolScreen({ onNavigate, onComplete }: { onNavigate: (s: ScreenId)
       const dominantPick = pickDominantLayer(shadowSc, hl, shadowCascadeRisk, ctxConditions, combinedRealSignal);
       const updatedResult = { ...result!, patternEngine: finalPattern, sc: shadowSc, cascadeRisk: shadowCascadeRisk, dominantLayer: dominantPick.layer, dominantLayerTiedFallback: dominantPick.tiedFallback };
       setResult(updatedResult);
+      setSubmitting(true);
       setPhase('analyzing');
       setTimeout(() => onComplete(updatedResult, { gender: 'Male', age: '26–35', conditions: [], sleepScore, stressScore, gutScore, timeSpentSeconds: Math.round((Date.now() - quizStartTime.current) / 1000) }), 5500);
     }
@@ -3128,8 +3193,8 @@ function ScoreToolScreen({ onNavigate, onComplete }: { onNavigate: (s: ScreenId)
           </ScrollView>
 
           <View style={{ paddingHorizontal: 24, paddingBottom: 24, paddingTop: 12, backgroundColor: colors.bg }}>
-            <TouchableOpacity onPress={finishSliders} style={{ backgroundColor: colors.red, paddingVertical: 14, borderRadius: 12, alignItems: 'center' }}>
-              <Text style={{ color: '#fff', fontSize: 14, fontWeight: '700', letterSpacing: 0.5 }}>See My Results</Text>
+            <TouchableOpacity disabled={submitting} onPress={finishSliders} style={{ backgroundColor: colors.red, paddingVertical: 14, borderRadius: 12, alignItems: 'center', opacity: submitting ? 0.6 : 1 }}>
+              {submitting ? <ActivityIndicator color="#fff" size="small" /> : <Text style={{ color: '#fff', fontSize: 14, fontWeight: '700', letterSpacing: 0.5 }}>See My Results</Text>}
             </TouchableOpacity>
           </View>
         </SafeAreaView>
@@ -3152,8 +3217,8 @@ function ScoreToolScreen({ onNavigate, onComplete }: { onNavigate: (s: ScreenId)
             <TouchableOpacity onPress={startAdaptive} style={{ backgroundColor: colors.red, paddingVertical: 14, borderRadius: 12, alignItems: 'center' }}>
               <Text style={{ color: '#fff', fontSize: 14, fontWeight: '700', letterSpacing: 0.5 }}>Make it more precise ({result.adaptiveQCount} questions)</Text>
             </TouchableOpacity>
-            <TouchableOpacity onPress={() => { setPhase('analyzing'); setTimeout(() => onComplete(result, { gender: 'Male', age: '26–35', conditions: [], sleepScore, stressScore, gutScore, timeSpentSeconds: Math.round((Date.now() - quizStartTime.current) / 1000) }), 5500); }} style={{ backgroundColor: colors.card, paddingVertical: 14, borderRadius: 12, alignItems: 'center' }}>
-              <Text style={{ color: colors.text, fontSize: 14, fontWeight: '700' }}>See my result now</Text>
+            <TouchableOpacity disabled={submitting} onPress={() => { if (submitting) return; setSubmitting(true); setPhase('analyzing'); setTimeout(() => onComplete(result, { gender: 'Male', age: '26–35', conditions: [], sleepScore, stressScore, gutScore, timeSpentSeconds: Math.round((Date.now() - quizStartTime.current) / 1000) }), 5500); }} style={{ backgroundColor: colors.card, paddingVertical: 14, borderRadius: 12, alignItems: 'center', opacity: submitting ? 0.6 : 1 }}>
+              {submitting ? <ActivityIndicator color={colors.text} size="small" /> : <Text style={{ color: colors.text, fontSize: 14, fontWeight: '700' }}>See my result now</Text>}
             </TouchableOpacity>
           </View>
         </View>
@@ -3206,8 +3271,8 @@ function ScoreToolScreen({ onNavigate, onComplete }: { onNavigate: (s: ScreenId)
             </View>
           </ScrollView>
           <View style={{ paddingHorizontal: 24, paddingBottom: 24, paddingTop: 12, backgroundColor: colors.bg }}>
-            <TouchableOpacity onPress={nextAdaptive} disabled={adaptiveSel.size === 0} style={{ backgroundColor: adaptiveSel.size > 0 ? colors.red : colors.card, paddingVertical: 14, borderRadius: 12, alignItems: 'center', opacity: adaptiveSel.size > 0 ? 1 : 0.5 }}>
-              <Text style={{ color: adaptiveSel.size > 0 ? '#fff' : colors.textTertiary, fontSize: 14, fontWeight: '700', letterSpacing: 0.5 }}>{adaptiveIdx === adaptiveQueue.length - 1 ? 'See My Results' : 'Continue'}</Text>
+            <TouchableOpacity onPress={nextAdaptive} disabled={adaptiveSel.size === 0 || submitting} style={{ backgroundColor: adaptiveSel.size > 0 ? colors.red : colors.card, paddingVertical: 14, borderRadius: 12, alignItems: 'center', opacity: adaptiveSel.size > 0 && !submitting ? 1 : 0.5 }}>
+              {submitting ? <ActivityIndicator color="#fff" size="small" /> : <Text style={{ color: adaptiveSel.size > 0 ? '#fff' : colors.textTertiary, fontSize: 14, fontWeight: '700', letterSpacing: 0.5 }}>{adaptiveIdx === adaptiveQueue.length - 1 ? 'See My Results' : 'Continue'}</Text>}
             </TouchableOpacity>
           </View>
         </SafeAreaView>
@@ -7415,6 +7480,23 @@ function DebugScoreTraceScreen({ onNavigate }: { onNavigate: (s: ScreenId) => vo
     AsyncStorage.removeItem(DEBUG_SCORE_TRACE_KEY).then(load).catch(() => {});
   };
 
+  // Reads AsyncStorage directly rather than copying the `entries` state, so this always
+  // copies the true current full array — not whatever was last loaded into state — and
+  // isn't limited to what's rendered on screen.
+  const copyLog = () => {
+    AsyncStorage.getItem(DEBUG_SCORE_TRACE_KEY).then(raw => {
+      let text = raw || '[]';
+      try { text = JSON.stringify(JSON.parse(text), null, 2); } catch { /* copy raw as-is */ }
+      Clipboard.setStringAsync(text).then(() => {
+        Alert.alert('Copied', 'Full trace log copied to clipboard.');
+      }).catch(() => {
+        Alert.alert('Copy failed', 'Could not copy the log to clipboard.');
+      });
+    }).catch(() => {
+      Alert.alert('Copy failed', 'Could not read the trace log.');
+    });
+  };
+
   // Newest-first — the most relevant entries (right after a reopen) are what you want on
   // screen without scrolling.
   const ordered = [...entries].reverse();
@@ -7435,6 +7517,9 @@ function DebugScoreTraceScreen({ onNavigate }: { onNavigate: (s: ScreenId) => vo
         </TouchableOpacity>
         <TouchableOpacity onPress={clearLog} style={{ flex: 1, backgroundColor: colors.card, paddingVertical: 12, borderRadius: 12, alignItems: 'center', borderWidth: 1, borderColor: colors.border }}>
           <Text style={{ color: colors.red, fontSize: 13, fontWeight: '700' }}>Clear Log</Text>
+        </TouchableOpacity>
+        <TouchableOpacity onPress={copyLog} style={{ flex: 1, backgroundColor: colors.card, paddingVertical: 12, borderRadius: 12, alignItems: 'center', borderWidth: 1, borderColor: colors.border }}>
+          <Text style={{ color: colors.text, fontSize: 13, fontWeight: '700' }}>Copy Full Log</Text>
         </TouchableOpacity>
       </View>
 
@@ -10509,6 +10594,10 @@ function BottomNav({ active, onNavigate, hasScore }: { active: string; onNavigat
 // APP NAVIGATOR
 // ============================================================
 
+// Screens reachable without a signed-in session. Everything else is gated by the
+// allowlist effect below — any other screen with no user bounces to 'login'.
+const PUBLIC_SCREENS: ScreenId[] = ['splash', 'compliance', 'login', 'onboarding'];
+
 function AppNavigator() {
   const { user, loading } = useAuth();
   const { hasScore, saveScore, setLastQuizAnswers, scoreHistory } = useAppData();
@@ -10541,8 +10630,15 @@ function AppNavigator() {
     setHighlightTodaysOne(Date.now());
   }, []);
 
+  // Guards handleScoreComplete against firing twice from a double-tap on any of
+  // ScoreToolScreen's three completion buttons — a ref because it must block
+  // synchronously, before React's next render, which a useState guard can't guarantee.
+  // Re-armed only when a fresh quiz attempt starts (navigate('score')), not on every render.
+  const scoreSubmittedRef = useRef(false);
+
   const navigate = useCallback((s: ScreenId) => {
     setAutoExpandN3(false); // Reset on normal navigation
+    if (s === 'score') scoreSubmittedRef.current = false; // fresh quiz attempt, re-arm the guard below
     setScreen(s);
   }, []);
 
@@ -10611,7 +10707,38 @@ function AppNavigator() {
     })();
   }, [user, loading]);
 
+  // Router-level allowlist gate — bounces to 'login' any time `screen` lands somewhere outside
+  // PUBLIC_SCREENS with no signed-in user, regardless of how it got there (not just the initial
+  // splash decision above). Closes the gap where a screen could still be reached with no session
+  // via any other setScreen/navigate call path.
+  const prevUserRef = useRef<any>(user);
+  const authGraceUntilRef = useRef<number>(0);
+  useEffect(() => {
+    // Brief grace window right after a genuine sign-in/sign-up completes. `screen` (updated via
+    // navigate() in LoginScreen/OnboardingScreen immediately after auth succeeds) and `user`
+    // (updated via AuthContext's own setUser) are separate state updates in separate components
+    // — if `screen` commits to a non-public value one render before `user` does, this gate would
+    // otherwise bounce straight back to login for a frame right after a successful sign-in.
+    if (!prevUserRef.current && user) authGraceUntilRef.current = Date.now() + 2000;
+    prevUserRef.current = user;
+  }, [user]);
+  useEffect(() => {
+    if (loading) return;
+    if (user) return;
+    if (PUBLIC_SCREENS.includes(screen)) return;
+    if (Date.now() < authGraceUntilRef.current) return;
+    setScreen('login');
+  }, [loading, user, screen]);
+
   const handleScoreComplete = (result: ScoreResult, data: UserData) => {
+    // Closes the double-tap/double-submit race: ScoreToolScreen's three completion
+    // buttons each schedule this via a 5500ms setTimeout, and React's phase-change
+    // re-render doesn't happen synchronously with the first tap — a fast second tap
+    // (or a device double-firing one physical tap) can invoke this twice before that
+    // re-render removes the button. Confirmed live 2026-08-22: two app_scores rows
+    // 0.53s apart, byte-for-byte identical answers/time_spent_seconds.
+    if (scoreSubmittedRef.current) return;
+    scoreSubmittedRef.current = true;
     // Must read scoreHistory[0] here, before saveScore() below mutates it — see
     // previousTotalScore's declaration above for why.
     setPreviousTotalScore(scoreHistory[0]?.total_score ?? null);

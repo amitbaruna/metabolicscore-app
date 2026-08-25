@@ -265,6 +265,67 @@ Update this at the end of every session (either with Claude Code or with Claude 
 chat) — what got fixed, what's still open. Keep entries short; this is a fast
 "where did we leave off" scan, not a full changelog. Newest entry on top.
 
+## Session log entry — 2026-08-22 (long session: website, security audit, auth bug, unresolved duplicate-score bug)
+
+### Website — DONE, deployed, verified live
+- Built privacy.html and terms.html from scratch, matching the site's existing design system (dark #0A0A0A, #D42B2B red accent, Inter font) rather than reusing the mobile app's theme.
+- Real bug caught during build: the site's styles.css is a precompiled/purged Tailwind build — only contains CSS for classes already used in the original site. New utility classes introduced in the two new pages (28 of them — sticky sidebar layout, spacing, hover states) had no matching rule and silently failed to render. Fixed with explicit custom CSS in a <style> block, same pattern the site already uses for anything Tailwind can't cover.
+- Both pages made fully self-contained (stylesheet inlined directly, not linked externally) so they render correctly standalone — needed because Claude's own artifact-preview panel, and any local file:// open, can't resolve the site's absolute-path stylesheet reference. This was the actual cause of "looks broken" reports during review — confirmed via real headless-browser testing (Playwright, both file:// and a real local HTTP server), not guessed.
+- Footer updated across all three pages (index.html, privacy.html, terms.html) — added real Privacy Policy / Terms & Conditions links (previously just descriptive badges, no actual links) and support@metabolicscore.in as a visible contact link.
+- Finalized: publish date filled in, retention-period language finalized ("as long as account is active; deletion completed within 30 days"), refund policy finalized (100% before first consultation either program; single consultation 0% after; 90-day program 75% within 15 days of purchase after first consultation, 0% after 15 days).
+- Deployed to Cloudflare Pages, confirmed live at metabolicscore.in/privacy and /terms.
+
+### support@metabolicscore.in — DONE, verified working both directions
+- GoDaddy Titan Email (Professional Email Pro Light, already purchased) set up.
+- DNS records added in Cloudflare (domain's actual nameserver, not GoDaddy) — ownership TXT, SPF, DMARC updated in place (not duplicated — matched existing GoDaddy-issued DMARC record, just tightened p=quarantine → p=reject), 2 DKIM CNAMEs, 2 MX records, 1 SRV record. All added as DNS-only (unproxied) per Cloudflare's requirement for mail records.
+- Verified via GoDaddy's own domain-check tool after DNS propagation, and via real send/receive test.
+- Forwarding to amit.baruna@gmail.com configured and confirmed working with a real cross-account test email (not a self-loop test, which had initially given an ambiguous result).
+- Display name set to "Metabolic Score Support" (deliberately not just "Amit Baruna" — brand-first framing for a support inbox).
+
+### Security audit — DONE, confirmed clean via live queries against production
+- Razorpay payment verification: confirmed real HMAC-SHA256 signature verification on both /verify-payment and /webhook endpoints in metabolic-payment-verify Worker — no path exists where an unsigned/forged payment confirmation is accepted. /create-order uses server-side fixed prices, never a client-supplied amount.
+- service_role key: confirmed never present in any client-shipped code — only in Worker secrets and a gitignored local .env used by a dev-only Node script, never in git history.
+- Full RLS audit across all 13+ tables (app_scores, app_cravings, app_checkins, app_profiles, app_membership, app_bookings, notification_log, habit_cycles, actions, app_referrals, app_referral_codes, app_nps_ratings, app_report_downloads, unmatched_payments, booking_availability_template, booking_exceptions) — confirmed RLS enabled AND policies correctly scoped to auth.uid() = user_id via live pg_class/pg_policies queries, not just migration-file inference.
+- app_membership specifically re-confirmed: the client-writable self-grant bug (found and fixed in an earlier session) holds — only a SELECT policy exists now, no client INSERT/UPDATE path to self-grant paid status.
+- Three minor items flagged, not urgent: app_referrals' UPDATE policy is user-triggerable (worth confirming this can't let a user fake referral completion); two "anyone can read" lookup policies (referral codes, booking slot availability) are intentionally open — worth confirming they don't leak more than intended (e.g. other users' names/contact info in the same row).
+
+### Auth signup bug — found and FIXED, confirmed working via live device test
+- Serious pre-launch bug: OnboardingScreen's "Sign Up" never called the real signUp() (which already existed correctly in AuthContext, just was never wired up). Users landed in a fully-functional-looking app with zero real Supabase account — data written to a local-only 'anonymous' AsyncStorage bucket, shared across anyone who did this on the same device, unrecoverable on reinstall. Confirmed via full trace: no real users were ever affected (app not yet submitted).
+- Also found and fixed in the same pass: LoginScreen's blank-field fallback silently substituted hardcoded guest@example.com/password credentials against the REAL backend (not a demo mode) instead of showing a validation error.
+- Fix implemented (App.tsx, AuthContext.tsx, supabase.ts):
+  - Email/password added as onboarding's final (5th) step, after name/age/gender/conditions.
+  - handleComplete now calls signUp() first; only proceeds to profile/baseline/conditions save + navigation on success; shows real Supabase error and allows retry on failure; removed the old unconditional catch-block navigate-to-home.
+  - Client-side password validation (8+ characters) before calling signUp.
+  - Router-level allowlist gate added in AppNavigator (PUBLIC_SCREENS = splash/compliance/login/onboarding) — bounces to login if an unauthenticated session reaches any other screen, closing the class of bug, not just this instance.
+  - LoginScreen guest-fallback removed, replaced with real inline validation.
+  - Fixed auth.signUp()'s failure-detection — it was checking for a field called `error` that Supabase's real API doesn't return (same bug class already fixed in signIn back on 2026-07-27, just never applied to signUp).
+  - "Skip for now" on the conditions step repurposed to skip only that field and advance to the new email/password step, rather than exiting onboarding entirely (which would now dead-end at the router gate).
+  - New user's id/email threaded explicitly into the post-signup save calls, avoiding a render-timing race with AppDataContext's own auth state.
+- Verified via tsc --noEmit (matches 13-error documented baseline) and a real bundle export (clean), AND via live testing on-device through Expo Go: real signup completed successfully, real Supabase account created, name/age/conditions/score all correctly persisted and displayed, login with the new credentials works.
+- This account (support@metabolicscore.in) is the intended App Store demo account. STILL NEEDS: password recorded (only Amit has it, correctly not shared with Claude), membership manually flipped to "paid" in Supabase (not yet done as of this session) so the reviewer can see the call-booking feature, and credentials dropped into the App Review notes draft (still has [FILL] placeholders for this).
+
+### UNRESOLVED — top priority for next session: duplicate score submission
+- Separate bug from the above, found during the same testing pass: completing the quiz saves TWO identical rows to app_scores instead of one.
+- Root cause confirmed via direct SQL query against production: two rows, 0.53 seconds apart, byte-for-byte identical answers/time_spent_seconds — a double-tap/double-fire race on the completion button, not two genuine submissions.
+- First fix attempt (ref-based re-entry guard in handleScoreComplete + disable-while-submitting state on all three completion buttons in ScoreToolScreen) was implemented, verified clean via tsc/bundle — but FAILED live re-testing. A deliberate rapid double-tap still produced two saved rows after the fix.
+- Real mechanism NOT yet confirmed. Leading hypotheses not yet checked: (a) useRef getting reset by an unexpected remount/re-render between taps, (b) both taps registering before React's first re-render commits (faster than the "submitting" state can visually/functionally block a second tap), (c) the fix possibly tested against a stale Expo Go bundle rather than the actual updated code (not ruled out — should reload with `r` and retest before assuming the code itself is wrong).
+- Database cleanup status UNCLEAR: at least one duplicate pair from the original bug (rows 19ca2893... and d8175936..., total_score 42) was identified with a delete statement given for the older row — NOT CONFIRMED whether this was actually run. The re-test after the "fix" also produced a duplicate, meaning there may now be a second duplicate pair sitting in app_scores for this same test account. Needs a fresh count/cleanup pass before this account is used as anything demo-worthy.
+- NEXT SESSION: start here. Re-verify Expo Go is running fresh code (force reload), retest; if it still fails, send Claude Code the deeper investigation brief (verbatim code trace of the guard logic, check for remount/scope issues, check whether both taps can land before the first re-render). Do not assume the original diagnosis was complete — it wasn't, since the fix based on it didn't work.
+
+### Deferred, explicitly accepted as known gaps (not blocking submission)
+- Sentry source-map upload still broken (SENTRY_DISABLE_AUTO_UPLOAD=true still set for both build profiles) — crash catching works, stack traces are minified/unreadable. Never fixed this session; explicitly deferred again.
+- Offline cold-restart transient display bug (pre-existing score history briefly disappearing during an offline-and-killed-app window, before self-healing on reconnect) — confirmed NOT actual data loss, downgraded to accepted known limitation, diagnostic logging (ms_debug_score_trace) is implemented and in place but never actually used to capture a real trace.
+- Signup password field lacks a show/hide toggle and confirm-password field — logged to Future Ideas Registry, not urgent.
+
+### Toolchain note
+- This session included a full dev-environment rebuild (Node, Git, Claude Code CLI, EAS CLI all reinstalled and re-authenticated) after a laptop restart/drive change. Confirmed fully working by session's end — not the cause of any of the above findings, just explains any timestamp gaps.
+
+### Still open, unchanged from before this session
+- WhatsApp share inconsistency — was fixed (both entry points standardized on branded image share) in an earlier session, confirmed via tsc/bundle, never device-tested.
+- Screenshots for App Store listing — not yet captured.
+- eas submit — never run. Nothing is in TestFlight or App Store Connect yet.
+- One EAS build remaining this billing cycle (resets ~Sept 1) — must be spent deliberately on the final, fully-verified production build, not further testing.
+
 ### 2026-08-08 (cont'd 7) — Gap-day averaging bug fixed in the 7-day sleep figures too
 (bundled); unbounded session-length bug found, hard-capped at 16h; "22→20 not ~19"
 mystery fully resolved (data regenerates between syncs, not a merge-logic bug); a bug in

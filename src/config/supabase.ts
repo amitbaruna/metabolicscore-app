@@ -88,7 +88,15 @@ export const auth = {
         body: JSON.stringify({ id: data.user.id, email, full_name: fullName, onboarded: false }),
       }, data.access_token);
     }
-    return { user: data.user, error: data.error || null };
+    // Same fix as auth.signIn below — Supabase's auth error responses use `msg`/
+    // `error_description`/`error_code`, not a field literally named `error`, so reading
+    // `data.error` directly was always undefined on a real rejection (duplicate email, weak
+    // password, etc.), letting a failed signup look like a no-op success. res.ok is the real
+    // signal to gate on.
+    const error = !res.ok
+      ? { message: data.msg || data.error_description || data.message || 'Sign up failed', code: data.error_code }
+      : null;
+    return { user: data.user, error };
   },
   async signIn(email: string, password: string) {
     const res = await fetch(`${SUPABASE_URL}/auth/v1/token?grant_type=password`, {
