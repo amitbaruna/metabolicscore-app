@@ -2,7 +2,7 @@
 
 A premium React Native + Expo app for **Dr. Amit Baruna** — a 14-question Metabolic Score™ diagnostic, 5 Layers education hub, score tracking, and 1:1 booking.
 
-Built to match the cinematic dark-premium feel of [amitbaruna.com](https://amitbaruna.com).
+Built to match the cinematic dark-premium feel of [metabolicscore.in](https://metabolicscore.in).
 
 ---
 
@@ -231,8 +231,8 @@ export const BRAND = {
   name: 'Metabolic Score',
   tagline: 'Decode your metabolism. Transform your health.',
   doctorName: 'Dr. Amit Baruna',
-  email: 'hello@amitbaruna.com',
-  website: 'https://amitbaruna.com',
+  email: 'support@metabolicscore.in',
+  website: 'https://metabolicscore.in',
   instagram: 'https://www.instagram.com/amitbaruna/?hl=en',
   instagramHandle: '@amitbaruna',
   calendly: 'https://calendly.com/amit-baruna/transformation-blueprint-call',
@@ -305,4 +305,4 @@ Apple Developer account ($99/year) and Google Play Console ($25 one-time) requir
 
 ---
 
-Built for **Dr. Amit Baruna** · [amitbaruna.com](https://amitbaruna.com) · [@amitbaruna](https://www.instagram.com/amitbaruna/?hl=en)
+Built for **Dr. Amit Baruna** · [metabolicscore.in](https://metabolicscore.in) · [@amitbaruna](https://www.instagram.com/amitbaruna/?hl=en)
