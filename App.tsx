@@ -808,14 +808,14 @@ function ComplianceScreen({ onNavigate, fromProfile }: { onNavigate: (s: ScreenI
                 {deleteStep === 'done' && (
                   <>
                     <Text style={{ fontSize: 16, fontWeight: '800', color: colors.text, marginBottom: 8 }}>Your data has been deleted</Text>
-                    <Text style={{ fontSize: 13, color: colors.textSecondary, lineHeight: 19, marginBottom: 20 }}>You're being signed out now. If you'd like your login credentials removed too, email Help@amitbaruna.com and reference this deletion.</Text>
+                    <Text style={{ fontSize: 13, color: colors.textSecondary, lineHeight: 19, marginBottom: 20 }}>You're being signed out now. If you'd like your login credentials removed too, email support@metabolicscore.in and reference this deletion.</Text>
                     <TouchableOpacity onPress={() => onNavigate('login')} style={{ paddingVertical: 12, borderRadius: 10, backgroundColor: colors.red, alignItems: 'center' }}><Text style={{ fontSize: 13, fontWeight: '700', color: '#fff' }}>Done</Text></TouchableOpacity>
                   </>
                 )}
                 {deleteStep === 'error' && (
                   <>
                     <Text style={{ fontSize: 16, fontWeight: '800', color: colors.text, marginBottom: 8 }}>Something didn't complete</Text>
-                    <Text style={{ fontSize: 13, color: colors.textSecondary, lineHeight: 19, marginBottom: 8 }}>Most of your data may have been deleted, but not all of it. Email Help@amitbaruna.com so we can finish this manually.</Text>
+                    <Text style={{ fontSize: 13, color: colors.textSecondary, lineHeight: 19, marginBottom: 8 }}>Most of your data may have been deleted, but not all of it. Email support@metabolicscore.in so we can finish this manually.</Text>
                     {deleteErrors.slice(0, 3).map((e, i) => (<Text key={i} style={{ fontSize: 10, color: colors.textTertiary, marginBottom: 4 }}>{e}</Text>))}
                     <TouchableOpacity onPress={() => setDeleteStep('closed')} style={{ marginTop: 12, paddingVertical: 12, borderRadius: 10, backgroundColor: colors.card, alignItems: 'center' }}><Text style={{ fontSize: 13, fontWeight: '700', color: colors.text }}>Close</Text></TouchableOpacity>
                   </>
@@ -3470,7 +3470,7 @@ function ScoreShareCardContent({ score, band, pattern }: { score: number; band: 
         <Text style={{ fontSize: 10, fontWeight: '700', letterSpacing: 1, color: '#fff', textTransform: 'uppercase' }}>{band.status}</Text>
       </View>
       <Text style={{ fontSize: 12, color: 'rgba(255,255,255,0.6)', marginBottom: 4 }}>Pattern: {pattern}</Text>
-      <Text style={{ fontSize: 10, color: 'rgba(255,255,255,0.3)' }}>amitbaruna.com/metabolic-score</Text>
+      <Text style={{ fontSize: 10, color: 'rgba(255,255,255,0.3)' }}>metabolicscore.in</Text>
     </View>
   );
 }
@@ -3496,7 +3496,7 @@ function ResultsScreen({ onNavigate, result, userData, autoExpandN3, onSelectLay
     }
   };
   const copyShareLink = async () => {
-    await Clipboard.setStringAsync('https://amitbaruna.com');
+    await Clipboard.setStringAsync('https://metabolicscore.in');
     Alert.alert('Link copied');
   };
   const [animatedScore, setAnimatedScore] = useState(0);
@@ -6417,8 +6417,8 @@ function ProfileScreen({ onNavigate, hasScore, scoreResult, onGoToCravings, onGo
     try {
       const code = await referral.getOrCreateCode();
       const message = code
-        ? `I've been using the Metabolic Score app to figure out what's actually blocking my fat loss — thought you'd find it useful too. Use my code ${code} when you sign up: https://amitbaruna.com`
-        : `Check out the Metabolic Score app — it helped me figure out what's actually blocking my fat loss: https://amitbaruna.com`;
+        ? `I've been using the Metabolic Score app to figure out what's actually blocking my fat loss — thought you'd find it useful too. Use my code ${code} when you sign up: https://metabolicscore.in`
+        : `Check out the Metabolic Score app — it helped me figure out what's actually blocking my fat loss: https://metabolicscore.in`;
       await Share.share({ message });
     } catch (e) {
       console.warn('[shareApp] failed:', e);
@@ -7111,11 +7111,11 @@ function ProfileScreen({ onNavigate, hasScore, scoreResult, onGoToCravings, onGo
                     </View>
                     <Ionicons name="call-outline" size={14} color={colors.textTertiary} />
                   </TouchableOpacity>
-                  <TouchableOpacity onPress={() => Linking.openURL('mailto:Help@amitbaruna.com')} style={{ flexDirection: 'row', alignItems: 'center', gap: 10, paddingVertical: 10, borderTopWidth: 1, borderTopColor: colors.border }}>
+                  <TouchableOpacity onPress={() => Linking.openURL('mailto:support@metabolicscore.in')} style={{ flexDirection: 'row', alignItems: 'center', gap: 10, paddingVertical: 10, borderTopWidth: 1, borderTopColor: colors.border }}>
                     <View style={{ width: 32, height: 32, borderRadius: 8, backgroundColor: `${colors.red}20`, alignItems: 'center', justifyContent: 'center' }}><Ionicons name="mail" size={14} color={colors.red} /></View>
                     <View style={{ flex: 1 }}>
                       <Text style={{ fontSize: 10, fontWeight: '700', letterSpacing: 1, color: colors.textSecondary, textTransform: 'uppercase' }}>Email</Text>
-                      <Text style={{ fontSize: 13, fontWeight: '600', color: colors.text, marginTop: 2 }}>Help@amitbaruna.com</Text>
+                      <Text style={{ fontSize: 13, fontWeight: '600', color: colors.text, marginTop: 2 }}>support@metabolicscore.in</Text>
                     </View>
                     <Ionicons name="mail-outline" size={14} color={colors.textTertiary} />
                   </TouchableOpacity>
@@ -8665,7 +8665,7 @@ async function stampFooterOnPdf(pdfBytes: Uint8Array): Promise<Uint8Array> {
   const gray = rgb(0.4, 0.4, 0.4);
   const pages = pdfDoc.getPages();
   const total = pages.length;
-  const line1 = `Generated by Metabolic Score - ${BRAND.fullName} - amitbaruna.com - metabolicscore.in`;
+  const line1 = `Generated by Metabolic Score - ${BRAND.fullName} - metabolicscore.in`;
   const line2 = `WhatsApp +91 98918 28688 - Instagram ${BRAND.instagramHandle}`;
   pages.forEach((page, i) => {
     const { width, height } = page.getSize();
@@ -8956,7 +8956,7 @@ function ReportScreen({ onNavigate, scoreResult, userData }: { onNavigate: (s: S
       </View>
 
       <View style={{ paddingHorizontal: 24, marginTop: 16, marginBottom: 24, alignItems: 'center' }}>
-        <Text style={{ fontSize: 10, color: colors.textTertiary }}>Generated by Metabolic Score™ · {BRAND.fullName} · amitbaruna.com</Text>
+        <Text style={{ fontSize: 10, color: colors.textTertiary }}>Generated by Metabolic Score™ · {BRAND.fullName} · metabolicscore.in</Text>
         <Text style={{ fontSize: 10, color: colors.textTertiary, marginTop: 4 }}>{BRAND.instagramHandle}</Text>
       </View>
 
