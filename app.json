@@ -12,7 +12,8 @@
       "supportsTablet": true,
       "bundleIdentifier": "com.amitbaruna.metabolicscore",
       "infoPlist": {
-        "ITSAppUsesNonExemptEncryption": false
+        "ITSAppUsesNonExemptEncryption": false,
+        "NSPhotoLibraryUsageDescription": "Metabolic Score lets you save your branded score card image to your photos when you choose to share or download it."
       }
     },
     "android": {
