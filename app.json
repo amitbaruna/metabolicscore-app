@@ -9,7 +9,7 @@
     "newArchEnabled": false,
     "icon": "./src/assets/icon/appicon.png",
     "ios": {
-      "supportsTablet": true,
+      "supportsTablet": false,
       "bundleIdentifier": "com.amitbaruna.metabolicscore",
       "infoPlist": {
         "ITSAppUsesNonExemptEncryption": false,
