@@ -120,6 +120,24 @@ export const auth = {
       : null;
     return { user: data.user, error };
   },
+  // redirect_to MUST be a URL query param, not a body field — Supabase silently ignores it
+  // in the body (confirmed the hard way on a different part of this product). Email-send
+  // only; no in-app deep-link handling of the reset link itself.
+  async recover(email: string) {
+    const redirectTo = 'https://amitbaruna-dashboard.amit-baruna.workers.dev/reset-password.html';
+    const res = await fetch(`${SUPABASE_URL}/auth/v1/recover?redirect_to=${encodeURIComponent(redirectTo)}`, {
+      method: 'POST',
+      headers: { 'apikey': SUPABASE_ANON_KEY, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email }),
+    });
+    const data = await res.json().catch(() => ({}));
+    // Same error-shape fix as signIn/signUp above — Supabase doesn't use a field literally
+    // named `error`, so res.ok is the real signal to gate on.
+    const error = !res.ok
+      ? { message: data.msg || data.error_description || data.message || 'Could not send reset email' }
+      : null;
+    return { error };
+  },
   async signOut() {
     await AsyncStorage.removeItem('ms_user');
     await AsyncStorage.removeItem('ms_token');

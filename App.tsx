@@ -547,6 +547,8 @@ function LoginScreen({ onNavigate }: { onNavigate: (s: ScreenId) => void }) {
   const [showPassword, setShowPassword] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
+  const [resetLoading, setResetLoading] = useState(false);
+  const [resetMessage, setResetMessage] = useState('');
 
   // Shared by both sign-in paths — previously both routed to 'onboarding' unconditionally,
   // meaning a returning user who lost their session (logged out, expired token) would be
@@ -566,11 +568,22 @@ function LoginScreen({ onNavigate }: { onNavigate: (s: ScreenId) => void }) {
 
   const handleSignIn = async () => {
     if (!email.trim() || !password) { setError('Please enter both email and password.'); return; }
+    setResetMessage('');
     setLoading(true); setError('');
     const { error } = await signIn(email.trim(), password);
     setLoading(false);
     if (error) setError(error.message || 'Sign in failed');
     else await routeAfterAuth();
+  };
+
+  const handleForgotPassword = async () => {
+    if (!email.trim()) { setError('Enter your email above first.'); return; }
+    setError(''); setResetMessage('');
+    setResetLoading(true);
+    const { error } = await auth.recover(email.trim());
+    setResetLoading(false);
+    if (error) setError(error.message || 'Could not send reset email');
+    else setResetMessage('Reset link sent — check your email.');
   };
 
   return (
@@ -625,8 +638,14 @@ function LoginScreen({ onNavigate }: { onNavigate: (s: ScreenId) => void }) {
         <Text style={{ paddingHorizontal: 24, marginTop: 12, fontSize: 12, color: colors.red }}>{error}</Text>
       ) : null}
 
+      {resetMessage ? (
+        <Text style={{ paddingHorizontal: 24, marginTop: 12, fontSize: 12, color: colors.green }}>✓ {resetMessage}</Text>
+      ) : null}
+
       <View style={{ paddingHorizontal: 24, marginTop: 12, alignItems: 'flex-end' }}>
-        <TouchableOpacity><Text style={{ fontSize: 12, color: colors.red }}>Forgot password?</Text></TouchableOpacity>
+        <TouchableOpacity onPress={handleForgotPassword} disabled={resetLoading}>
+          <Text style={{ fontSize: 12, color: colors.red, opacity: resetLoading ? 0.6 : 1 }}>{resetLoading ? 'Sending...' : 'Forgot password?'}</Text>
+        </TouchableOpacity>
       </View>
 
       <View style={{ paddingHorizontal: 24, marginTop: 16 }}>
@@ -2415,9 +2434,11 @@ function HomeScreen({ onNavigate, hasScore, scoreResult, onSelectLayer, onNaviga
               </TouchableOpacity>
               )}
 
+              {__DEV__ && (
               <View style={{ marginTop: 24, alignItems: 'center' }}>
                 <TouchableOpacity onPress={() => setPreviewOverride(true)}><Text style={{ fontSize: 10, color: colors.textTertiary, textDecorationLine: 'underline' }}>Preview post-test state →</Text></TouchableOpacity>
               </View>
+              )}
             </View>
           ) : (
             <View>
