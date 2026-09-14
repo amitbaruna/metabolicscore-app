@@ -736,7 +736,6 @@ export const HOME_SECTIONS: HomeSection[] = [
   { id: 'score', label: 'Your Score', locked: true, defaultOn: true },
   { id: 'resistance', label: 'Fat Loss Resistance', defaultOn: true, explanation: 'Shows your fat loss resistance percentage and recovery potential. This is your key diagnostic number — it tells you how much your body is protecting vs adapting.' },
   { id: 'metabolic-story', label: 'Metabolic Story', defaultOn: true, explanation: 'The interactive map of how your five layers connect — which cascades are active right now and why. Turning this off removes the visual explanation, not the underlying data.' },
-  { id: 'upcoming-call', label: 'Upcoming Call', defaultOn: true, explanation: 'Shows your next scheduled call with Amit right on Home, so you never miss it. Turning this off just hides the reminder card — your booking itself is unaffected.' },
   { id: 'layers', label: 'The 5 Layers', locked: true, defaultOn: true },
   { id: 'daily-focus', label: "Today's 1% Action", defaultOn: true, explanation: 'This is your daily anchor. Without it, the app becomes just information — not transformation. Small daily actions compound into score changes.' },
   { id: 'cravings', label: 'Cravings Quick-Log', defaultOn: true, explanation: 'Cravings are biological signals, not discipline failures. Logging them builds a diagnostic pattern over 5-7 days that reveals which layers are under strain.' },

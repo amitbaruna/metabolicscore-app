@@ -25,7 +25,7 @@ import { File as ExpoFile, Paths as ExpoPaths, writeAsStringAsync } from 'expo-f
 import { PDFDocument, StandardFonts, rgb } from '@cantoo/pdf-lib';
 import Svg, { Path, Defs, LinearGradient as SvgLinearGradient, Stop as SvgStop, Line, G, Circle, Text as SvgText } from 'react-native-svg';
 import Constants from 'expo-constants';
-import { booking, membership, referral, account, pushNotifications, actionContent, checkins, habitCycles, notificationLog, auth, profiles } from './src/config/supabase';
+import { referral, account, pushNotifications, actionContent, checkins, habitCycles, notificationLog, auth, profiles } from './src/config/supabase';
 // Guarded — expo-notifications behaves inconsistently in Expo Go, especially for remote push
 // token registration on iOS, which really needs a real build. Same safe-load pattern as the
 // other native-adjacent modules this session.
@@ -416,14 +416,6 @@ function addDaysStr(dateStr: string, n: number): string {
   return d.toISOString().slice(0, 10);
 }
 
-function fmtSlotTime(t?: string): string {
-  if (!t) return '';
-  const [h, m] = t.split(':').map(Number);
-  const period = h >= 12 ? 'PM' : 'AM';
-  const h12 = h % 12 === 0 ? 12 : h % 12;
-  return `${h12}:${m.toString().padStart(2, '0')} ${period}`;
-}
-
 function LayerIcon({ name, size, color }: { name: string; size: number; color: string }) {
   if (name === 'brain') return <FontAwesome5 name="brain" size={size} color={color} solid />;
   if (name === 'gutbrain') {
@@ -549,7 +541,7 @@ function SplashScreen() {
 
 function LoginScreen({ onNavigate }: { onNavigate: (s: ScreenId) => void }) {
   const { colors } = useTheme();
-  const { signIn, signInWithGoogle, isDemoMode } = useAuth();
+  const { signIn, isDemoMode } = useAuth();
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
@@ -578,15 +570,6 @@ function LoginScreen({ onNavigate }: { onNavigate: (s: ScreenId) => void }) {
     const { error } = await signIn(email.trim(), password);
     setLoading(false);
     if (error) setError(error.message || 'Sign in failed');
-    else await routeAfterAuth();
-  };
-
-  const handleGoogle = async () => {
-    setLoading(true); setError('');
-    const { error, cancelled } = await signInWithGoogle();
-    setLoading(false);
-    if (cancelled) return; // user backed out of the consent screen — stay on login, no error to show
-    if (error) setError(error.message || 'Google sign in failed');
     else await routeAfterAuth();
   };
 
@@ -649,21 +632,6 @@ function LoginScreen({ onNavigate }: { onNavigate: (s: ScreenId) => void }) {
       <View style={{ paddingHorizontal: 24, marginTop: 16 }}>
         <TouchableOpacity onPress={handleSignIn} disabled={loading} style={{ backgroundColor: colors.red, paddingVertical: 14, borderRadius: 12, alignItems: 'center', opacity: loading ? 0.6 : 1 }}>
           {loading ? <ActivityIndicator color="#fff" size="small" /> : <Text style={{ color: '#fff', fontSize: 14, fontWeight: '700', letterSpacing: 0.5 }}>Sign In</Text>}
-        </TouchableOpacity>
-      </View>
-
-      {/* Google sign-in — real OAuth now exists (expo-auth-session, wired to handleGoogle
-          above), so the button that was deliberately removed while it was still a fake stub
-          goes back in here. */}
-      <View style={{ paddingHorizontal: 24, marginTop: 16 }}>
-        <View style={{ flexDirection: 'row', alignItems: 'center', gap: 10, marginBottom: 16 }}>
-          <View style={{ flex: 1, height: 1, backgroundColor: colors.border }} />
-          <Text style={{ fontSize: 11, color: colors.textTertiary }}>or</Text>
-          <View style={{ flex: 1, height: 1, backgroundColor: colors.border }} />
-        </View>
-        <TouchableOpacity onPress={handleGoogle} disabled={loading} style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 10, backgroundColor: colors.card, borderWidth: 1, borderColor: colors.border, paddingVertical: 13, borderRadius: 12, opacity: loading ? 0.6 : 1 }}>
-          <Ionicons name="logo-google" size={16} color={colors.text} />
-          <Text style={{ fontSize: 14, fontWeight: '600', color: colors.text }}>Continue with Google</Text>
         </TouchableOpacity>
       </View>
 
@@ -2098,8 +2066,6 @@ function HomeScreen({ onNavigate, hasScore, scoreResult, onSelectLayer, onNaviga
   const [notif7dRows, setNotif7dRows] = useState<{ id: string }[]>([]);
   useEffect(() => { notificationLog.listLast7Days().then(setNotif7dRows).catch(() => {}); }, []);
   const notifCount7d = notif7dRows.filter(r => !dismissedNotifIds.has(r.id)).length;
-  const [myBooking, setMyBooking] = useState<any>(null);
-  useEffect(() => { booking.getMyBooking().then(setMyBooking).catch(() => {}); }, []);
   const [actionDone, setActionDone] = useState(false);
   const [actionDoneFlash, setActionDoneFlash] = useState(false);
   const [scorePadExpanded, setScorePadExpanded] = useState(false);
@@ -2776,24 +2742,6 @@ function HomeScreen({ onNavigate, hasScore, scoreResult, onSelectLayer, onNaviga
               </View>
               )}
 
-
-              {myBooking && homeSections['upcoming-call'] !== false && new Date(myBooking.booking_date) >= new Date(new Date().toDateString()) && (
-                <View style={{ paddingHorizontal: 24, marginTop: 20 }}>
-                  <TouchableOpacity onPress={() => onNavigate('profile')} activeOpacity={0.95} style={{ borderRadius: 18, padding: 16, backgroundColor: colors.red, flexDirection: 'row', alignItems: 'center', gap: 12 }}>
-                    <View style={{ width: 40, height: 40, borderRadius: 12, backgroundColor: 'rgba(255,255,255,0.2)', alignItems: 'center', justifyContent: 'center' }}>
-                      <Ionicons name="calendar" size={18} color="#fff" />
-                    </View>
-                    <View style={{ flex: 1 }}>
-                      <Text style={{ fontSize: 13, fontWeight: '700', color: '#fff' }}>Upcoming call with Amit</Text>
-                      <Text style={{ fontSize: 11, color: 'rgba(255,255,255,0.85)', marginTop: 2 }}>
-                        {new Date(myBooking.booking_date).toLocaleDateString('en-US', { weekday: 'long', month: 'short', day: 'numeric' })}
-                        {myBooking.booking_availability_template && ` · ${fmtSlotTime(myBooking.booking_availability_template.start_time)} – ${fmtSlotTime(myBooking.booking_availability_template.end_time)}`}
-                      </Text>
-                    </View>
-                    <Ionicons name="chevron-forward" size={16} color="rgba(255,255,255,0.85)" />
-                  </TouchableOpacity>
-                </View>
-              )}
 
               {/* 5 Layers — always shown (locked) */}
               <View style={{ marginTop: 28 }}>
@@ -6307,27 +6255,6 @@ function ProfileScreen({ onNavigate, hasScore, scoreResult, onGoToCravings, onGo
     conditions: ctxConditions, setConditions: ctxSetConditions,
   } = useAppData();
   useEffect(() => { refreshScoreHistory(); }, [refreshScoreHistory]);
-  const [myMembership, setMyMembership] = useState<any>({ status: 'trial' });
-  const [myBooking, setMyBooking] = useState<any>(null);
-  // Per-user cache, same convention as ClinicalDepthProvider's ms_clinical_depth_${uid} key —
-  // membership.get() was previously live-fetch-or-placeholder with no offline fallback, so a
-  // paid member offline (or right after reconnect, before the fetch resolves) saw "Trial"
-  // instead of their real status (2026-08-14). Cache is read first so a returning user's real
-  // status shows immediately; 'trial' only remains the shown value when nothing was ever cached.
-  useEffect(() => {
-    const membershipCacheKey = `ms_membership_status_${user?.id || 'anonymous'}`;
-    (async () => {
-      try {
-        const cached = await AsyncStorage.getItem(membershipCacheKey);
-        if (cached) setMyMembership(JSON.parse(cached));
-      } catch { /* ignore, fall through to live fetch */ }
-    })();
-    membership.get().then(m => {
-      setMyMembership(m);
-      AsyncStorage.setItem(membershipCacheKey, JSON.stringify(m)).catch(() => {});
-    }).catch(() => {});
-    booking.getMyBooking().then(setMyBooking).catch(() => {});
-  }, []);
   const latestHistory = scoreHistory[0];
   // No hardcoded default layer. Prefer the fresh in-session scoreResult's dominantLayer; fall
   // back to the persisted dominant_layer on the latest historical entry (present on rows saved
@@ -6385,9 +6312,6 @@ function ProfileScreen({ onNavigate, hasScore, scoreResult, onGoToCravings, onGo
   const [medicalCondExpanded, setMedicalCondExpanded] = useState(false);
   const [goalRowExpanded, setGoalRowExpanded] = useState(false);
   const [baselineRowExpanded, setBaselineRowExpanded] = useState(false);
-  const [rescheduleOpen, setRescheduleOpen] = useState(false);
-  const [rebookFreeOpen, setRebookFreeOpen] = useState(false);
-  const [cancelStep, setCancelStep] = useState<'closed' | 'confirm' | 'cancelling' | 'done'>('closed');
   const [notifStatus, setNotifStatus] = useState<'unknown' | 'granted' | 'denied' | 'requesting'>('unknown');
   useEffect(() => {
     if (!Notifications) return;
@@ -6466,79 +6390,6 @@ function ProfileScreen({ onNavigate, hasScore, scoreResult, onGoToCravings, onGo
                   <Text style={{ fontSize: 12, fontWeight: '700', color: colors.red }}>Latest score: {scoreHistory[0]?.total_score ?? '—'}</Text>
                 </View>
               </View>
-            </View>
-          </View>
-
-          {/* My Program */}
-          <View style={{ paddingHorizontal: 24, marginTop: 20 }}>
-            <View style={{ borderRadius: 20, padding: 20, backgroundColor: colors.card, borderWidth: myMembership.status === 'paid' ? 1.5 : 1, borderColor: myMembership.status === 'paid' ? colors.red : colors.border }}>
-              <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: myMembership.status === 'paid' ? 16 : 0 }}>
-                <Text style={{ fontSize: 10, fontWeight: '700', letterSpacing: 1, color: colors.textSecondary, textTransform: 'uppercase' }}>My Program</Text>
-                <View style={{ paddingHorizontal: 10, paddingVertical: 4, borderRadius: 6, backgroundColor: myMembership.status === 'paid' ? colors.red : `${colors.textTertiary}20` }}>
-                  <Text style={{ fontSize: 9, fontWeight: '700', letterSpacing: 0.5, color: myMembership.status === 'paid' ? '#fff' : colors.textSecondary, textTransform: 'uppercase' }}>{myMembership.status === 'paid' ? 'Paid Member' : 'Trial'}</Text>
-                </View>
-              </View>
-
-              {myMembership.status === 'paid' ? (
-                <>
-                  <Text style={{ fontSize: 15, fontWeight: '700', color: colors.text }}>{myMembership.plan_type === '90_day_program' ? '90-Day Metabolic Reset' : '360° Transformation Blueprint'}</Text>
-                  <View style={{ flexDirection: 'row', gap: 20, marginTop: 10 }}>
-                    <View>
-                      <Text style={{ fontSize: 10, color: colors.textTertiary }}>Joined</Text>
-                      <Text style={{ fontSize: 12, fontWeight: '600', color: colors.text, marginTop: 2 }}>{myMembership.joined_date ? new Date(myMembership.joined_date).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }) : '—'}</Text>
-                    </View>
-                    {myMembership.plan_end_date ? (
-                      <View>
-                        <Text style={{ fontSize: 10, color: colors.textTertiary }}>Plan ends</Text>
-                        <Text style={{ fontSize: 12, fontWeight: '600', color: colors.text, marginTop: 2 }}>{new Date(myMembership.plan_end_date).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })}</Text>
-                      </View>
-                    ) : myBooking ? (
-                      <View>
-                        <Text style={{ fontSize: 10, color: colors.textTertiary }}>Session</Text>
-                        <Text style={{ fontSize: 12, fontWeight: '600', color: colors.text, marginTop: 2 }}>
-                          {new Date(myBooking.booking_date).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}
-                          {myBooking.booking_availability_template && ` · ${fmtSlotTime(myBooking.booking_availability_template.start_time)}`}
-                        </Text>
-                      </View>
-                    ) : null}
-                  </View>
-                  {myBooking ? (
-                    <>
-                    <View style={{ marginTop: 14, paddingTop: 14, borderTopWidth: 1, borderTopColor: colors.border, flexDirection: 'row', alignItems: 'center', gap: 10 }}>
-                      <Ionicons name="calendar" size={16} color={colors.red} />
-                      <Text style={{ fontSize: 12, color: colors.textSecondary }}>
-                        Upcoming: {new Date(myBooking.booking_date).toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' })}
-                        {myBooking.booking_availability_template && ` · ${fmtSlotTime(myBooking.booking_availability_template.start_time)} – ${fmtSlotTime(myBooking.booking_availability_template.end_time)}`}
-                      </Text>
-                    </View>
-                    <TouchableOpacity onPress={() => setRescheduleOpen(true)} style={{ marginTop: 10, alignSelf: 'flex-start' }}>
-                      <Text style={{ fontSize: 12, fontWeight: '600', color: colors.red }}>Reschedule call →</Text>
-                    </TouchableOpacity>
-                    <TouchableOpacity onPress={() => setCancelStep('confirm')} style={{ marginTop: 8, alignSelf: 'flex-start' }}>
-                      <Text style={{ fontSize: 12, fontWeight: '600', color: colors.textSecondary }}>Cancel call</Text>
-                    </TouchableOpacity>
-                    </>
-                  ) : (
-                    <View style={{ marginTop: 14, paddingTop: 14, borderTopWidth: 1, borderTopColor: colors.border }}>
-                      <Text style={{ fontSize: 12, color: colors.textSecondary, marginBottom: 10 }}>No call currently booked — your plan is still active, so booking one is free.</Text>
-                      <TouchableOpacity onPress={() => setRebookFreeOpen(true)} style={{ backgroundColor: colors.red, paddingVertical: 12, borderRadius: 10, alignItems: 'center', alignSelf: 'flex-start', paddingHorizontal: 20 }}>
-                        <Text style={{ fontSize: 12, fontWeight: '700', color: '#fff' }}>Book a Call</Text>
-                      </TouchableOpacity>
-                    </View>
-                  )}
-                </>
-              ) : (
-                <TouchableOpacity onPress={() => onNavigate('booking')} activeOpacity={0.9} style={{ flexDirection: 'row', alignItems: 'center', gap: 12, marginTop: 12 }}>
-                  <View style={{ width: 40, height: 40, borderRadius: 12, backgroundColor: `${colors.red}14`, alignItems: 'center', justifyContent: 'center' }}>
-                    <Ionicons name="rocket" size={18} color={colors.red} />
-                  </View>
-                  <View style={{ flex: 1 }}>
-                    <Text style={{ fontSize: 13, fontWeight: '600', color: colors.text }}>You're on the free trial</Text>
-                    <Text style={{ fontSize: 11, color: colors.textSecondary, marginTop: 2 }}>Book a call to unlock your program</Text>
-                  </View>
-                  <Ionicons name="chevron-forward" size={16} color={colors.textTertiary} />
-                </TouchableOpacity>
-              )}
             </View>
           </View>
 
@@ -7160,71 +7011,6 @@ function ProfileScreen({ onNavigate, hasScore, scoreResult, onGoToCravings, onGo
         <BottomNav active="profile" onNavigate={onNavigate} hasScore={hasScore} />
       </SafeAreaView>
     </View>
-    {rescheduleOpen && myBooking && (
-      <SlotPickerModal
-        planType={myMembership.plan_type || 'single_consultation'}
-        razorpayLink=""
-        price=""
-        mode="reschedule"
-        rescheduleBookingId={myBooking.id}
-        onClose={() => setRescheduleOpen(false)}
-        onNavigate={onNavigate}
-      />
-    )}
-    {rebookFreeOpen && (
-      <SlotPickerModal
-        planType={myMembership.plan_type || 'single_consultation'}
-        razorpayLink=""
-        price=""
-        mode="rebook-free"
-        onClose={() => { setRebookFreeOpen(false); booking.getMyBooking().then(setMyBooking).catch(() => {}); }}
-        onNavigate={onNavigate}
-      />
-    )}
-    <Modal visible={cancelStep !== 'closed'} transparent animationType="fade" onRequestClose={() => setCancelStep('closed')}>
-      <View style={{ flex: 1, backgroundColor: 'rgba(0,0,0,0.7)', alignItems: 'center', justifyContent: 'center', paddingHorizontal: 24 }}>
-        <View style={{ backgroundColor: colors.bg, borderRadius: 20, padding: 24, width: '100%' }}>
-          {cancelStep === 'confirm' && myBooking && (
-            <>
-              <Text style={{ fontSize: 16, fontWeight: '800', color: colors.text, marginBottom: 8 }}>Cancel this call?</Text>
-              <Text style={{ fontSize: 13, color: colors.textSecondary, lineHeight: 19, marginBottom: 20 }}>
-                Your call on {new Date(myBooking.booking_date).toLocaleDateString('en-US', { weekday: 'long', month: 'short', day: 'numeric' })}
-                {myBooking.booking_availability_template && ` at ${fmtSlotTime(myBooking.booking_availability_template.start_time)}`} will be cancelled — the slot will be freed up. This doesn't cancel your plan, just this specific call. You can book a new one anytime from here.
-              </Text>
-              <View style={{ flexDirection: 'row', gap: 10 }}>
-                <TouchableOpacity onPress={() => setCancelStep('closed')} style={{ flex: 1, paddingVertical: 12, borderRadius: 10, backgroundColor: colors.card, alignItems: 'center' }}>
-                  <Text style={{ fontSize: 13, fontWeight: '700', color: colors.text }}>Keep it</Text>
-                </TouchableOpacity>
-                <TouchableOpacity onPress={async () => {
-                  setCancelStep('cancelling');
-                  await booking.cancelBooking(myBooking.id);
-                  const fresh = await booking.getMyBooking();
-                  setMyBooking(fresh);
-                  setCancelStep('done');
-                }} style={{ flex: 1, paddingVertical: 12, borderRadius: 10, backgroundColor: colors.red, alignItems: 'center' }}>
-                  <Text style={{ fontSize: 13, fontWeight: '700', color: '#fff' }}>Cancel Call</Text>
-                </TouchableOpacity>
-              </View>
-            </>
-          )}
-          {cancelStep === 'cancelling' && (
-            <View style={{ alignItems: 'center', paddingVertical: 12 }}>
-              <ActivityIndicator color={colors.red} />
-              <Text style={{ fontSize: 13, color: colors.textSecondary, marginTop: 12 }}>Cancelling…</Text>
-            </View>
-          )}
-          {cancelStep === 'done' && (
-            <>
-              <Text style={{ fontSize: 16, fontWeight: '800', color: colors.text, marginBottom: 8 }}>Call cancelled</Text>
-              <Text style={{ fontSize: 13, color: colors.textSecondary, lineHeight: 19, marginBottom: 20 }}>You can book a new slot anytime — your plan is still active.</Text>
-              <TouchableOpacity onPress={() => setCancelStep('closed')} style={{ paddingVertical: 12, borderRadius: 10, backgroundColor: colors.red, alignItems: 'center' }}>
-                <Text style={{ fontSize: 13, fontWeight: '700', color: '#fff' }}>Done</Text>
-              </TouchableOpacity>
-            </>
-          )}
-        </View>
-      </View>
-    </Modal>
     </>
   );
 }
@@ -7818,24 +7604,6 @@ function BookingScreen({ onNavigate }: { onNavigate: (s: ScreenId) => void }) {
   const [approachExpanded, setApproachExpanded] = useState(false);
   const [programExpanded, setProgramExpanded] = useState(false);
   const [blueprintExpanded, setBlueprintExpanded] = useState(false);
-  const [rebookFreeOpen, setRebookFreeOpen] = useState(false);
-  const [myMembership, setMyMembership] = useState<any>({ status: 'trial' });
-  const [myBooking, setMyBooking] = useState<any>(null);
-  const [membershipLoading, setMembershipLoading] = useState(true);
-  const [redirectPrompt, setRedirectPrompt] = useState<null | 'single_consultation' | '90_day_program'>(null); // same-tier tap while already active
-  const [rescheduleFromRedirect, setRescheduleFromRedirect] = useState(false);
-  useEffect(() => {
-    Promise.all([membership.get(), booking.getMyBooking()])
-      .then(([m, b]) => { setMyMembership(m); setMyBooking(b); })
-      .catch(() => {})
-      .finally(() => setMembershipLoading(false));
-  }, []);
-  const now = new Date();
-  // Unified: both plan tiers now carry a plan_end_date (single_consultation = 7-day window from
-  // join date, 90_day_program = anchored to payment/kickoff — see the Worker's confirmBookingAndMembership
-  // and confirmMembershipByEmail).
-  const planActive = myMembership.status === 'paid' && myMembership.plan_end_date && new Date(myMembership.plan_end_date) > now;
-  const hasBookedCall = !!myBooking; // an existing confirmed call, regardless of which plan it belongs to
   // Replaces handleTapPlan + handleUpgradePayment. No payment happens inside the app at all —
   // this just opens a conversation, pre-filled with exactly what Amit needs to send the right
   // Razorpay Payment Link: which program, its price, and the email to match the payment against.
@@ -7843,11 +7611,6 @@ function BookingScreen({ onNavigate }: { onNavigate: (s: ScreenId) => void }) {
   // already-deployed Worker's webhook is what marks someone 'paid' once that external payment
   // completes, matching on the same email shared here.
   const contactCoach = (tier: 'single_consultation' | '90_day_program') => {
-    if (planActive && myMembership.plan_type === tier) {
-      // Already on this exact tier — nothing to arrange, offer to reschedule the existing call
-      setRedirectPrompt(tier);
-      return;
-    }
     const planLabel = tier === '90_day_program' ? '90-Day Metabolic Reset' : 'Single Consultation';
     const priceLabel = tier === '90_day_program' ? '₹24,990' : '₹3,499';
     const message = `Hi Amit, I'd like to enroll in the ${planLabel} (${priceLabel}). My registered email: ${user?.email || '(not set)'}`;
@@ -7927,39 +7690,6 @@ function BookingScreen({ onNavigate }: { onNavigate: (s: ScreenId) => void }) {
         </TouchableOpacity>
       </View>
 
-      {planActive && (
-        <View style={{ paddingHorizontal: 20, marginTop: 24 }}>
-          <View style={{ borderRadius: 20, padding: 20, backgroundColor: colors.card, borderWidth: 1.5, borderColor: colors.red }}>
-            <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8, marginBottom: 12 }}>
-              <View style={{ width: 8, height: 8, borderRadius: 4, backgroundColor: '#22C55E' }} />
-              <Text style={{ fontSize: 11, fontWeight: '700', letterSpacing: 1, color: '#22C55E', textTransform: 'uppercase' }}>Plan Active</Text>
-            </View>
-            <Text style={{ fontSize: 16, fontWeight: '800', color: colors.text }}>{myMembership.plan_type === '90_day_program' ? '90-Day Metabolic Reset' : '360° Transformation Blueprint'}</Text>
-            {myBooking ? (
-              <Text style={{ fontSize: 13, color: colors.textSecondary, marginTop: 8, lineHeight: 19 }}>
-                Upcoming call: {new Date(myBooking.booking_date).toLocaleDateString('en-US', { weekday: 'long', month: 'short', day: 'numeric' })}
-                {myBooking.booking_availability_template && ` at ${fmtSlotTime(myBooking.booking_availability_template.start_time)}`}
-              </Text>
-            ) : (
-              <>
-                <Text style={{ fontSize: 13, color: colors.textSecondary, marginTop: 8, lineHeight: 19 }}>
-                  No call currently booked — your plan is still active, so booking a new one is free.
-                </Text>
-                <TouchableOpacity onPress={() => setRebookFreeOpen(true)} style={{ marginTop: 12, backgroundColor: colors.red, paddingVertical: 12, borderRadius: 10, alignItems: 'center' }}>
-                  <Text style={{ fontSize: 13, fontWeight: '700', color: '#fff' }}>Book a Call</Text>
-                </TouchableOpacity>
-              </>
-            )}
-            <TouchableOpacity onPress={() => onNavigate('profile')} style={{ marginTop: 16, alignSelf: 'flex-start' }}>
-              <Text style={{ fontSize: 12, fontWeight: '600', color: colors.red }}>Manage in My Program →</Text>
-            </TouchableOpacity>
-          </View>
-        </View>
-      )}
-      {/* Option 1: Single Consultation — hidden once a plan is active (can't buy the same tier twice,
-          and someone on the 90-day program doesn't need this either) */}
-      {!planActive && (
-      <>
       {/* Option 1: Single Consultation */}
       <View style={{ paddingHorizontal: 20, marginTop: 24 }}>
         <View style={{ borderRadius: 20, padding: 20, backgroundColor: colors.card, borderWidth: 1.5, borderColor: `${colors.red}30` }}>
@@ -7993,12 +7723,8 @@ function BookingScreen({ onNavigate }: { onNavigate: (s: ScreenId) => void }) {
           </TouchableOpacity>
         </View>
       </View>
-      </>
-      )}
 
-      {/* Option 2: 90-Day Program — shown when nothing is active, or when single_consultation is
-          active (upsell path). Hidden only when 90_day_program itself is already active. */}
-      {(!planActive || myMembership.plan_type === 'single_consultation') && (
+      {/* Option 2: 90-Day Program */}
       <View style={{ paddingHorizontal: 20, marginTop: 20 }}>
         <TouchableOpacity activeOpacity={0.97} onPress={() => setProgramExpanded(!programExpanded)} style={{ borderRadius: 20, padding: 20, backgroundColor: colors.card, borderWidth: 2, borderColor: colors.red }}>
           <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8, marginBottom: 8 }}>
@@ -8033,7 +7759,6 @@ function BookingScreen({ onNavigate }: { onNavigate: (s: ScreenId) => void }) {
           </TouchableOpacity>
         </TouchableOpacity>
       </View>
-      )}
 
       <View style={{ paddingHorizontal: 20, marginTop: 24, marginBottom: 16 }}>
         <TouchableOpacity onPress={() => Linking.openURL(BRAND.instagram)} style={{ backgroundColor: colors.card, paddingVertical: 14, borderRadius: 12, alignItems: 'center' }}>
@@ -8041,252 +7766,7 @@ function BookingScreen({ onNavigate }: { onNavigate: (s: ScreenId) => void }) {
         </TouchableOpacity>
       </View>
     </ScrollScreen>
-
-    {/* Same-tier redirect prompt — tapped a plan they're already on (defensive; normally hidden already) */}
-    {redirectPrompt && myBooking && (
-      <View style={{ position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: 'rgba(0,0,0,0.6)', alignItems: 'center', justifyContent: 'center', paddingHorizontal: 24 }}>
-        <View style={{ backgroundColor: colors.card, borderRadius: 20, padding: 24, width: '100%' }}>
-          <Text style={{ fontSize: 16, fontWeight: '800', color: colors.text, marginBottom: 8 }}>You already have a call booked</Text>
-          <Text style={{ fontSize: 13, color: colors.textSecondary, lineHeight: 19, marginBottom: 20 }}>
-            You have a call booked for {new Date(myBooking.booking_date).toLocaleDateString('en-US', { weekday: 'long', month: 'short', day: 'numeric' })}
-            {myBooking.booking_availability_template && ` at ${fmtSlotTime(myBooking.booking_availability_template.start_time)}`}. Want to change it instead?
-          </Text>
-          <View style={{ flexDirection: 'row', gap: 10 }}>
-            <TouchableOpacity onPress={() => setRedirectPrompt(null)} style={{ flex: 1, paddingVertical: 12, borderRadius: 10, backgroundColor: colors.bg, alignItems: 'center' }}>
-              <Text style={{ fontSize: 13, fontWeight: '700', color: colors.text }}>Cancel</Text>
-            </TouchableOpacity>
-            <TouchableOpacity onPress={() => { setRedirectPrompt(null); setRescheduleFromRedirect(true); }} style={{ flex: 1, paddingVertical: 12, borderRadius: 10, backgroundColor: colors.red, alignItems: 'center' }}>
-              <Text style={{ fontSize: 13, fontWeight: '700', color: '#fff' }}>Reschedule my call</Text>
-            </TouchableOpacity>
-          </View>
-        </View>
-      </View>
-    )}
-    {rescheduleFromRedirect && myBooking && (
-      <SlotPickerModal
-        planType={myMembership.plan_type || 'single_consultation'}
-        razorpayLink=""
-        price=""
-        mode="reschedule"
-        rescheduleBookingId={myBooking.id}
-        onClose={() => { setRescheduleFromRedirect(false); booking.getMyBooking().then(setMyBooking).catch(() => {}); }}
-        onNavigate={onNavigate}
-      />
-    )}
-
-    {/* Upgrade-and-reuse prompt — buying 90-day while already having a booked call */}
-    {rebookFreeOpen && (
-      <SlotPickerModal
-        planType={myMembership.plan_type || 'single_consultation'}
-        razorpayLink=""
-        price=""
-        mode="rebook-free"
-        onClose={() => { setRebookFreeOpen(false); booking.getMyBooking().then(setMyBooking).catch(() => {}); }}
-        onNavigate={onNavigate}
-      />
-    )}
     </>
-  );
-}
-
-function SlotPickerModal({ planType, razorpayLink, price, onClose, onNavigate, mode = 'book', rescheduleBookingId }: { planType: 'single_consultation' | '90_day_program'; razorpayLink: string; price: string; onClose: () => void; onNavigate: (s: ScreenId) => void; mode?: 'book' | 'reschedule' | 'rebook-free'; rescheduleBookingId?: string }) {
-  const { colors } = useTheme();
-  const { user } = useAuth();
-  const [loading, setLoading] = useState(true);
-  const [days, setDays] = useState<{ date: string; label: string; slots: { id: string; label: string }[] }[]>([]);
-  const [selectedDay, setSelectedDay] = useState<string | null>(null);
-  const [selectedSlot, setSelectedSlot] = useState<{ id: string; label: string } | null>(null);
-  const [confirming, setConfirming] = useState(false);
-  const [confirmed, setConfirmed] = useState(false);
-
-  const fmtTime = (t: string) => {
-    const [h, m] = t.split(':').map(Number);
-    const period = h >= 12 ? 'PM' : 'AM';
-    const h12 = h % 12 === 0 ? 12 : h % 12;
-    return `${h12}:${m.toString().padStart(2, '0')} ${period}`;
-  };
-
-  const localDateStr = (d: Date) => {
-    const y = d.getFullYear();
-    const m = (d.getMonth() + 1).toString().padStart(2, '0');
-    const day = d.getDate().toString().padStart(2, '0');
-    return `${y}-${m}-${day}`;
-  };
-
-  useEffect(() => {
-    (async () => {
-      try {
-        const template = await booking.getTemplate();
-        // template loaded successfully
-        const todayD = new Date();
-        const toDate = new Date(todayD.getTime() + 14 * 24 * 60 * 60 * 1000);
-        const fromStr = localDateStr(todayD);
-        const toStr = localDateStr(toDate);
-        const [exceptions, bookedRows] = await Promise.all([
-          booking.getExceptions(fromStr, toStr),
-          booking.getBookedSlots(fromStr, toStr),
-        ]);
-        // exceptions and booked rows loaded successfully
-        const bookedSet = new Set(
-          (Array.isArray(bookedRows) ? bookedRows : [])
-            .filter((b: any) => b.status === 'confirmed' || (b.status === 'held' && new Date(b.hold_expires_at) > new Date()))
-            .map((b: any) => `${b.booking_date}_${b.template_slot_id}`)
-        );
-        const blockedFullDays = new Set((Array.isArray(exceptions) ? exceptions : []).filter((e: any) => e.type === 'full_day_block').map((e: any) => e.exception_date));
-        const blockedSlots = new Set((Array.isArray(exceptions) ? exceptions : []).filter((e: any) => e.type === 'slot_block').map((e: any) => `${e.exception_date}_${e.template_slot_id}`));
-
-        const result: typeof days = [];
-        for (let i = 0; i < 14 && result.length < 4; i++) {
-          const d = new Date(todayD.getFullYear(), todayD.getMonth(), todayD.getDate() + i);
-          const dow = d.getDay(); // 0=Sun (local)
-          if (dow === 0) continue;
-          const dateStr = localDateStr(d);
-          if (blockedFullDays.has(dateStr)) continue;
-          const jsDowToTemplate = dow; // template uses 1=Mon..6=Sat, JS getDay() 1=Mon..6=Sat too (0=Sun excluded already)
-          const isToday = i === 0;
-          const cutoffMs = todayD.getTime() + 5 * 60 * 1000; // 5-minute buffer before a slot starts
-          const daySlots = (Array.isArray(template) ? template : [])
-            .filter((t: any) => Number(t.day_of_week) === jsDowToTemplate)
-            .filter((t: any) => !bookedSet.has(`${dateStr}_${t.id}`) && !blockedSlots.has(`${dateStr}_${t.id}`))
-            .filter((t: any) => {
-              if (!isToday) return true;
-              const [h, m] = String(t.start_time).split(':').map(Number);
-              const slotStart = new Date(d.getFullYear(), d.getMonth(), d.getDate(), h, m).getTime();
-              return slotStart > cutoffMs;
-            })
-            .map((t: any) => ({ id: t.id, label: `${fmtTime(t.start_time)} – ${fmtTime(t.end_time)}` }));
-          if (daySlots.length > 0) {
-            result.push({ date: dateStr, label: d.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' }), slots: daySlots });
-          }
-        }
-        // days with availability computed successfully
-        setDays(result);
-        if (result.length) setSelectedDay(result[0].date);
-      } catch (e) {
-        console.warn('Slot load failed', e);
-      } finally {
-        setLoading(false);
-      }
-    })();
-  }, []);
-
-  const confirmHold = async () => {
-    if (!selectedDay || !selectedSlot || !user?.id) return;
-
-    // This flow no longer handles in-app payment at all — every real payment now happens
-    // externally (WhatsApp/email → Razorpay link, confirmed by the Worker's webhook). This
-    // function only ever runs for an already-active member picking a call slot, which is
-    // free — no money changes hands here.
-    setConfirming(true);
-    try {
-      const res = await booking.createFreeRebooking({ user_id: user.id, template_slot_id: selectedSlot.id, booking_date: selectedDay });
-      const row = Array.isArray(res) ? res[0] : res;
-      if (!row?.id) {
-        console.warn('[SlotPicker] createFreeRebooking did not return a valid row:', res);
-        Alert.alert('Could not book this slot', 'Please try again, and if it keeps happening, let Amit know.');
-        return;
-      }
-      setConfirmed(true);
-    } catch (e) {
-      console.warn('[SlotPicker] createFreeRebooking threw:', e);
-      Alert.alert('Something went wrong', 'Please try again.');
-    } finally {
-      setConfirming(false);
-    }
-  };
-
-  const confirmReschedule = async () => {
-    if (!selectedDay || !selectedSlot || !rescheduleBookingId) return;
-    setConfirming(true);
-    try {
-      const res = await booking.rescheduleBooking(rescheduleBookingId, selectedSlot.id, selectedDay);
-      // rescheduleBooking succeeded
-      const row = Array.isArray(res) ? res[0] : null;
-      if (!row?.id) {
-        Alert.alert('Could not reschedule', 'Something went wrong on our end. Please try again.');
-        return;
-      }
-      setConfirmed(true);
-    } catch (e) {
-      console.warn('[SlotPicker] rescheduleBooking threw:', e);
-      Alert.alert('Could not reschedule', 'Please try again.');
-    } finally {
-      setConfirming(false);
-    }
-  };
-
-  // testConfirmPayment removed — payment confirmation is now automatic, inside confirmHold,
-  // via the real Worker verification. No manual "I've completed payment" step needed anymore.
-
-
-  const selectedDayObj = days.find(d => d.date === selectedDay);
-
-  return (
-    <View style={{ position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: 'rgba(0,0,0,0.7)', justifyContent: 'center', paddingHorizontal: 20 }}>
-      <View style={{ backgroundColor: colors.bg, borderRadius: 24, maxHeight: '80%', borderWidth: 1, borderColor: colors.border }}>
-        <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', padding: 20 }}>
-          <Text style={{ fontSize: 16, fontWeight: '700', color: colors.text }}>{confirmed ? (mode === 'reschedule' ? 'Rescheduled' : 'Booking Confirmed') : (mode === 'reschedule' ? 'Pick a new time' : 'Pick your slot')}</Text>
-          <TouchableOpacity onPress={onClose} style={{ width: 32, height: 32, borderRadius: 16, backgroundColor: colors.card, alignItems: 'center', justifyContent: 'center' }}>
-            <Ionicons name="close" size={16} color={colors.textSecondary} />
-          </TouchableOpacity>
-        </View>
-
-        <ScrollView contentContainerStyle={{ padding: 20, paddingTop: 0 }}>
-          {confirmed ? (
-            <View style={{ alignItems: 'center', paddingVertical: 20 }}>
-              <View style={{ width: 64, height: 64, borderRadius: 32, backgroundColor: 'rgba(34,197,94,0.14)', alignItems: 'center', justifyContent: 'center', marginBottom: 16 }}>
-                <Ionicons name="checkmark" size={32} color="#22C55E" />
-              </View>
-              <Text style={{ fontSize: 16, fontWeight: '700', color: colors.text, textAlign: 'center' }}>{mode === 'reschedule' ? "You're rescheduled!" : "You're booked!"}</Text>
-              <Text style={{ fontSize: 13, color: colors.textSecondary, textAlign: 'center', marginTop: 8 }}>{selectedDayObj?.label} · {selectedSlot?.label}</Text>
-              <TouchableOpacity onPress={() => { onClose(); onNavigate('profile'); }} style={{ marginTop: 24, backgroundColor: colors.red, paddingVertical: 14, paddingHorizontal: 32, borderRadius: 12 }}>
-                <Text style={{ color: '#fff', fontSize: 14, fontWeight: '700' }}>View My Program</Text>
-              </TouchableOpacity>
-            </View>
-          ) : loading ? (
-            <ActivityIndicator color={colors.red} style={{ marginTop: 40 }} />
-          ) : days.length === 0 ? (
-            <Text style={{ fontSize: 13, color: colors.textSecondary, textAlign: 'center', marginTop: 20 }}>No slots available right now — please check back soon.</Text>
-          ) : (
-            <>
-              <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{ marginBottom: 16 }}>
-                {days.map(d => (
-                  <TouchableOpacity key={d.date} onPress={() => { setSelectedDay(d.date); setSelectedSlot(null); }} style={{ paddingVertical: 10, paddingHorizontal: 16, borderRadius: 12, marginRight: 8, backgroundColor: selectedDay === d.date ? colors.red : colors.card }}>
-                    <Text style={{ fontSize: 12, fontWeight: '600', color: selectedDay === d.date ? '#fff' : colors.text }}>{d.label}</Text>
-                  </TouchableOpacity>
-                ))}
-              </ScrollView>
-
-              <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 10 }}>
-                {selectedDayObj?.slots.map(s => (
-                  <TouchableOpacity key={s.id} onPress={() => setSelectedSlot(s)} style={{ paddingVertical: 12, paddingHorizontal: 14, borderRadius: 10, borderWidth: 1.5, borderColor: selectedSlot?.id === s.id ? colors.red : colors.border, backgroundColor: selectedSlot?.id === s.id ? `${colors.red}14` : 'transparent' }}>
-                    <Text style={{ fontSize: 12, fontWeight: '600', color: selectedSlot?.id === s.id ? colors.red : colors.text }}>{s.label}</Text>
-                  </TouchableOpacity>
-                ))}
-              </View>
-
-              {mode === 'reschedule' ? (
-                selectedSlot ? (
-                  <TouchableOpacity onPress={confirmReschedule} disabled={confirming} style={{ marginTop: 24, backgroundColor: colors.red, paddingVertical: 14, borderRadius: 12, alignItems: 'center' }}>
-                    {confirming ? <ActivityIndicator color="#fff" /> : <Text style={{ color: '#fff', fontSize: 14, fontWeight: '700' }}>Confirm New Time →</Text>}
-                  </TouchableOpacity>
-                ) : (
-                  <Text style={{ marginTop: 24, fontSize: 12, color: colors.textTertiary, textAlign: 'center' }}>Select a new slot to continue</Text>
-                )
-              ) : (
-                selectedSlot ? (
-                  <TouchableOpacity onPress={confirmHold} disabled={confirming} style={{ marginTop: 24, backgroundColor: colors.red, paddingVertical: 14, borderRadius: 12, alignItems: 'center' }}>
-                    {confirming ? <ActivityIndicator color="#fff" /> : <Text style={{ color: '#fff', fontSize: 14, fontWeight: '700' }}>{mode === 'rebook-free' ? 'Confirm Slot →' : `Book · ${price} →`}</Text>}
-                  </TouchableOpacity>
-                ) : (
-                  <Text style={{ marginTop: 24, fontSize: 12, color: colors.textTertiary, textAlign: 'center' }}>Select a slot to continue</Text>
-                )
-              )}
-            </>
-          )}
-        </ScrollView>
-      </View>
-    </View>
   );
 }
 

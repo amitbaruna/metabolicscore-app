@@ -81,17 +81,6 @@ export const mockAuthService = {
     return { user };
   },
 
-  async signInWithGoogle() {
-    await delay();
-    const user: DemoUser = {
-      id: 'demo-google-user',
-      email: 'guest@gmail.com',
-      user_metadata: { full_name: 'Google Guest' },
-    };
-    await writeJSON(KEYS.user, user);
-    return { user };
-  },
-
   async signOut() {
     await AsyncStorage.removeItem(KEYS.user);
   },

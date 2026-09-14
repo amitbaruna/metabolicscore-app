@@ -120,23 +120,6 @@ export const auth = {
       : null;
     return { user: data.user, error };
   },
-  // Real Google sign-in — exchanges the ID token Google handed back (via expo-auth-session)
-  // for an actual Supabase session, same REST pattern as email sign-in above. Replaces the
-  // previous fake stub that created a hardcoded local account regardless of what happened.
-  async signInWithGoogleToken(idToken: string) {
-    const res = await fetch(`${SUPABASE_URL}/auth/v1/token?grant_type=id_token`, {
-      method: 'POST',
-      headers: { 'apikey': SUPABASE_ANON_KEY, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ provider: 'google', id_token: idToken }),
-    });
-    const data = await res.json();
-    if (data.user) {
-      await AsyncStorage.setItem('ms_user', JSON.stringify(data.user));
-      await AsyncStorage.setItem('ms_token', data.access_token);
-      await AsyncStorage.setItem('ms_refresh_token', data.refresh_token || '');
-    }
-    return { user: data.user, error: data.error || null };
-  },
   async signOut() {
     await AsyncStorage.removeItem('ms_user');
     await AsyncStorage.removeItem('ms_token');
@@ -253,74 +236,9 @@ export const scores = {
 };
 
 export const booking = {
-  async getTemplate() {
-    const res = await sbFetch('/rest/v1/booking_availability_template?is_active=eq.true&order=day_of_week,start_time');
-    if (!Array.isArray(res)) console.warn('[booking.getTemplate] unexpected response:', res);
-    return res;
-  },
-  async getExceptions(fromDate: string, toDate: string) {
-    const res = await sbFetch(`/rest/v1/booking_exceptions?exception_date=gte.${fromDate}&exception_date=lte.${toDate}`);
-    if (!Array.isArray(res)) console.warn('[booking.getExceptions] unexpected response:', res);
-    return res;
-  },
-  async getBookedSlots(fromDate: string, toDate: string) {
-    const res = await sbFetch(`/rest/v1/app_bookings?booking_date=gte.${fromDate}&booking_date=lte.${toDate}&status=in.(held,confirmed)&select=template_slot_id,booking_date,status,hold_expires_at`);
-    if (!Array.isArray(res)) console.warn('[booking.getBookedSlots] unexpected response (likely needs the public-read policy — see follow-up SQL):', res);
-    return res;
-  },
   async createHold(payload: { user_id: string; template_slot_id: string; booking_date: string; hold_expires_at: string }) {
     const token = await auth.getToken();
     return await sbFetch('/rest/v1/app_bookings', { method: 'POST', body: JSON.stringify({ ...payload, status: 'held' }) }, token);
-  },
-  // For users whose membership is already active/paid but have no current booked call —
-  // e.g., after cancelling. Creates a booking directly as 'confirmed', skipping the
-  // hold→payment→verify flow entirely, since payment was already made for the plan itself,
-  // not per-call. Safe under RLS (auth.uid() = user_id), no server-side verification needed
-  // since no money changes hands here.
-  async createFreeRebooking(payload: { user_id: string; template_slot_id: string; booking_date: string }) {
-    const token = await auth.getToken();
-    // hold_expires_at is NOT NULL on this table even though it's meaningless for an
-    // already-confirmed booking — set it to now, satisfying the constraint without
-    // implying any actual hold/expiry behavior applies.
-    return await sbFetch('/rest/v1/app_bookings', { method: 'POST', body: JSON.stringify({ ...payload, status: 'confirmed', confirmed_at: new Date().toISOString(), hold_expires_at: new Date().toISOString() }) }, token);
-  },
-  async rescheduleBooking(bookingId: string, newTemplateSlotId: string, newBookingDate: string) {
-    const token = await auth.getToken();
-    const res = await sbFetch(`/rest/v1/app_bookings?id=eq.${bookingId}`, {
-      method: 'PATCH',
-      body: JSON.stringify({ template_slot_id: newTemplateSlotId, booking_date: newBookingDate }),
-    }, token);
-    if (!Array.isArray(res)) {
-      console.warn('[booking.rescheduleBooking] unexpected response:', res);
-    }
-    return res;
-  },
-  // Genuine cancellation — distinct from reschedule. Marks the booking cancelled rather than
-  // moving it, freeing up the slot for other users without requiring the person to pick a new
-  // time first.
-  async cancelBooking(bookingId: string) {
-    const token = await auth.getToken();
-    const res = await sbFetch(`/rest/v1/app_bookings?id=eq.${bookingId}`, {
-      method: 'PATCH',
-      body: JSON.stringify({ status: 'cancelled' }),
-    }, token);
-    if (!Array.isArray(res)) {
-      console.warn('[booking.cancelBooking] unexpected response:', res);
-    }
-    return res;
-  },
-  async getMyBooking() {
-    const user = await auth.getSession();
-    if (!user?.id) return null; // session hasn't loaded yet — this is a normal, expected moment
-    // right after app start, not an error; the caller's effect will re-run once it has, and
-    // firing the request anyway just produces a confusing 400 with "undefined" in the URL.
-    const token = await auth.getToken();
-    const rows = await sbFetch(`/rest/v1/app_bookings?user_id=eq.${user.id}&status=eq.confirmed&order=created_at.desc&limit=1&select=id,booking_date,status,template_slot_id,booking_availability_template(start_time,end_time)`, {}, token);
-    if (!Array.isArray(rows)) {
-      console.warn('[booking.getMyBooking] unexpected response (not an array):', rows);
-      return null;
-    }
-    return rows[0] || null;
   },
 };
 
@@ -530,20 +448,6 @@ export const notificationLog = {
       method: 'PATCH',
       body: JSON.stringify({ dismissed_at: new Date().toISOString() }),
     }, token);
-  },
-};
-
-export const membership = {
-  async get() {
-    const user = await auth.getSession();
-    if (!user?.id) return { status: 'trial' }; // session not loaded yet — same as booking.getMyBooking
-    const token = await auth.getToken();
-    const rows = await sbFetch(`/rest/v1/app_membership?user_id=eq.${user.id}`, {}, token);
-    if (!Array.isArray(rows)) {
-      console.warn('[membership.get] unexpected response (not an array) — falling back to trial:', rows);
-      return { status: 'trial' };
-    }
-    return rows[0] || { status: 'trial' };
   },
 };
 
