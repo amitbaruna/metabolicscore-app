@@ -678,23 +678,28 @@ function LoginScreen({ onNavigate }: { onNavigate: (s: ScreenId) => void }) {
 
 function ComplianceScreen({ onNavigate, fromProfile }: { onNavigate: (s: ScreenId) => void; fromProfile?: boolean }) {
   const { colors } = useTheme();
+  const { signOut } = useAuth();
   const [agreed, setAgreed] = useState(false);
   const [showPolicy, setShowPolicy] = useState<'privacy' | 'terms' | null>(null);
   const [deleteStep, setDeleteStep] = useState<'closed' | 'confirm' | 'deleting' | 'done' | 'error'>('closed');
   const [deleteErrors, setDeleteErrors] = useState<string[]>([]);
+  const [deleteDataDeleted, setDeleteDataDeleted] = useState(false);
 
   const handleDeleteAccount = async () => {
     setDeleteStep('deleting');
     try {
-      const result = await account.deleteMyData();
+      const result = await account.deleteAccount();
       if (result.ok) {
+        await signOut();
         setDeleteStep('done');
       } else {
-        setDeleteErrors(result.errors);
+        setDeleteErrors([result.error || 'Unknown error']);
+        setDeleteDataDeleted(!!result.dataDeleted);
         setDeleteStep('error');
       }
     } catch (e) {
       setDeleteErrors([String(e)]);
+      setDeleteDataDeleted(false);
       setDeleteStep('error');
     }
   };
@@ -738,7 +743,7 @@ function ComplianceScreen({ onNavigate, fromProfile }: { onNavigate: (s: ScreenI
                 <View style={{ width: 44, height: 44, borderRadius: 12, backgroundColor: 'rgba(239,68,68,0.14)', alignItems: 'center', justifyContent: 'center' }}><Ionicons name="trash" size={20} color={colors.red} /></View>
                 <View style={{ flex: 1 }}>
                   <Text style={{ fontSize: 14, fontWeight: '700', color: colors.text }}>Right to Deletion</Text>
-                  <Text style={{ fontSize: 12, color: colors.textSecondary, marginTop: 4, lineHeight: 17 }}>Delete all your logged data immediately — scores, cravings, symptoms, bookings, everything. Tap to start.</Text>
+                  <Text style={{ fontSize: 12, color: colors.textSecondary, marginTop: 4, lineHeight: 17 }}>Permanently delete your account and everything in it — scores, cravings, symptoms, bookings, and your login.</Text>
                 </View>
                 <Ionicons name="chevron-forward" size={16} color={colors.textTertiary} style={{ marginTop: 12 }} />
               </TouchableOpacity>
@@ -775,35 +780,35 @@ function ComplianceScreen({ onNavigate, fromProfile }: { onNavigate: (s: ScreenI
               <View style={{ backgroundColor: colors.bg, borderRadius: 20, padding: 24, width: '100%' }}>
                 {deleteStep === 'confirm' && (
                   <>
-                    <Text style={{ fontSize: 16, fontWeight: '800', color: colors.text, marginBottom: 8 }}>Delete all your data?</Text>
+                    <Text style={{ fontSize: 16, fontWeight: '800', color: colors.text, marginBottom: 8 }}>Delete your account?</Text>
                     <Text style={{ fontSize: 13, color: colors.textSecondary, lineHeight: 19, marginBottom: 20 }}>
-                      This immediately and permanently deletes your scores, cravings, symptoms, bookings, membership, and profile. This cannot be undone.{'\n\n'}
-                      Your login itself will be fully removed by our team shortly after — this final step isn't yet automated, but everything else happens now, not in 30 days.
+                      This immediately and permanently deletes your account — your scores, cravings, symptoms, bookings, membership, profile, and your login itself. This cannot be undone.
                     </Text>
                     <View style={{ flexDirection: 'row', gap: 10 }}>
                       <TouchableOpacity onPress={() => setDeleteStep('closed')} style={{ flex: 1, paddingVertical: 12, borderRadius: 10, backgroundColor: colors.card, alignItems: 'center' }}><Text style={{ fontSize: 13, fontWeight: '700', color: colors.text }}>Cancel</Text></TouchableOpacity>
-                      <TouchableOpacity onPress={handleDeleteAccount} style={{ flex: 1, paddingVertical: 12, borderRadius: 10, backgroundColor: colors.red, alignItems: 'center' }}><Text style={{ fontSize: 13, fontWeight: '700', color: '#fff' }}>Delete Everything</Text></TouchableOpacity>
+                      <TouchableOpacity onPress={handleDeleteAccount} style={{ flex: 1, paddingVertical: 12, borderRadius: 10, backgroundColor: colors.red, alignItems: 'center' }}><Text style={{ fontSize: 13, fontWeight: '700', color: '#fff' }}>Delete Account</Text></TouchableOpacity>
                     </View>
                   </>
                 )}
                 {deleteStep === 'deleting' && (
                   <View style={{ alignItems: 'center', paddingVertical: 12 }}>
                     <ActivityIndicator color={colors.red} />
-                    <Text style={{ fontSize: 13, color: colors.textSecondary, marginTop: 12 }}>Deleting your data…</Text>
+                    <Text style={{ fontSize: 13, color: colors.textSecondary, marginTop: 12 }}>Deleting your account…</Text>
                   </View>
                 )}
                 {deleteStep === 'done' && (
                   <>
-                    <Text style={{ fontSize: 16, fontWeight: '800', color: colors.text, marginBottom: 8 }}>Your data has been deleted</Text>
-                    <Text style={{ fontSize: 13, color: colors.textSecondary, lineHeight: 19, marginBottom: 20 }}>You're being signed out now. If you'd like your login credentials removed too, email support@metabolicscore.in and reference this deletion.</Text>
+                    <Text style={{ fontSize: 16, fontWeight: '800', color: colors.text, marginBottom: 8 }}>Your account has been deleted</Text>
+                    <Text style={{ fontSize: 13, color: colors.textSecondary, lineHeight: 19, marginBottom: 20 }}>Your data and login have both been permanently removed. You're signed out now.</Text>
                     <TouchableOpacity onPress={() => onNavigate('login')} style={{ paddingVertical: 12, borderRadius: 10, backgroundColor: colors.red, alignItems: 'center' }}><Text style={{ fontSize: 13, fontWeight: '700', color: '#fff' }}>Done</Text></TouchableOpacity>
                   </>
                 )}
                 {deleteStep === 'error' && (
                   <>
-                    <Text style={{ fontSize: 16, fontWeight: '800', color: colors.text, marginBottom: 8 }}>Something didn't complete</Text>
-                    <Text style={{ fontSize: 13, color: colors.textSecondary, lineHeight: 19, marginBottom: 8 }}>Most of your data may have been deleted, but not all of it. Email support@metabolicscore.in so we can finish this manually.</Text>
-                    {deleteErrors.slice(0, 3).map((e, i) => (<Text key={i} style={{ fontSize: 10, color: colors.textTertiary, marginBottom: 4 }}>{e}</Text>))}
+                    <Text style={{ fontSize: 16, fontWeight: '800', color: colors.text, marginBottom: 8 }}>
+                      {deleteDataDeleted ? 'Your data was deleted, but one step failed' : 'Your account was not deleted'}
+                    </Text>
+                    <Text style={{ fontSize: 13, color: colors.textSecondary, lineHeight: 19, marginBottom: 8 }}>{deleteErrors[0] || 'Something went wrong. Please try again or contact support@metabolicscore.in.'}</Text>
                     <TouchableOpacity onPress={() => setDeleteStep('closed')} style={{ marginTop: 12, paddingVertical: 12, borderRadius: 10, backgroundColor: colors.card, alignItems: 'center' }}><Text style={{ fontSize: 13, fontWeight: '700', color: colors.text }}>Close</Text></TouchableOpacity>
                   </>
                 )}
@@ -828,7 +833,7 @@ function ComplianceScreen({ onNavigate, fromProfile }: { onNavigate: (s: ScreenI
             {[
               { icon: 'lock-closed', title: 'Encrypted Storage', desc: 'Your health data is encrypted at rest and in transit.' },
               { icon: 'ban', title: 'No Third-Party Sharing', desc: 'We never sell or share your data with third parties.' },
-              { icon: 'trash', title: 'Right to Deletion', desc: 'Delete all your data anytime from Profile → Privacy & Consent — takes effect immediately.' },
+              { icon: 'trash', title: 'Right to Deletion', desc: 'Delete your account anytime from Profile → Privacy & Consent — takes effect immediately.' },
             ].map((item, i) => (
               <View key={i} style={{ borderRadius: 20, padding: 16, flexDirection: 'row', alignItems: 'flex-start', gap: 14, backgroundColor: colors.card }}>
                 <View style={{ width: 44, height: 44, borderRadius: 12, backgroundColor: `${colors.red}14`, alignItems: 'center', justifyContent: 'center' }}><Ionicons name={item.icon as any} size={20} color={colors.red} /></View>

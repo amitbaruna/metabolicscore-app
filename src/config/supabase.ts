@@ -5,6 +5,7 @@ const SUPABASE_URL = 'https://hcksvwxbjcehfxbfgqdo.supabase.co';
 const SUPABASE_ANON_KEY = 'sb_publishable_8P0solsUeueG2VXNWSoujg_UuTImaJH';
 export const WORKER_URL = 'https://metabolic-narrative.amit-baruna.workers.dev';
 export const PAYMENT_WORKER_URL = 'https://metabolic-payment-verify.amit-baruna.workers.dev';
+export const ACCOUNT_DELETE_WORKER_URL = 'https://metabolic-account-delete.amit-baruna.workers.dev';
 export const IS_DEMO_MODE = false;
 
 async function doFetch(path: string, options: any, token?: string | null) {
@@ -604,5 +605,38 @@ export const account = {
     await AsyncStorage.multiRemove(['ms_profile', 'ms_domino_ever_shown', 'ms_domino_last_date', 'ms_domino_last_idx']).catch(() => {});
     await auth.signOut();
     return { ok: errors.length === 0, errors };
+  },
+
+  async deleteAccount(): Promise<{ ok: boolean; error?: string; dataDeleted?: boolean }> {
+    const token = await auth.getToken();
+    if (!token) return { ok: false, error: 'Not signed in' };
+
+    const callWorker = async (t: string) => {
+      const res = await fetch(`${ACCOUNT_DELETE_WORKER_URL}/`, {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${t}` },
+      });
+      const text = await res.text();
+      let data: any = null;
+      try { data = text ? JSON.parse(text) : null; } catch { /* e.g. a gateway timeout page, not JSON */ }
+      return { res, data };
+    };
+
+    try {
+      let { res, data } = await callWorker(token);
+      if (res.status === 401) {
+        const newToken = await refreshTokenOnce();
+        if (newToken) {
+          console.log('[account.deleteAccount] token refreshed after 401, retrying');
+          ({ res, data } = await callWorker(newToken));
+        }
+      }
+      if (!res.ok || !data?.deleted) {
+        return { ok: false, error: data?.error || `Deletion failed (status ${res.status})`, dataDeleted: !!data?.dataDeleted };
+      }
+      return { ok: true };
+    } catch (e) {
+      return { ok: false, error: String(e) };
+    }
   },
 };
